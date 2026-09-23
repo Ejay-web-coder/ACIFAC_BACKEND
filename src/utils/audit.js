@@ -3,22 +3,25 @@ import { query } from '../config/db.js';
 const SENSITIVE_FIELD_NAMES = new Set([
   'password',
   'password_hash',
-  'passwordHash',
+  'passwordhash',
   'token',
   'token_hash',
   'session_token',
-  'sessionToken',
+  'sessiontoken',
   'auth_token',
-  'authToken',
+  'authtoken',
   'secret',
   'api_key',
-  'apiKey',
+  'apikey',
   'refresh_token',
-  'refreshToken',
+  'refreshtoken',
   'cookie',
   'jwt',
   'access_token',
-  'accessToken'
+  'accesstoken',
+  'token_digest',
+  'id_document_path',
+  'stored_file_path',
 ]);
 
 function isSensitiveField(key) {
@@ -128,6 +131,7 @@ export async function createAuditLog({
   userAgent = null,
   status = 'SUCCESS',
   details = null,
+  client = null,
 }) {
   const payload = buildAuditLogPayload({
     user,
@@ -146,8 +150,11 @@ export async function createAuditLog({
     details,
   });
 
+  // Inside a transaction (client given) a failed audit insert aborts the whole
+  // operation, so an important change can never be committed without its log.
+  const runner = client ? client.query.bind(client) : query;
   try {
-    await query(
+    await runner(
       `INSERT INTO audit_logs (
         user_id, user_name_snapshot, user_role_snapshot, action, module, entity_type, entity_id,
         description, old_values, new_values, target_user_id, ip_address, user_agent, status, details, created_at
@@ -172,7 +179,8 @@ export async function createAuditLog({
     );
     return payload;
   } catch (error) {
-    console.error('Audit log failed:', error);
+    if (client) throw error;
+    console.error('Audit log failed:', error.message);
     return null;
   }
 }

@@ -1,0 +1,42 @@
+# Render blueprint for the ACIFAC Express API (https://render.com/docs/blueprint-spec).
+# Secrets are marked sync: false and must be entered in the Render dashboard.
+services:
+  - type: web
+    name: acifac-backend
+    runtime: node
+    plan: starter
+    region: singapore
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ACIFAC_TIME_ZONE
+        value: Asia/Manila
+      - key: COOKIE_SAMESITE
+        value: none
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: EMAIL_HOST
+        value: smtp.gmail.com
+      - key: EMAIL_PORT
+        value: "465"
+      - key: EMAIL_SECURE
+        value: "true"
+      - key: EMAIL_USER
+        sync: false
+      - key: EMAIL_APP_PASSWORD
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
