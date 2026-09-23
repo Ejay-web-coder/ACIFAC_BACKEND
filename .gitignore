@@ -1,15 +1,14 @@
 # Environment files
 .env
-.env.example
-.anv.example
 .env.*
+!.env.example
 
 # Dependencies and logs
 node_modules/
 npm-debug.log*
 
 # Private uploaded documents
-private/member-documents/*
+private/
 
 # Operating-system files
 .DS_Store
