@@ -15,6 +15,7 @@ import ocrRoutes from './routes/ocrRoutes.js';
 import loanRoutes from './routes/loanRoutes.js';
 import { announcementRoutes, eventRoutes, legalDocumentRoutes, notificationRoutes } from './routes/communicationRoutes.js';
 import { isListening } from './services/events.js';
+import { refreshLoanStatuses } from './services/loanService.js';
 
 export function createApp() {
   const app = express();
@@ -45,6 +46,17 @@ export function createApp() {
       console.error('Health check failed:', error.message);
       res.status(500).json({ ok: false, message: 'Database unavailable.' });
     }
+  });
+
+  // Vercel Cron replacement for the hourly timer in server.js. Vercel sends
+  // "Authorization: Bearer <CRON_SECRET>" with every scheduled invocation.
+  app.get('/api/cron/refresh-loans', async (req, res) => {
+    const secret = process.env.CRON_SECRET;
+    if (!secret || req.headers.authorization !== `Bearer ${secret}`) {
+      return res.status(401).json({ success: false, message: 'Unauthorized.' });
+    }
+    await refreshLoanStatuses({ force: true });
+    return res.status(200).json({ ok: true });
   });
 
   app.use('/api', rateLimit({

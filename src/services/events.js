@@ -93,6 +93,9 @@ export function isListening() {
 
 // GET /api/events (behind requireAuth)
 export function eventStream(req, res) {
+  // 204 tells EventSource to stop reconnecting, so serverless hosts are not
+  // hit with a reconnect loop when live updates are disabled.
+  if (process.env.DISABLE_LIVE_UPDATES === 'true') return res.status(204).end();
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-store',
