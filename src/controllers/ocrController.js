@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { query, withTransaction } from '../config/db.js';
 import { createAuditLog } from '../utils/audit.js';
 import { AppError, badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, parseId, parsePagination, paginationMeta } from '../utils/http.js';
-import { assertValidUpload, BUCKETS, removeFile, safeOriginalName, sendStoredFile, uploadFile } from '../services/storage.js';
+import { assertValidUpload, BUCKETS, downloadFile, removeFile, safeOriginalName, sendStoredFile, uploadFile } from '../services/storage.js';
 import { DOCUMENT_TYPES as UPLOAD_TYPES } from '../middleware/upload.js';
 import {
   buildAnalysisPrompt, DOCUMENT_TYPES, FORM_DEFINITIONS, isPostable, normalizeAuthenticity, normalizeDocumentType, normalizeExtractedData,
@@ -81,32 +81,57 @@ async function analyzeWithAi(file, captureSource) {
       messages: [{ role: 'system', content: buildAnalysisPrompt(captureSource) }, { role: 'user', content }],
     }),
   });
-  if (!response.ok) throw new Error(`AI service returned ${response.status}.`);
+  if (!response.ok) throw new Error(response.status === 429 || response.status >= 500 ? 'The AI service is busy right now. The document was saved; press Retry in a minute.' : `AI service returned ${response.status}.`);
   return parseModelResponse(await response.json());
 }
 
+// Google retires Gemini models over time (gemini-2.5-flash now answers 404
+// "no longer available") and models are sometimes overloaded (503/429). The
+// configured model is tried first, then these, all within one time budget so
+// the request finishes before the 60-second serverless limit.
+const GEMINI_FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash'];
+const AI_TIME_BUDGET_MS = 45000;
+
 async function analyzeWithGemini(file, apiKey, captureSource) {
-  const base64 = file.buffer.toString('base64');
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL || 'gemini-2.5-flash'}:generateContent`,
-    {
-      method: 'POST',
-      signal: AbortSignal.timeout(45000),
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      body: JSON.stringify({
-        generationConfig: { temperature: 0, responseMimeType: 'application/json' },
-        systemInstruction: { parts: [{ text: buildAnalysisPrompt(captureSource) }] },
-        contents: [{ parts: [
-          { text: 'Read this document including its text, labels, keywords, important fields, and layout. Classify it, extract the fields for its type, and assess whether it is genuine.' },
-          { inlineData: { mimeType: file.mimetype, data: base64 } },
-        ] }],
-      }),
+  const models = [...new Set([process.env.GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS].filter(Boolean))];
+  const deadline = Date.now() + AI_TIME_BUDGET_MS;
+  const body = JSON.stringify({
+    generationConfig: { temperature: 0, responseMimeType: 'application/json' },
+    systemInstruction: { parts: [{ text: buildAnalysisPrompt(captureSource) }] },
+    contents: [{ parts: [
+      { text: 'Read this document including its text, labels, keywords, important fields, and layout. Classify it, extract the fields for its type, and assess whether it is genuine.' },
+      { inlineData: { mimeType: file.mimetype, data: file.buffer.toString('base64') } },
+    ] }],
+  });
+
+  let lastProblem = 'unavailable';
+  for (const model of models) {
+    const remaining = deadline - Date.now();
+    if (remaining < 3000) break;
+    let response;
+    try {
+      response = await fetch(`${process.env.GEMINI_API_BASE || 'https://generativelanguage.googleapis.com/v1beta'}/models/${encodeURIComponent(model)}:generateContent`, {
+        method: 'POST', signal: AbortSignal.timeout(remaining), headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body,
+      });
+    } catch (error) {
+      lastProblem = error?.name === 'TimeoutError' ? 'timeout' : 'network';
+      console.warn(`Gemini ${model} ${lastProblem}:`, error instanceof Error ? error.message : error);
+      continue;
     }
-  );
-  if (!response.ok) throw new Error(`Gemini service returned ${response.status}.`);
-  const payload = await response.json();
-  const text = payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('');
-  return parseModelResponse({ choices: [{ message: { content: text } }] });
+    if (response.ok) {
+      const payload = await response.json();
+      const text = payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('');
+      return parseModelResponse({ choices: [{ message: { content: text } }] });
+    }
+    const detail = (await response.json().catch(() => ({})))?.error?.message || '';
+    console.warn(`Gemini ${model} returned ${response.status}: ${String(detail).slice(0, 200)}`);
+    if (response.status === 401 || response.status === 403) throw new Error('The AI service rejected the API key. Check GEMINI_API_KEY on the server.');
+    if (response.status === 400) throw new Error('The AI service could not read this file. Try a clearer photo or a PDF.');
+    lastProblem = response.status === 404 ? 'retired' : response.status === 429 ? 'busy' : 'unavailable';
+  }
+  throw new Error(lastProblem === 'busy' || lastProblem === 'unavailable' || lastProblem === 'timeout'
+    ? 'The AI service (Google Gemini) is busy right now. The document was saved; press Retry in a minute.'
+    : 'The AI service could not be reached. The document was saved; press Retry in a minute.');
 }
 
 // Upload/capture -> validate -> store privately -> AI OCR, classification and
@@ -333,6 +358,49 @@ export async function reverifyDocument(req, res) {
     confidence: scan.confidence === null ? null : Number(scan.confidence),
   });
   return res.status(200).json({ success: true, data: mapScan(await saveVerification(id, verification)) });
+}
+
+// POST /api/ocr/:id/retry — runs the AI again on the stored file of a scan
+// whose reading failed (e.g. the AI service was busy), then verifies it and
+// posts it when every check passes, exactly like a new upload.
+export async function retryDocument(req, res) {
+  const id = parseId(req.params.id, 'document ID');
+  const row = (await query('SELECT * FROM document_scans WHERE id = $1', [id])).rows[0];
+  if (!row) throw notFound('Document scan not found.');
+  if (row.processing_status !== 'failed') throw conflict('This document was already read. Use Check again to re-verify it.');
+  const buffer = await downloadFile(row.stored_file_path);
+  if (!buffer) throw notFound('The stored file is no longer available. Upload the document again.');
+
+  let analysis;
+  try {
+    analysis = await analyzeWithAi({ buffer, mimetype: row.mime_type, originalname: row.original_file_name, size: Number(row.file_size) }, row.capture_source);
+  } catch (error) {
+    const message = error instanceof Error ? error.message.slice(0, 500) : 'AI analysis failed.';
+    await query('UPDATE document_scans SET processing_error = $1, updated_at = NOW() WHERE id = $2', [message, id]);
+    throw new AppError(503, message);
+  }
+
+  let scan = (await query(
+    `UPDATE document_scans SET detected_document_type = $1, confidence = $2, ocr_text = $3, extracted_data = $4, authenticity = $5,
+            processing_status = 'completed', processing_error = NULL, verification = '{}'::jsonb, review_status = 'needs_review', updated_at = NOW()
+     WHERE id = $6 RETURNING *`,
+    [analysis.documentType, analysis.confidence, analysis.ocrText, JSON.stringify(analysis.extractedData), JSON.stringify(analysis.authenticity), id]
+  )).rows[0];
+  await createAuditLog({ user: req.user, action: 'OCR_RETRIED', module: 'OCR', entityType: 'document_scan', entityId: String(id), description: `Re-read ${row.original_file_name}`, newValues: { document_type: analysis.documentType }, ...getRequestMeta(req) });
+
+  let message = 'Document read.';
+  try {
+    const verification = await verifyDocument(req, scan, { documentType: scan.detected_document_type, extractedData: scan.extracted_data || {}, authenticity: scan.authenticity || {}, confidence: analysis.confidence });
+    scan = await saveVerification(id, verification);
+    if (autoPostEnabled() && isPostable(scan.detected_document_type) && verification.status === 'passed' && (analysis.confidence ?? 0) >= AUTO_POST_MIN_CONFIDENCE) {
+      const posted = await postScan(req, id, { automatic: true });
+      scan = posted.scan;
+      message = `Verified and saved automatically: ${posted.result.label}.`;
+    }
+  } catch (error) {
+    console.error('OCR verification error:', error instanceof Error ? error.message : error);
+  }
+  return res.status(200).json({ success: true, data: mapScan(scan), message });
 }
 
 export function listFormDefinitions(req, res) {

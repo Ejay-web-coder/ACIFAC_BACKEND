@@ -27,7 +27,7 @@ const memberSelect = `
          m.yearly_income, m.spouse_name, m.spouse_age, m.spouse_contact, m.children,
          m.emergency_contact, m.id_document_name, m.id_document_type, m.id_document_size,
          (m.id_document_path IS NOT NULL) AS has_id_document, (m.profile_photo IS NOT NULL) AS has_profile_photo,
-         m.membership_date, m.share_capital, m.status, m.archived_at, m.archived_by,
+         m.membership_date, m.share_capital, m.status, m.archived_at, m.archived_by, m.additional_info,
          archived_user.username AS archived_by_username, m.created_at, m.updated_at,
          TRIM(CONCAT_WS(' ', m.first_name, m.middle_name, m.last_name, m.suffix)) AS full_name
   FROM members m
@@ -54,6 +54,36 @@ const shareContributionSelect = `
 function numericOrNull(value) {
   if (value === undefined || value === null || value === '') return null;
   return Number(value);
+}
+
+const ADDITIONAL_TEXT_FIELDS = [
+  'motherMaidenName', 'motherLastName', 'motherFirstName', 'motherMiddleName', 'membershipType', 'separationDate',
+  'bodResolution', 'membershipFee', 'dateReceived', 'preMembershipSeminar', 'paymentOfMembershipFee', 'orNumber', 'initialPaidUpCapital',
+];
+
+// Details from the Add Member form without a column of their own (mother's
+// name, children, income sources, membership information). Only known keys
+// are kept, as short plain text; arrives as an object (JSON) or a string (form upload).
+export function readAdditionalInfo(raw) {
+  let value = raw;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); } catch { throw badRequest('Additional member information is not valid.'); }
+  }
+  if (value === undefined || value === null || value === '') return {};
+  if (typeof value !== 'object' || Array.isArray(value)) throw badRequest('Additional member information is not valid.');
+  const info = {};
+  for (const key of ADDITIONAL_TEXT_FIELDS) {
+    const text = cleanString(typeof value[key] === 'number' ? String(value[key]) : value[key], 200);
+    if (text) info[key] = text;
+  }
+  const rows = (list, fields) => (Array.isArray(list) ? list.slice(0, 30) : [])
+    .map((item) => Object.fromEntries(fields.map((field) => [field, cleanString(typeof item?.[field] === 'number' ? String(item[field]) : item?.[field], 200)])))
+    .filter((item) => fields.some((field) => item[field]));
+  const children = rows(value.children, ['name', 'age']);
+  const incomeSources = rows(value.incomeSources, ['source', 'amount']);
+  if (children.length) info.children = children;
+  if (incomeSources.length) info.incomeSources = incomeSources;
+  return info;
 }
 
 export function validateMemberInput(body) {
@@ -467,9 +497,9 @@ export async function insertMemberRecord(client, req, { body, values, shareCapit
                           id_type, id_number, rsbsa_no, livelihood, farm_area_ha, corn_area_ha, palay_area_ha,
                           yearly_income, spouse_name, spouse_age, spouse_contact, children, emergency_contact,
                           id_document_path, id_document_name, id_document_type, id_document_size, membership_date,
-                          share_capital, status, profile_photo, updated_at)
+                          share_capital, status, profile_photo, additional_info, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-             $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34::numeric, $35, $36, NOW())
+             $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34::numeric, $35, $36, $37::jsonb, NOW())
      RETURNING id`,
     [memberNumber, values.firstName, optionalString(body.middle_name, 100), values.lastName, optionalString(body.suffix, 20), values.email,
       values.phone, values.address, optionalString(body.barangay, 150), optionalString(body.municipality, 150), optionalString(body.province, 150),
@@ -478,7 +508,7 @@ export async function insertMemberRecord(client, req, { body, values, shareCapit
       numericOrNull(body.corn_area_ha), numericOrNull(body.palay_area_ha), numericOrNull(body.yearly_income),
       optionalString(body.spouse_name, 200), numericOrNull(body.spouse_age), optionalString(body.spouse_contact, 30), optionalString(body.children, 2000),
       optionalString(body.emergency_contact, 255), idDocumentRef, idDocument ? safeOriginalName(idDocument.originalname) : null, idDocument?.mimetype ?? null, idDocument?.size ?? null,
-      values.membershipDate, centsToString(shareCapitalCents), values.status, photoRef]
+      values.membershipDate, centsToString(shareCapitalCents), values.status, photoRef, JSON.stringify(readAdditionalInfo(body.additional_info))]
   );
   const id = insert.rows[0].id;
   if (shareCapitalCents > 0) {
@@ -597,7 +627,7 @@ export async function updateMember(req, res) {
                           palay_area_ha = $21, yearly_income = $22, spouse_name = $23, spouse_age = $24,
                           spouse_contact = $25, children = $26, emergency_contact = $27, membership_date = $28,
                           share_capital = COALESCE((SELECT SUM(amount) FROM share_contributions WHERE member_id = $30), 0),
-                          status = $29, updated_at = NOW()
+                          status = $29, additional_info = COALESCE($31::jsonb, additional_info), updated_at = NOW()
        WHERE id = $30`,
       [values.firstName, optionalString(body.middle_name, 100), values.lastName, optionalString(body.suffix, 20), values.email, values.phone,
         values.address, optionalString(body.barangay, 150), optionalString(body.municipality, 150), optionalString(body.province, 150), optionalString(body.date_of_birth, 10),
@@ -605,7 +635,7 @@ export async function updateMember(req, res) {
         optionalString(body.rsbsa_no, 100), optionalString(body.livelihood, 255), numericOrNull(body.farm_area_ha), numericOrNull(body.corn_area_ha),
         numericOrNull(body.palay_area_ha), numericOrNull(body.yearly_income), optionalString(body.spouse_name, 200), numericOrNull(body.spouse_age),
         optionalString(body.spouse_contact, 30), optionalString(body.children, 2000), optionalString(body.emergency_contact, 255), values.membershipDate,
-        values.status, id]
+        values.status, id, body.additional_info === undefined ? null : JSON.stringify(readAdditionalInfo(body.additional_info))]
     );
     const after = (await client.query(`${memberSelect} WHERE m.id = $1`, [id])).rows[0];
     await createAuditLog({ client, user: req.user, action: 'MEMBER_UPDATED', module: 'Members', entityType: 'member', entityId: String(id), description: `Updated member ${after.member_number}`, oldValues: before, newValues: after, ...getRequestMeta(req) });

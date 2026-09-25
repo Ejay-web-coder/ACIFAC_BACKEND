@@ -18,6 +18,7 @@ let stubServer;
 let stubMode = 'ok';
 const DEFAULT_STUB_ANALYSIS = { documentType: 'Payment Receipt', confidence: 92, ocrText: 'Receipt 123', extractedData: { 'Member Name': 'Juan Dela Cruz', 'Payment Amount': '500.00' } };
 let stubAnalysis = DEFAULT_STUB_ANALYSIS;
+const geminiCalls = [];
 let pool;
 const sentEmails = [];
 const ORIGIN = 'http://localhost:5173';
@@ -75,6 +76,14 @@ before(async () => {
   stubServer = http.createServer((req, res) => {
     req.resume();
     req.on('end', () => {
+      const gemini = /\/gemini\/models\/([^:]+):generateContent/.exec(req.url);
+      if (gemini) {
+        geminiCalls.push(gemini[1]);
+        const reply = { 'gemini-2.5-flash': [404, { error: { message: 'no longer available' } }], 'gemini-3.8-flash': [503, { error: { message: 'high demand' } }] }[gemini[1]];
+        res.writeHead(reply ? reply[0] : 200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(reply ? reply[1] : { candidates: [{ content: { parts: [{ text: JSON.stringify(DEFAULT_STUB_ANALYSIS) }] } }] }));
+        return;
+      }
       if (stubMode === 'fail') { res.writeHead(500); res.end('{}'); return; }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(stubAnalysis) } }] }));
@@ -153,6 +162,19 @@ test('members: create, validate, duplicate, view document, update, archive, rest
   assert.equal(updated.status, 200, JSON.stringify(updated.data));
   assert.equal(updated.data.data.phone, '09179999999');
   assert.equal(updated.data.data.share_capital, 1000);
+
+  // Add Member details without their own column are kept in additional_info.
+  const { additional_info: _unused, ...editable } = updated.data.data;
+  const withInfo = await admin.put(`/api/members/${state.memberId}`, { ...editable, additional_info: {
+    motherMaidenName: 'Santos', children: [{ name: 'Ana', age: '7' }, { name: '', age: '' }], incomeSources: [{ source: 'Rice', amount: '50000' }],
+    membershipType: 'Regular', orNumber: 'OR-9', notAllowed: 'dropped',
+  } });
+  assert.equal(withInfo.status, 200, JSON.stringify(withInfo.data));
+  assert.equal(withInfo.data.data.additional_info.motherMaidenName, 'Santos');
+  assert.deepEqual(withInfo.data.data.additional_info.children, [{ name: 'Ana', age: '7' }]);
+  assert.equal(withInfo.data.data.additional_info.notAllowed, undefined);
+  const keepsInfo = await admin.put(`/api/members/${state.memberId}`, { ...editable, phone: '09178888888' });
+  assert.equal(keepsInfo.data.data.additional_info.orNumber, 'OR-9', 'an update without additional_info keeps it');
 
   const archived = await admin.patch(`/api/members/${state.secondMemberId}/archive`);
   assert.equal(archived.status, 200, JSON.stringify(archived.data));
@@ -472,6 +494,36 @@ test('ocr: scanned forms are verified, posted to their module, and fakes are blo
   assert.ok(JSON.stringify(created.data).includes(membership.posted.recordId));
 
   stubAnalysis = DEFAULT_STUB_ANALYSIS;
+});
+
+test('ocr: retired or busy Gemini models fall back, and failed readings can be retried', { skip }, async () => {
+  const scanFile = (bytes, name) => { const form = new FormData(); form.append('document', new Blob([Buffer.concat([PNG, Buffer.from(bytes)])], { type: 'image/png' }), name); return form; };
+
+  // A retired model (404) and a busy one (503) are skipped for the next model.
+  Object.assign(process.env, { GEMINI_API_KEY: 'test-gemini', GEMINI_MODEL: 'gemini-2.5-flash', GEMINI_API_BASE: `http://127.0.0.1:${stubServer.address().port}/gemini` });
+  try {
+    const viaFallback = await admin.request('POST', '/api/ocr/analyze', { form: scanFile([201], 'fallback.png') });
+    assert.equal(viaFallback.status, 201, JSON.stringify(viaFallback.data));
+    assert.equal(viaFallback.data.data.processingStatus, 'completed');
+    assert.deepEqual(geminiCalls, ['gemini-2.5-flash', 'gemini-3.8-flash', 'gemini-flash-latest']);
+  } finally {
+    Object.assign(process.env, { GEMINI_API_KEY: '', GEMINI_MODEL: '', GEMINI_API_BASE: '' });
+  }
+
+  // When the AI is down the scan is kept, and Retry reads the stored file again.
+  stubMode = 'fail';
+  const failed = await admin.request('POST', '/api/ocr/analyze', { form: scanFile([202], 'busy.png') });
+  assert.equal(failed.data.data.processingStatus, 'failed');
+  assert.match(failed.data.data.processingError, /busy/i);
+  const stillDown = await admin.post(`/api/ocr/${failed.data.data.id}/retry`);
+  assert.equal(stillDown.status, 503);
+  stubMode = 'ok';
+  const retried = await admin.post(`/api/ocr/${failed.data.data.id}/retry`);
+  assert.equal(retried.status, 200, JSON.stringify(retried.data));
+  assert.equal(retried.data.data.processingStatus, 'completed');
+  assert.equal(retried.data.data.documentType, 'Payment Receipt');
+  const again = await admin.post(`/api/ocr/${failed.data.data.id}/retry`);
+  assert.equal(again.status, 409);
 });
 
 test('notifications, announcements and live updates', { skip }, async () => {
