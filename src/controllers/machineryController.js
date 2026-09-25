@@ -173,6 +173,26 @@ export async function updateMachinery(req, res) {
   return res.json({ success: true, machinery: machine });
 }
 
+// Inserts a pending rental request inside the caller's transaction. Shared by
+// the booking form and by OCR-posted machinery forms.
+export async function insertRentalRequest(client, req, { machineryId, memberId, purpose, notes, startDate, endDate }) {
+  const machine = (await client.query('SELECT id, name, daily_fee, status FROM machinery WHERE id = $1 FOR UPDATE', [cleanString(String(machineryId), 20)])).rows[0];
+  if (!machine) throw notFound('Machinery not found.');
+  if (machine.status === 'maintenance') throw conflict('That machinery is under maintenance and cannot be booked right now.');
+  await assertNoOverlap(client, machine.id, startDate, endDate);
+  const member = (await client.query(`SELECT id, TRIM(CONCAT_WS(' ', first_name, middle_name, last_name, suffix)) AS full_name FROM members WHERE id = $1 AND status = 'active'`, [memberId])).rows[0];
+  if (!member) throw badRequest('Active member record not found.');
+  const inserted = await client.query(
+    `INSERT INTO rental_requests (machinery_id, member_id, member_name, purpose, start_date, end_date, duration, rental_fee, notes)
+     VALUES ($3, $4, $5, $6, $1::date, $2::date, ${DURATION_SQL}, $7::numeric * ${DURATION_SQL}, $8) RETURNING id`,
+    [startDate, endDate, machine.id, member.id, member.full_name, purpose, machine.daily_fee, notes]
+  );
+  const id = inserted.rows[0].id;
+  await createAuditLog({ client, user: req.user, action: 'RENTAL_REQUESTED', module: 'Machinery', entityType: 'rental_request', entityId: String(id), description: `Rental request for ${machine.name} by ${member.full_name}`, newValues: { machinery_id: machine.id, start_date: startDate, end_date: endDate }, ...getRequestMeta(req) });
+  await notifyAdmins(client, { type: 'rental_requested', title: 'New rental request', message: `${member.full_name} requested ${machine.name} from ${startDate} to ${endDate}.`, link: '/machinery', entityType: 'rental_request', entityId: id, dedupeKey: `rental-${id}-requested` }, { exceptUserId: req.user.role === 'ADMIN' ? currentUserId(req) : null });
+  return (await client.query(`${requestSelect} WHERE r.id = $1`, [id])).rows[0];
+}
+
 export async function createRentalRequest(req, res) {
   const { machineryId, memberDatabaseId } = req.body || {};
   const purpose = cleanString(req.body?.purpose, 1000);
@@ -185,23 +205,7 @@ export async function createRentalRequest(req, res) {
   const requestedMemberId = req.user.role === 'ADMIN' ? parseId(memberDatabaseId, 'member') : Number(req.user.member_id);
   if (!Number.isInteger(requestedMemberId) || requestedMemberId <= 0) throw badRequest('A valid member is required.');
 
-  const request = await withTransaction(async (client) => {
-    const machine = (await client.query('SELECT id, name, daily_fee, status FROM machinery WHERE id = $1 FOR UPDATE', [cleanString(machineryId, 20)])).rows[0];
-    if (!machine) throw notFound('Machinery not found.');
-    if (machine.status === 'maintenance') throw conflict('That machinery is under maintenance and cannot be booked right now.');
-    await assertNoOverlap(client, machine.id, startDate, endDate);
-    const member = (await client.query(`SELECT id, TRIM(CONCAT_WS(' ', first_name, middle_name, last_name, suffix)) AS full_name FROM members WHERE id = $1 AND status = 'active'`, [requestedMemberId])).rows[0];
-    if (!member) throw badRequest('Active member record not found.');
-    const inserted = await client.query(
-      `INSERT INTO rental_requests (machinery_id, member_id, member_name, purpose, start_date, end_date, duration, rental_fee, notes)
-       VALUES ($3, $4, $5, $6, $1::date, $2::date, ${DURATION_SQL}, $7::numeric * ${DURATION_SQL}, $8) RETURNING id`,
-      [startDate, endDate, machine.id, member.id, member.full_name, purpose, machine.daily_fee, notes]
-    );
-    const id = inserted.rows[0].id;
-    await createAuditLog({ client, user: req.user, action: 'RENTAL_REQUESTED', module: 'Machinery', entityType: 'rental_request', entityId: String(id), description: `Rental request for ${machine.name} by ${member.full_name}`, newValues: { machinery_id: machine.id, start_date: startDate, end_date: endDate }, ...getRequestMeta(req) });
-    await notifyAdmins(client, { type: 'rental_requested', title: 'New rental request', message: `${member.full_name} requested ${machine.name} from ${startDate} to ${endDate}.`, link: '/machinery', entityType: 'rental_request', entityId: id, dedupeKey: `rental-${id}-requested` }, { exceptUserId: req.user.role === 'ADMIN' ? currentUserId(req) : null });
-    return (await client.query(`${requestSelect} WHERE r.id = $1`, [id])).rows[0];
-  });
+  const request = await withTransaction((client) => insertRentalRequest(client, req, { machineryId, memberId: requestedMemberId, purpose, notes, startDate, endDate }));
   return res.status(201).json({ success: true, request });
 }
 

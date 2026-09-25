@@ -74,7 +74,7 @@ const memberApplicationSelect = `SELECT id, member_number, first_name, middle_na
 const clean = (value, max = 1000) => cleanString(value, max);
 const optional = (value, max) => optionalString(value, max);
 
-function readDecimal(value, label, pattern = MONEY_PATTERN, max = 100000000) {
+export function readDecimal(value, label, pattern = MONEY_PATTERN, max = 100000000) {
   const text = String(value ?? '').trim();
   if (!pattern.test(text) || Number(text) > max) throw badRequest(`${label} must be a valid positive amount with up to two decimal places.`);
   return text;
@@ -115,7 +115,7 @@ function normaliseInKindItems(rawItems, loanMode) {
   return normalised;
 }
 
-async function prepareApplication(db, body, member) {
+export async function prepareApplication(db, body, member) {
   const loanType = clean(body.loanType || body.loan_type, 30).toLowerCase();
   const purpose = clean(body.purpose, 2000);
   const loanMode = clean(body.loanMode || body.loan_mode || 'cash', 20).toLowerCase();
@@ -135,7 +135,7 @@ async function prepareApplication(db, body, member) {
   const email = clean(body.borrowerEmail, 255) || member.email || '';
   const phone = clean(body.borrowerPhone, 30) || member.phone || '';
   const address = clean(body.borrowerAddress, 2000) || member.address || '';
-  if (!email || !EMAIL_PATTERN.test(email)) throw badRequest('A valid borrower email is required.');
+  if (email && !EMAIL_PATTERN.test(email)) throw badRequest('Borrower email format is invalid.');
   if (!phone || !PHONE_PATTERN.test(phone)) throw badRequest('A valid borrower contact number is required.');
   if (!address) throw badRequest('Borrower address is required.');
 
@@ -476,6 +476,47 @@ export async function recordPayment(req, res) {
   return res.status(201).json({ success: true, payment });
 }
 
+// Inserts a pending loan application inside the caller's transaction. Used by
+// the member self-service form and by OCR-posted loan forms, so both land in the
+// same admin approval queue.
+export async function insertLoanRequest(client, req, { member, application, income, submittedBy = 'member' }) {
+  const pending = await client.query(`SELECT 1 FROM loan_requests WHERE member_id = $1 AND loan_type = $2 AND status = 'pending'`, [member.id, application.loanType]);
+  if (pending.rows[0]) throw conflict(submittedBy === 'member' ? 'You already have a pending application for this loan type.' : 'This member already has a pending application for this loan type.');
+
+  const inserted = await client.query(
+    `INSERT INTO loan_requests (member_id, member_number, member_name, loan_type, amount, term, purpose, monthly_income,
+      borrower_email, borrower_phone, borrower_address, borrower_age, borrower_gender, borrower_civil_status, borrower_occupation,
+      years_farming, farm_location, barangay, municipality, province, farm_area, crops_planted, crop_season, irrigation_type,
+      irrigation_other, loan_mode, maximum_eligible_amount, interest_rate, calculated_interest, total_repayment, in_kind_items,
+      co_maker_name, co_maker_address, co_maker_contact, co_maker_relationship, collateral_type, collateral_details)
+     VALUES ($1, $2, $3, $4, $5::numeric, $6, $7, $8::numeric, $9, $10, $11, $12, $13, $14, $15, $16::numeric, $17, $18, $19, $20,
+       $21::numeric, $22, $23, $24, $25, $26, $27::numeric, $28::numeric, $29::numeric, $30::numeric, $31::jsonb, $32, $33, $34, $35, $36, $37)
+     RETURNING id`,
+    [member.id, member.member_number, member.full_name, application.loanType, application.requestedAmount, application.term,
+      application.purpose, income, application.borrowerEmail || null, application.borrowerPhone, application.borrowerAddress,
+      application.borrowerAge, application.borrowerGender, application.borrowerCivilStatus, application.borrowerOccupation,
+      application.yearsFarming, application.farmLocation, application.barangay, application.municipality, application.province,
+      application.farmArea, application.cropsPlanted, application.cropSeason, application.irrigationType, application.irrigationOther,
+      application.loanMode, application.financials.maximum_eligible_amount, LOAN_POLICY.interestRate,
+      application.financials.calculated_interest, application.financials.total_repayment, JSON.stringify(application.inKindItems),
+      application.coMaker.name, application.coMaker.address, application.coMaker.contact, application.coMaker.relationship,
+      application.collateralType, application.collateralDetails]
+  );
+  const id = inserted.rows[0].id;
+  await createAuditLog({ client, user: req.user, action: 'LOAN_APPLICATION_SUBMITTED', module: 'Loans', entityType: 'loan_request', entityId: String(id), description: `Loan application submitted by ${member.full_name}`, newValues: { amount: application.requestedAmount, term: application.term, loan_type: application.loanType }, ...getRequestMeta(req) });
+  await notifyAdmins(client, {
+    type: 'loan_submitted',
+    title: 'Loan application received',
+    message: `${member.full_name} applied for a ${application.loanType} loan of PHP ${Number(application.requestedAmount).toLocaleString('en-PH', { minimumFractionDigits: 2 })}.`,
+    link: '/loans',
+    entityType: 'loan_request',
+    entityId: id,
+    dedupeKey: `loan-request-${id}-submitted`,
+  });
+  await notifyMember(client, member.id, { type: 'loan_submitted', title: 'Loan application submitted', message: 'Your loan application was received and is waiting for review.', link: '/loan-status', entityType: 'loan_request', entityId: id, dedupeKey: `loan-request-${id}-received` });
+  return (await client.query(`${requestSelect} WHERE r.id = $1`, [id])).rows[0];
+}
+
 export async function createMemberLoanRequest(req, res) {
   const memberId = Number(req.user?.member_id);
   const request = await withTransaction(async (client) => {
@@ -483,41 +524,7 @@ export async function createMemberLoanRequest(req, res) {
     if (!member) throw badRequest('Your active member record could not be found.');
     const application = await prepareApplication(client, req.body || {}, member);
     const income = req.body?.monthlyIncome === '' || req.body?.monthlyIncome === undefined || req.body?.monthlyIncome === null ? '0' : readDecimal(req.body.monthlyIncome, 'Monthly income');
-    const pending = await client.query(`SELECT 1 FROM loan_requests WHERE member_id = $1 AND loan_type = $2 AND status = 'pending'`, [member.id, application.loanType]);
-    if (pending.rows[0]) throw conflict('You already have a pending application for this loan type.');
-
-    const inserted = await client.query(
-      `INSERT INTO loan_requests (member_id, member_number, member_name, loan_type, amount, term, purpose, monthly_income,
-        borrower_email, borrower_phone, borrower_address, borrower_age, borrower_gender, borrower_civil_status, borrower_occupation,
-        years_farming, farm_location, barangay, municipality, province, farm_area, crops_planted, crop_season, irrigation_type,
-        irrigation_other, loan_mode, maximum_eligible_amount, interest_rate, calculated_interest, total_repayment, in_kind_items,
-        co_maker_name, co_maker_address, co_maker_contact, co_maker_relationship, collateral_type, collateral_details)
-       VALUES ($1, $2, $3, $4, $5::numeric, $6, $7, $8::numeric, $9, $10, $11, $12, $13, $14, $15, $16::numeric, $17, $18, $19, $20,
-         $21::numeric, $22, $23, $24, $25, $26, $27::numeric, $28::numeric, $29::numeric, $30::numeric, $31::jsonb, $32, $33, $34, $35, $36, $37)
-       RETURNING id`,
-      [member.id, member.member_number, member.full_name, application.loanType, application.requestedAmount, application.term,
-        application.purpose, income, application.borrowerEmail, application.borrowerPhone, application.borrowerAddress,
-        application.borrowerAge, application.borrowerGender, application.borrowerCivilStatus, application.borrowerOccupation,
-        application.yearsFarming, application.farmLocation, application.barangay, application.municipality, application.province,
-        application.farmArea, application.cropsPlanted, application.cropSeason, application.irrigationType, application.irrigationOther,
-        application.loanMode, application.financials.maximum_eligible_amount, LOAN_POLICY.interestRate,
-        application.financials.calculated_interest, application.financials.total_repayment, JSON.stringify(application.inKindItems),
-        application.coMaker.name, application.coMaker.address, application.coMaker.contact, application.coMaker.relationship,
-        application.collateralType, application.collateralDetails]
-    );
-    const id = inserted.rows[0].id;
-    await createAuditLog({ client, user: req.user, action: 'LOAN_APPLICATION_SUBMITTED', module: 'Loans', entityType: 'loan_request', entityId: String(id), description: `Loan application submitted by ${member.full_name}`, newValues: { amount: application.requestedAmount, term: application.term, loan_type: application.loanType }, ...getRequestMeta(req) });
-    await notifyAdmins(client, {
-      type: 'loan_submitted',
-      title: 'Loan application received',
-      message: `${member.full_name} applied for a ${application.loanType} loan of PHP ${Number(application.requestedAmount).toLocaleString('en-PH', { minimumFractionDigits: 2 })}.`,
-      link: '/loans',
-      entityType: 'loan_request',
-      entityId: id,
-      dedupeKey: `loan-request-${id}-submitted`,
-    });
-    await notifyMember(client, member.id, { type: 'loan_submitted', title: 'Loan application submitted', message: 'Your loan application was received and is waiting for review.', link: '/loan-status', entityType: 'loan_request', entityId: id, dedupeKey: `loan-request-${id}-received` });
-    return (await client.query(`${requestSelect} WHERE r.id = $1`, [id])).rows[0];
+    return insertLoanRequest(client, req, { member, application, income });
   });
 
   void (async () => {
@@ -529,4 +536,4 @@ export async function createMemberLoanRequest(req, res) {
   return res.status(201).json({ success: true, request });
 }
 
-export { loanSelect, paymentSelect, requestSelect };
+export { loanSelect, memberApplicationSelect, paymentSelect, requestSelect };

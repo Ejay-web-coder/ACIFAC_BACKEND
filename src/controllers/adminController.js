@@ -7,7 +7,7 @@ import { isValidDateOnly } from '../utils/dates.js';
 import { badRequest, cleanString, conflict, currentUserId, forbidden, getRequestMeta, notFound, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { sendEmailSafely, sendTestEmail } from '../services/emailService.js';
 import { accountCreatedEmail, passwordResetEmail } from '../services/emailTemplates.js';
-import { notifyUser } from '../services/notificationService.js';
+import { backfillAnnouncementNotifications, notifyUser } from '../services/notificationService.js';
 
 const ACCOUNT_STATUSES = ['ACTIVE', 'INACTIVE', 'LOCKED'];
 
@@ -86,6 +86,7 @@ export async function createMemberAccount(req, res) {
       [numericMemberId, username, email, passwordHash, role]
     );
     const createdUser = insertResult.rows[0];
+    await backfillAnnouncementNotifications(client, createdUser.id, createdUser.role);
     const digest = digestToken(setupToken);
     await client.query(
       `INSERT INTO password_reset_tokens (user_id, token_hash, token_digest, expires_at) VALUES ($1, $2::text, $2::text, NOW() + INTERVAL '24 hours')`,

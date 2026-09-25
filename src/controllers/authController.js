@@ -13,10 +13,15 @@ const PHONE_PATTERN = /^[+0-9()\s.-]{7,30}$/;
 let dummyHashPromise = null;
 const getDummyHash = () => (dummyHashPromise ??= hashPassword(generateSecureToken(16)));
 
+// Members sign in with their username or member number; email sign-in is kept
+// for administrators only.
 async function findUserByIdentifier(identifier) {
   const result = await query(
-    `SELECT * FROM users WHERE LOWER(username) = LOWER($1) OR LOWER(email) = LOWER($1)
-     ORDER BY (LOWER(username) = LOWER($1)) DESC LIMIT 1`,
+    `SELECT u.* FROM users u LEFT JOIN members m ON m.id = u.member_id
+     WHERE LOWER(u.username) = LOWER($1)
+        OR (u.role = 'MEMBER' AND LOWER(m.member_number) = LOWER($1))
+        OR (u.role = 'ADMIN' AND LOWER(u.email) = LOWER($1))
+     ORDER BY (LOWER(u.username) = LOWER($1)) DESC LIMIT 1`,
     [identifier]
   );
   return result.rows[0] || null;
@@ -153,7 +158,8 @@ export async function me(req, res) {
 export async function updateProfile(req, res) {
   const userId = currentUserId(req);
   const fullName = optionalString(req.body?.name, 200);
-  const email = optionalString(req.body?.email, 255);
+  // Member accounts do not use email; only administrators can set one.
+  const email = req.user.role === 'ADMIN' ? optionalString(req.body?.email, 255) : undefined;
   const phone = optionalString(req.body?.phone, 50);
   const position = req.user.role === 'ADMIN' ? optionalString(req.body?.position, 120) : undefined;
   if (email && !EMAIL_PATTERN.test(email)) throw badRequest('Email format is invalid.');

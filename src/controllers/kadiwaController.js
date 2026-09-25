@@ -39,6 +39,80 @@ export async function listKadiwaData(req, res) {
   return res.json({ success: true, inventory: inventory.rows, sales: sales.rows, pagination: paginationMeta(page, limit, count.rows[0].total), summary: summary.rows[0] });
 }
 
+// Records one sale inside the caller's transaction: locks and decrements
+// inventory, writes the sale and its lines. Shared by the sales form and by
+// OCR-posted Kadiwa sales forms.
+export async function insertKadiwaSale(client, req, { encoderName, manual, expensesCents, items }) {
+  const totals = { ...manual };
+  const lines = [];
+  // Lock every product row in a fixed order so concurrent sales cannot
+  // oversell or deadlock.
+  const ids = [...new Set(items.map((item) => item.inventoryId))].sort();
+  const products = ids.length
+    ? (await client.query('SELECT id, name, category, unit, stock, price FROM kadiwa_inventory WHERE id = ANY($1::varchar[]) ORDER BY id FOR UPDATE', [ids])).rows
+    : [];
+  const byId = new Map(products.map((product) => [product.id, product]));
+  const requested = new Map();
+  for (const item of items) {
+    const product = byId.get(item.inventoryId);
+    if (!product) throw notFound('A selected product no longer exists.');
+    requested.set(product.id, (requested.get(product.id) || 0) + toCents(item.quantity));
+  }
+  for (const [id, quantityCents] of requested) {
+    const product = byId.get(id);
+    if (quantityCents > toCents(product.stock)) throw conflict(`Not enough stock for ${product.name}: ${Number(product.stock)} ${product.unit} available.`);
+  }
+  for (const item of items) {
+    const product = byId.get(item.inventoryId);
+    const line = (await client.query('SELECT ROUND($1::numeric * $2::numeric, 2) AS total', [item.quantity, product.price])).rows[0].total;
+    lines.push({ product, quantity: item.quantity, lineTotal: line });
+    totals[product.category] = (totals[product.category] || 0) + toCents(line);
+  }
+  // "Other" items have no dedicated column; they are counted with groceries.
+  const groceries = (totals.Groceries || 0) + (totals.Other || 0);
+  const net = groceries + (totals.Vegetables || 0) + (totals.Meat || 0) - expensesCents;
+
+  const id = (await client.query(
+    `INSERT INTO kadiwa_sales (id, encoder_name, groceries, vegetables, meat, total_expenses, net_sales, created_by)
+     VALUES ('S-' || TO_CHAR(${SQL_TODAY}, 'YYYY') || '-' || LPAD(nextval('kadiwa_sale_seq')::text, 5, '0'), $1, $2::numeric, $3::numeric, $4::numeric, $5::numeric, $6::numeric, $7)
+     RETURNING id`,
+    [encoderName, centsToString(groceries), centsToString(totals.Vegetables || 0), centsToString(totals.Meat || 0), centsToString(expensesCents), centsToString(net), currentUserId(req)]
+  )).rows[0].id;
+
+  for (const line of lines) {
+    await client.query(
+      `INSERT INTO kadiwa_sale_items (sale_id, inventory_id, item_name, category, unit, quantity, unit_price, line_total)
+       VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric)`,
+      [id, line.product.id, line.product.name, line.product.category, line.product.unit, line.quantity, line.product.price, line.lineTotal]
+    );
+  }
+  const lowStock = [];
+  for (const [productId, quantityCents] of requested) {
+    const updated = await client.query(
+      `UPDATE kadiwa_inventory SET stock = stock - $1::numeric, updated_at = NOW() WHERE id = $2 AND stock >= $1::numeric
+       RETURNING name, stock, reorder_level`,
+      [centsToString(quantityCents), productId]
+    );
+    if (!updated.rows[0]) throw conflict('Stock changed while saving the sale. Please try again.');
+    if (Number(updated.rows[0].stock) <= Number(updated.rows[0].reorder_level)) lowStock.push(updated.rows[0].name);
+  }
+  await createAuditLog({
+    client,
+    user: req.user,
+    action: 'KADIWA_SALE_CREATED',
+    module: 'Kadiwa',
+    entityType: 'kadiwa_sale',
+    entityId: id,
+    description: `Recorded Kadiwa sale ${id}`,
+    newValues: { net_sales: centsToString(net), items: lines.map((line) => ({ id: line.product.id, quantity: line.quantity })) },
+    ...getRequestMeta(req),
+  });
+  if (lowStock.length) {
+    await notifyAdmins(client, { type: 'low_stock', title: 'Kadiwa stock is low', message: `${lowStock.join(', ')} ${lowStock.length === 1 ? 'is' : 'are'} at or below the reorder level.`, severity: 'warning', link: '/kadiwa', entityType: 'kadiwa_sale', entityId: id, dedupeKey: `low-stock-${id}` });
+  }
+  return id;
+}
+
 // A sale may include inventory items (stock is decremented) plus optional
 // manual amounts per category for goods that are not tracked in inventory.
 export async function createKadiwaSale(req, res) {
@@ -61,76 +135,7 @@ export async function createKadiwaSale(req, res) {
   });
   if (!items.length && Object.values(manual).every((cents) => cents === 0)) throw badRequest('Add at least one sold item or sales amount.');
 
-  const saleId = await withTransaction(async (client) => {
-    const totals = { ...manual };
-    const lines = [];
-    // Lock every product row in a fixed order so concurrent sales cannot
-    // oversell or deadlock.
-    const ids = [...new Set(items.map((item) => item.inventoryId))].sort();
-    const products = ids.length
-      ? (await client.query('SELECT id, name, category, unit, stock, price FROM kadiwa_inventory WHERE id = ANY($1::varchar[]) ORDER BY id FOR UPDATE', [ids])).rows
-      : [];
-    const byId = new Map(products.map((product) => [product.id, product]));
-    const requested = new Map();
-    for (const item of items) {
-      const product = byId.get(item.inventoryId);
-      if (!product) throw notFound('A selected product no longer exists.');
-      requested.set(product.id, (requested.get(product.id) || 0) + toCents(item.quantity));
-    }
-    for (const [id, quantityCents] of requested) {
-      const product = byId.get(id);
-      if (quantityCents > toCents(product.stock)) throw conflict(`Not enough stock for ${product.name}: ${Number(product.stock)} ${product.unit} available.`);
-    }
-    for (const item of items) {
-      const product = byId.get(item.inventoryId);
-      const line = (await client.query('SELECT ROUND($1::numeric * $2::numeric, 2) AS total', [item.quantity, product.price])).rows[0].total;
-      lines.push({ product, quantity: item.quantity, lineTotal: line });
-      totals[product.category] = (totals[product.category] || 0) + toCents(line);
-    }
-    // "Other" items have no dedicated column; they are counted with groceries.
-    const groceries = (totals.Groceries || 0) + (totals.Other || 0);
-    const net = groceries + (totals.Vegetables || 0) + (totals.Meat || 0) - expensesCents;
-
-    const id = (await client.query(
-      `INSERT INTO kadiwa_sales (id, encoder_name, groceries, vegetables, meat, total_expenses, net_sales, created_by)
-       VALUES ('S-' || TO_CHAR(${SQL_TODAY}, 'YYYY') || '-' || LPAD(nextval('kadiwa_sale_seq')::text, 5, '0'), $1, $2::numeric, $3::numeric, $4::numeric, $5::numeric, $6::numeric, $7)
-       RETURNING id`,
-      [encoderName, centsToString(groceries), centsToString(totals.Vegetables || 0), centsToString(totals.Meat || 0), centsToString(expensesCents), centsToString(net), currentUserId(req)]
-    )).rows[0].id;
-
-    for (const line of lines) {
-      await client.query(
-        `INSERT INTO kadiwa_sale_items (sale_id, inventory_id, item_name, category, unit, quantity, unit_price, line_total)
-         VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric)`,
-        [id, line.product.id, line.product.name, line.product.category, line.product.unit, line.quantity, line.product.price, line.lineTotal]
-      );
-    }
-    const lowStock = [];
-    for (const [productId, quantityCents] of requested) {
-      const updated = await client.query(
-        `UPDATE kadiwa_inventory SET stock = stock - $1::numeric, updated_at = NOW() WHERE id = $2 AND stock >= $1::numeric
-         RETURNING name, stock, reorder_level`,
-        [centsToString(quantityCents), productId]
-      );
-      if (!updated.rows[0]) throw conflict('Stock changed while saving the sale. Please try again.');
-      if (Number(updated.rows[0].stock) <= Number(updated.rows[0].reorder_level)) lowStock.push(updated.rows[0].name);
-    }
-    await createAuditLog({
-      client,
-      user: req.user,
-      action: 'KADIWA_SALE_CREATED',
-      module: 'Kadiwa',
-      entityType: 'kadiwa_sale',
-      entityId: id,
-      description: `Recorded Kadiwa sale ${id}`,
-      newValues: { net_sales: centsToString(net), items: lines.map((line) => ({ id: line.product.id, quantity: line.quantity })) },
-      ...getRequestMeta(req),
-    });
-    if (lowStock.length) {
-      await notifyAdmins(client, { type: 'low_stock', title: 'Kadiwa stock is low', message: `${lowStock.join(', ')} ${lowStock.length === 1 ? 'is' : 'are'} at or below the reorder level.`, severity: 'warning', link: '/kadiwa', entityType: 'kadiwa_sale', entityId: id, dedupeKey: `low-stock-${id}` });
-    }
-    return id;
-  });
+  const saleId = await withTransaction((client) => insertKadiwaSale(client, req, { encoderName, manual, expensesCents, items }));
   const sale = await query(`${salesSelect} WHERE s.id = $1`, [saleId]);
   return res.status(201).json({ success: true, sale: sale.rows[0] });
 }

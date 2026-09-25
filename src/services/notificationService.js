@@ -21,6 +21,24 @@ export async function createNotifications(db, userIds, notification) {
   return result.rowCount;
 }
 
+// Announcement notifications are created when an announcement is posted, so an
+// account created afterwards would never see it. Called when an account is
+// created, this adds the still-active announcements its role may see, dated
+// when they were posted.
+export async function backfillAnnouncementNotifications(db, userId, role) {
+  const result = await runner(db)(
+    `INSERT INTO notifications (user_id, type, title, message, severity, link, entity_type, entity_id, dedupe_key, created_at)
+     SELECT $1, 'announcement', LEFT('Announcement: ' || a.title, 200),
+            CASE WHEN LENGTH(a.message) > 240 THEN LEFT(a.message, 237) || '...' ELSE a.message END,
+            'info', NULL, 'announcement', a.id::text, 'announcement-' || a.id, a.created_at
+     FROM announcements a
+     WHERE a.archived_at IS NULL AND (a.audience = 'All Members' OR $2 = 'ADMIN')
+     ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`,
+    [userId, role]
+  );
+  return result.rowCount;
+}
+
 export async function notifyAdmins(db, notification, { exceptUserId = null } = {}) {
   const admins = await runner(db)(
     `SELECT id FROM users WHERE role = 'ADMIN' AND account_status = 'ACTIVE' AND ($1::int IS NULL OR id <> $1)`,

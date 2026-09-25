@@ -4,6 +4,7 @@ import {
   archiveMember,
   createMember,
   createSavingsRecord,
+  importMembers,
   downloadMemberDocument,
   getMember,
   getMemberStatistics,
@@ -34,6 +35,7 @@ router.get('/statistics', getMemberStatistics);
 router.get('/archived', listArchivedMembers);
 router.get('/savings', listSavingsRecords);
 router.post('/savings', createSavingsRecord);
+router.post('/import', importMembers);
 router.post('/', memberDocumentUpload.fields([
   { name: 'idDocument', maxCount: 1 },
   { name: 'profilePhoto', maxCount: 1 },

@@ -16,6 +16,8 @@ let baseUrl;
 let server;
 let stubServer;
 let stubMode = 'ok';
+const DEFAULT_STUB_ANALYSIS = { documentType: 'Payment Receipt', confidence: 92, ocrText: 'Receipt 123', extractedData: { 'Member Name': 'Juan Dela Cruz', 'Payment Amount': '500.00' } };
+let stubAnalysis = DEFAULT_STUB_ANALYSIS;
 let pool;
 const sentEmails = [];
 const ORIGIN = 'http://localhost:5173';
@@ -66,15 +68,16 @@ before(async () => {
     DATABASE_URL: TEST_DB, DATABASE_SSL: 'disable', NODE_ENV: 'test', CORS_ORIGIN: ORIGIN, FRONTEND_URL: ORIGIN,
     MEMBER_DOCUMENT_DIR: docs, OCR_AI_API_KEY: 'test-key', API_RATE_LIMIT_PER_MINUTE: '100000', EMAIL_FROM: 'test@acifac.local',
   });
-  delete process.env.GEMINI_API_KEY;
-  delete process.env.SUPABASE_URL;
+  // Blank (not delete): src/config/env.js loads .env with dotenv, which only
+  // fills variables that are unset, and .env points at the real services.
+  Object.assign(process.env, { GEMINI_API_KEY: '', SUPABASE_URL: '', SUPABASE_SERVICE_ROLE_KEY: '', SUPABASE_DB_URL: TEST_DB, SUPABASE_DB_LISTEN_URL: TEST_DB });
 
   stubServer = http.createServer((req, res) => {
     req.resume();
     req.on('end', () => {
       if (stubMode === 'fail') { res.writeHead(500); res.end('{}'); return; }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ documentType: 'Payment Receipt', confidence: 92, ocrText: 'Receipt 123', extractedData: { 'Member Name': 'Juan Dela Cruz', 'Payment Amount': '500.00' } }) } }] }));
+      res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(stubAnalysis) } }] }));
     });
   }).listen(0);
   process.env.OCR_AI_URL = `http://127.0.0.1:${stubServer.address().port}/v1/chat/completions`;
@@ -387,6 +390,90 @@ test('ocr: upload, classify, duplicate, failure recorded and retried, review sav
   assert.equal(file.status, 200);
 });
 
+test('ocr: scanned forms are verified, posted to their module, and fakes are blocked', { skip }, async () => {
+  const memberRecord = await admin.get(`/api/members/${state.memberId}`);
+  const memberNumber = memberRecord.data.data.member_number;
+  const genuine = { score: 95, verdict: 'genuine', physicalDocument: true, filledIn: true, signaturePresent: true, issues: [] };
+  let counter = 10;
+  const scan = async (analysis, source = 'camera') => {
+    stubAnalysis = analysis;
+    counter += 1;
+    const form = new FormData();
+    form.append('source', source);
+    form.append('document', new Blob([Buffer.concat([PNG, Buffer.from([counter])])], { type: 'image/png' }), `form-${counter}.png`);
+    const response = await admin.request('POST', '/api/ocr/analyze', { form });
+    assert.equal(response.status, 201, JSON.stringify(response.data));
+    return response.data.data;
+  };
+  const savingsForm = (overrides = {}, authenticity = genuine) => ({
+    documentType: 'Savings Form', confidence: 94, ocrText: 'ACIFAC SAVINGS DEPOSIT',
+    extractedData: { memberNumber, memberName: 'Juan Dela Cruz', amount: '₱1,250.00', date: '2026-01-20', paymentMethod: 'cash', referenceNumber: 'SV-OCR-1', ...overrides },
+    authenticity,
+  });
+
+  const forms = await admin.get('/api/ocr/forms');
+  assert.deepEqual(forms.data.data.map((form) => form.type), ['Membership Form', 'Loan Form', 'Savings Form', 'Machinery Form', 'Kadiwa Sales Form']);
+
+  // A genuine, complete savings form is verified and posted automatically.
+  const posted = await scan(savingsForm());
+  assert.equal(posted.captureSource, 'camera');
+  assert.equal(posted.verification.status, 'passed', JSON.stringify(posted.verification));
+  assert.equal(posted.reviewStatus, 'posted');
+  assert.equal(posted.posted.module, 'savings');
+  assert.equal(posted.posted.automatically, true);
+  assert.equal(posted.extractedData.amount, '1250.00');
+  const savings = await admin.get(`/api/members/savings?memberId=${state.memberId}`);
+  assert.ok(savings.data.data.some((row) => row.reference === 'SV-OCR-1' && Number(row.amount) === 1250));
+
+  // The same paper form photographed again is not posted twice.
+  const twin = await scan(savingsForm());
+  assert.equal(twin.verification.status, 'failed');
+  assert.equal(twin.posted, null);
+  assert.ok(twin.verification.checks.some((check) => check.id === 'duplicate' && check.status === 'fail'));
+
+  // A form the AI judges fake cannot be posted, even by an admin.
+  const fake = await scan(savingsForm({ referenceNumber: 'SV-OCR-2' }, { ...genuine, score: 20, verdict: 'fake', issues: ['Amount was overwritten'] }));
+  assert.equal(fake.verification.status, 'failed');
+  const blocked = await admin.post(`/api/ocr/${fake.id}/post`, { documentType: 'Savings Form', extractedData: fake.extractedData, acknowledgeWarnings: true });
+  assert.equal(blocked.status, 422);
+
+  // The name on the form must belong to the member ID on the form.
+  const wrongName = await scan(savingsForm({ referenceNumber: 'SV-OCR-3', memberName: 'Pedro Penduko' }));
+  assert.ok(wrongName.verification.checks.some((check) => check.id === 'member' && check.status === 'fail'));
+
+  // Warnings (no signature) hold the form for review; the admin confirms and posts it.
+  const unsigned = await scan(savingsForm({ referenceNumber: 'SV-OCR-4', amount: '300' }, { ...genuine, signaturePresent: false }));
+  assert.equal(unsigned.verification.status, 'warning');
+  assert.equal(unsigned.posted, null);
+  const needsAck = await admin.post(`/api/ocr/${unsigned.id}/post`, { documentType: 'Savings Form', extractedData: unsigned.extractedData });
+  assert.equal(needsAck.status, 422);
+  const manual = await admin.post(`/api/ocr/${unsigned.id}/post`, { documentType: 'Savings Form', extractedData: unsigned.extractedData, acknowledgeWarnings: true });
+  assert.equal(manual.status, 200, JSON.stringify(manual.data));
+  assert.equal(manual.data.data.posted.automatically, false);
+  const again = await admin.post(`/api/ocr/${unsigned.id}/post`, { documentType: 'Savings Form', extractedData: unsigned.extractedData, acknowledgeWarnings: true });
+  assert.equal(again.status, 409);
+
+  // A Kadiwa sales form whose written total does not add up is rejected.
+  const badTotals = await scan({
+    documentType: 'Kadiwa Sales Form', confidence: 93, ocrText: 'KADIWA SALES',
+    extractedData: { encoderName: 'Maria', saleDate: '2026-01-20', groceriesPrice: '1000', vegetablesPrice: '500', meatPrice: '0', totalExpenses: '100', netSales: '1900' },
+    authenticity: { ...genuine, signaturePresent: false },
+  }, 'upload');
+  assert.ok(badTotals.verification.checks.some((check) => check.id === 'totals' && check.status === 'fail'));
+
+  // A scanned membership form registers the applicant, with the scan kept as their document.
+  const membership = await scan({
+    documentType: 'Membership Form', confidence: 96, ocrText: 'ACIFAC MEMBERSHIP APPLICATION',
+    extractedData: { firstName: 'Rosa', lastName: 'Magsaysay', email: 'rosa.ocr@example.com', phone: '09181234567', address: 'Purok 3, Amnay', membershipDate: '2026-01-10', dateOfBirth: '03/15/1990' },
+    authenticity: genuine,
+  });
+  assert.equal(membership.posted?.module, 'members', JSON.stringify(membership.verification));
+  const created = await admin.get(`/api/members?search=${encodeURIComponent('rosa.ocr@example.com')}`);
+  assert.ok(JSON.stringify(created.data).includes(membership.posted.recordId));
+
+  stubAnalysis = DEFAULT_STUB_ANALYSIS;
+});
+
 test('notifications, announcements and live updates', { skip }, async () => {
   const events = [];
   const controller = new AbortController();
@@ -439,7 +526,7 @@ test('notifications, announcements and live updates', { skip }, async () => {
 test('dashboard and analytics use real data', { skip }, async () => {
   const dashboard = await admin.get('/api/admin/dashboard');
   assert.equal(dashboard.status, 200);
-  assert.equal(dashboard.data.stats.totalMembers, 2);
+  assert.equal(dashboard.data.stats.totalMembers, 3); // two registered directly, one from a scanned membership form
   assert.ok(dashboard.data.recentActivities.length > 0);
   const analytics = await admin.get('/api/admin/analytics?from=2000-01-01&to=2999-12-31');
   assert.equal(analytics.status, 200, JSON.stringify(analytics.data));

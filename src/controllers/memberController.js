@@ -2,7 +2,7 @@ import { query, withTransaction } from '../config/db.js';
 import { SQL_TODAY } from '../config/env.js';
 import { createAuditLog } from '../utils/audit.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
-import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, optionalString, paginationMeta, parseId, parsePagination } from '../utils/http.js';
+import { AppError, badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, optionalString, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import { assertValidUpload, BUCKETS, removeFile, safeOriginalName, sendStoredFile, uploadFile } from '../services/storage.js';
 import { notifyMember } from '../services/notificationService.js';
@@ -56,7 +56,7 @@ function numericOrNull(value) {
   return Number(value);
 }
 
-function validateMemberInput(body) {
+export function validateMemberInput(body) {
   const errors = [];
   const values = {
     firstName: cleanString(body.first_name, 100),
@@ -311,6 +311,49 @@ async function getSavingsDetails(db, memberId) {
   return { transactions: result.rows.map((row) => ({ ...row, amount: Number(row.amount) })), total: Number(total.rows[0].total) };
 }
 
+// Inserts one savings deposit inside the caller's transaction. Shared by the
+// savings form and by OCR-posted savings forms.
+export async function insertSavingsDeposit(client, req, { memberId, amountCents, date, paymentMethod, reference, notes }) {
+  const member = (await client.query('SELECT id, member_number, status FROM members WHERE id = $1 FOR UPDATE', [memberId])).rows[0];
+  if (!member) throw notFound('Member not found.');
+  if (member.status === 'archived') throw badRequest('Savings cannot be recorded for an archived member.');
+  if (reference) {
+    const duplicate = await client.query('SELECT 1 FROM savings_transactions WHERE member_id = $1 AND LOWER(reference_number) = LOWER($2)', [memberId, reference]);
+    if (duplicate.rows[0]) throw conflict('A savings record with this reference number already exists for this member.');
+  }
+  const before = (await client.query('SELECT COALESCE(SUM(amount), 0) AS total FROM savings_transactions WHERE member_id = $1', [memberId])).rows[0].total;
+  const inserted = (await client.query(
+    `INSERT INTO savings_transactions (member_id, transaction_type, amount, transaction_date, payment_method, reference_number, notes, recorded_by)
+     VALUES ($1, 'deposit', $2::numeric, $3, $4, $5, $6, $7)
+     RETURNING id, member_id AS "memberId", amount, transaction_date AS date, payment_method AS "paymentMethod", reference_number AS reference, notes, created_at AS "createdAt"`,
+    [memberId, centsToString(amountCents), date, paymentMethod, reference, notes, currentUserId(req)]
+  )).rows[0];
+  const newTotal = centsToString(toCents(before) + amountCents);
+  await createAuditLog({
+    client,
+    user: req.user,
+    action: 'SAVINGS_DEPOSIT_CREATED',
+    module: 'Savings',
+    entityType: 'savings_transaction',
+    entityId: String(inserted.id),
+    description: `Recorded savings deposit for member ${member.member_number || memberId}`,
+    oldValues: { total_savings: before },
+    newValues: { member_id: memberId, amount: centsToString(amountCents), total_savings: newTotal, date, payment_method: paymentMethod, reference_number: reference },
+    ...getRequestMeta(req),
+  });
+  await notifyMember(client, memberId, {
+    type: 'savings_recorded',
+    title: 'Savings deposit recorded',
+    message: `A savings deposit of PHP ${Number(centsToString(amountCents)).toLocaleString('en-PH', { minimumFractionDigits: 2 })} was recorded. Your total savings are PHP ${Number(newTotal).toLocaleString('en-PH', { minimumFractionDigits: 2 })}.`,
+    severity: 'success',
+    link: '/member-profile',
+    entityType: 'savings_transaction',
+    entityId: inserted.id,
+    dedupeKey: `savings-${inserted.id}`,
+  });
+  return { record: { ...inserted, amount: Number(inserted.amount), type: 'Deposit', status: 'Completed' }, total: Number(newTotal) };
+}
+
 // POST /api/members/savings  { memberId, amount, date, paymentMethod?, reference?, notes? }
 // Savings deposits are a separate ledger from share capital (no PHP 20,000 cap).
 export async function createSavingsRecord(req, res) {
@@ -325,46 +368,7 @@ export async function createSavingsRecord(req, res) {
   if (date > todayDateOnly()) throw badRequest('Savings date cannot be in the future.');
   if (!SAVINGS_METHODS.includes(paymentMethod)) throw badRequest(`Payment method must be one of: ${SAVINGS_METHODS.join(', ')}.`);
 
-  const result = await withTransaction(async (client) => {
-    const member = (await client.query('SELECT id, member_number, status FROM members WHERE id = $1 FOR UPDATE', [memberId])).rows[0];
-    if (!member) throw notFound('Member not found.');
-    if (member.status === 'archived') throw badRequest('Savings cannot be recorded for an archived member.');
-    if (reference) {
-      const duplicate = await client.query('SELECT 1 FROM savings_transactions WHERE member_id = $1 AND LOWER(reference_number) = LOWER($2)', [memberId, reference]);
-      if (duplicate.rows[0]) throw conflict('A savings record with this reference number already exists for this member.');
-    }
-    const before = (await client.query('SELECT COALESCE(SUM(amount), 0) AS total FROM savings_transactions WHERE member_id = $1', [memberId])).rows[0].total;
-    const inserted = (await client.query(
-      `INSERT INTO savings_transactions (member_id, transaction_type, amount, transaction_date, payment_method, reference_number, notes, recorded_by)
-       VALUES ($1, 'deposit', $2::numeric, $3, $4, $5, $6, $7)
-       RETURNING id, member_id AS "memberId", amount, transaction_date AS date, payment_method AS "paymentMethod", reference_number AS reference, notes, created_at AS "createdAt"`,
-      [memberId, centsToString(amountCents), date, paymentMethod, reference, notes, currentUserId(req)]
-    )).rows[0];
-    const newTotal = centsToString(toCents(before) + amountCents);
-    await createAuditLog({
-      client,
-      user: req.user,
-      action: 'SAVINGS_DEPOSIT_CREATED',
-      module: 'Savings',
-      entityType: 'savings_transaction',
-      entityId: String(inserted.id),
-      description: `Recorded savings deposit for member ${member.member_number || memberId}`,
-      oldValues: { total_savings: before },
-      newValues: { member_id: memberId, amount: centsToString(amountCents), total_savings: newTotal, date, payment_method: paymentMethod, reference_number: reference },
-      ...getRequestMeta(req),
-    });
-    await notifyMember(client, memberId, {
-      type: 'savings_recorded',
-      title: 'Savings deposit recorded',
-      message: `A savings deposit of PHP ${Number(centsToString(amountCents)).toLocaleString('en-PH', { minimumFractionDigits: 2 })} was recorded. Your total savings are PHP ${Number(newTotal).toLocaleString('en-PH', { minimumFractionDigits: 2 })}.`,
-      severity: 'success',
-      link: '/member-profile',
-      entityType: 'savings_transaction',
-      entityId: inserted.id,
-      dedupeKey: `savings-${inserted.id}`,
-    });
-    return { record: { ...inserted, amount: Number(inserted.amount), type: 'Deposit', status: 'Completed' }, total: Number(newTotal) };
-  });
+  const result = await withTransaction((client) => insertSavingsDeposit(client, req, { memberId, amountCents, date, paymentMethod, reference, notes }));
   return res.status(201).json({ success: true, data: result.record, memberTotal: result.total, message: 'Savings recorded.' });
 }
 
@@ -437,14 +441,74 @@ async function findDuplicateMember(client, values, dateOfBirth, rsbsaNo, exclude
   return duplicates.rows[0] || null;
 }
 
+export function parseShareCapital(body, errors) {
+  const shareCapitalCents = body.share_capital === undefined || body.share_capital === null || body.share_capital === '' ? 0 : parseMoneyInput(body.share_capital, { allowZero: true });
+  if (shareCapitalCents === null) errors.push('Share capital must be a non-negative amount with up to two decimals.');
+  else if (shareCapitalCents > toCents(SHARE_CAPITAL_LIMIT)) errors.push('Share capital cannot exceed the PHP 20,000 maximum limit.');
+  return shareCapitalCents;
+}
+
+// Inserts one validated member inside an open transaction and assigns the next
+// ACIFAC-YYYY-NNN number. The advisory lock serialises numbering across requests.
+export async function insertMemberRecord(client, req, { body, values, shareCapitalCents, idDocument = null, idDocumentRef = null, photoRef = null, source = 'registration' }) {
+  const duplicate = await findDuplicateMember(client, values, cleanString(body.date_of_birth, 10), cleanString(body.rsbsa_no, 100));
+  if (duplicate) throw conflict(`This member appears to be already registered (${duplicate.member_number}). Check the email, RSBSA number, or name and birth date.`);
+
+  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['acifac-member-number']);
+  const year = todayDateOnly().slice(0, 4);
+  const numberResult = await client.query(
+    `SELECT COALESCE(MAX(NULLIF(SPLIT_PART(member_number, '-', 3), '')::int), 0) + 1 AS next_number
+     FROM members WHERE member_number ~ $1`,
+    [`^ACIFAC-${year}-[0-9]+$`]
+  );
+  const memberNumber = `ACIFAC-${year}-${String(numberResult.rows[0].next_number).padStart(3, '0')}`;
+  const insert = await client.query(
+    `INSERT INTO members (member_number, first_name, middle_name, last_name, suffix, email, phone, address,
+                          barangay, municipality, province, date_of_birth, gender, civil_status, education,
+                          id_type, id_number, rsbsa_no, livelihood, farm_area_ha, corn_area_ha, palay_area_ha,
+                          yearly_income, spouse_name, spouse_age, spouse_contact, children, emergency_contact,
+                          id_document_path, id_document_name, id_document_type, id_document_size, membership_date,
+                          share_capital, status, profile_photo, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+             $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34::numeric, $35, $36, NOW())
+     RETURNING id`,
+    [memberNumber, values.firstName, optionalString(body.middle_name, 100), values.lastName, optionalString(body.suffix, 20), values.email,
+      values.phone, values.address, optionalString(body.barangay, 150), optionalString(body.municipality, 150), optionalString(body.province, 150),
+      optionalString(body.date_of_birth, 10), optionalString(body.gender, 30), optionalString(body.civil_status, 30), optionalString(body.education, 50), optionalString(body.id_type, 50),
+      optionalString(body.id_number, 100), optionalString(body.rsbsa_no, 100), optionalString(body.livelihood, 255), numericOrNull(body.farm_area_ha),
+      numericOrNull(body.corn_area_ha), numericOrNull(body.palay_area_ha), numericOrNull(body.yearly_income),
+      optionalString(body.spouse_name, 200), numericOrNull(body.spouse_age), optionalString(body.spouse_contact, 30), optionalString(body.children, 2000),
+      optionalString(body.emergency_contact, 255), idDocumentRef, idDocument ? safeOriginalName(idDocument.originalname) : null, idDocument?.mimetype ?? null, idDocument?.size ?? null,
+      values.membershipDate, centsToString(shareCapitalCents), values.status, photoRef]
+  );
+  const id = insert.rows[0].id;
+  if (shareCapitalCents > 0) {
+    await client.query(
+      `INSERT INTO share_contributions (member_id, amount, contribution_date, payment_method, reference_number, notes, recorded_by)
+       VALUES ($1, $2::numeric, $3, 'Initial', $4, 'Initial share capital recorded with member registration.', $5)`,
+      [id, centsToString(shareCapitalCents), values.membershipDate, `INITIAL-${memberNumber}`, currentUserId(req)]
+    );
+  }
+  await createAuditLog({
+    client,
+    user: req.user,
+    action: 'MEMBER_CREATED',
+    module: 'Members',
+    entityType: 'member',
+    entityId: String(id),
+    description: source === 'import' ? `Imported member ${memberNumber}` : `Created member ${memberNumber}`,
+    newValues: { member_number: memberNumber, name: `${values.firstName} ${values.lastName}`, share_capital: centsToString(shareCapitalCents), source },
+    ...getRequestMeta(req),
+  });
+  return { id, memberNumber };
+}
+
 export async function createMember(req, res) {
   const body = req.body || {};
   const idDocument = req.files?.idDocument?.[0] || null;
   const profilePhoto = req.files?.profilePhoto?.[0] || null;
   const { errors, values } = validateMemberInput(body);
-  const shareCapitalCents = body.share_capital === undefined || body.share_capital === '' ? 0 : parseMoneyInput(body.share_capital, { allowZero: true });
-  if (shareCapitalCents === null) errors.push('Share capital must be a non-negative amount with up to two decimals.');
-  else if (shareCapitalCents > toCents(SHARE_CAPITAL_LIMIT)) errors.push('Share capital cannot exceed the PHP 20,000 maximum limit.');
+  const shareCapitalCents = parseShareCapital(body, errors);
   if (errors.length) throw badRequest(errors[0], errors);
   assertValidUpload(idDocument, DOCUMENT_TYPES, 'ID document');
   if (profilePhoto) assertValidUpload(profilePhoto, IMAGE_TYPES, 'profile photo');
@@ -455,58 +519,7 @@ export async function createMember(req, res) {
   const photoRef = profilePhoto ? await uploadFile({ bucket: BUCKETS.memberPhotos, folder, file: profilePhoto }) : null;
 
   try {
-    const memberId = await withTransaction(async (client) => {
-      const duplicate = await findDuplicateMember(client, values, cleanString(body.date_of_birth, 10), cleanString(body.rsbsa_no, 100));
-      if (duplicate) throw conflict(`This member appears to be already registered (${duplicate.member_number}). Check the email, RSBSA number, or name and birth date.`);
-
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['acifac-member-number']);
-      const year = todayDateOnly().slice(0, 4);
-      const numberResult = await client.query(
-        `SELECT COALESCE(MAX(NULLIF(SPLIT_PART(member_number, '-', 3), '')::int), 0) + 1 AS next_number
-         FROM members WHERE member_number ~ $1`,
-        [`^ACIFAC-${year}-[0-9]+$`]
-      );
-      const memberNumber = `ACIFAC-${year}-${String(numberResult.rows[0].next_number).padStart(3, '0')}`;
-      const insert = await client.query(
-        `INSERT INTO members (member_number, first_name, middle_name, last_name, suffix, email, phone, address,
-                              barangay, municipality, province, date_of_birth, gender, civil_status, education,
-                              id_type, id_number, rsbsa_no, livelihood, farm_area_ha, corn_area_ha, palay_area_ha,
-                              yearly_income, spouse_name, spouse_age, spouse_contact, children, emergency_contact,
-                              id_document_path, id_document_name, id_document_type, id_document_size, membership_date,
-                              share_capital, status, profile_photo, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                 $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34::numeric, $35, $36, NOW())
-         RETURNING id`,
-        [memberNumber, values.firstName, optionalString(body.middle_name, 100), values.lastName, optionalString(body.suffix, 20), values.email,
-          values.phone, values.address, optionalString(body.barangay, 150), optionalString(body.municipality, 150), optionalString(body.province, 150),
-          optionalString(body.date_of_birth, 10), optionalString(body.gender, 30), optionalString(body.civil_status, 30), optionalString(body.education, 50), optionalString(body.id_type, 50),
-          optionalString(body.id_number, 100), optionalString(body.rsbsa_no, 100), optionalString(body.livelihood, 255), numericOrNull(body.farm_area_ha),
-          numericOrNull(body.corn_area_ha), numericOrNull(body.palay_area_ha), numericOrNull(body.yearly_income),
-          optionalString(body.spouse_name, 200), numericOrNull(body.spouse_age), optionalString(body.spouse_contact, 30), optionalString(body.children, 2000),
-          optionalString(body.emergency_contact, 255), idDocumentRef, safeOriginalName(idDocument.originalname), idDocument.mimetype, idDocument.size,
-          values.membershipDate, centsToString(shareCapitalCents), values.status, photoRef]
-      );
-      const id = insert.rows[0].id;
-      if (shareCapitalCents > 0) {
-        await client.query(
-          `INSERT INTO share_contributions (member_id, amount, contribution_date, payment_method, reference_number, notes, recorded_by)
-           VALUES ($1, $2::numeric, $3, 'Initial', $4, 'Initial share capital recorded with member registration.', $5)`,
-          [id, centsToString(shareCapitalCents), values.membershipDate, `INITIAL-${memberNumber}`, currentUserId(req)]
-        );
-      }
-      await createAuditLog({
-        client,
-        user: req.user,
-        action: 'MEMBER_CREATED',
-        module: 'Members',
-        entityType: 'member',
-        entityId: String(id),
-        description: `Created member ${memberNumber}`,
-        newValues: { member_number: memberNumber, name: `${values.firstName} ${values.lastName}`, share_capital: centsToString(shareCapitalCents) },
-        ...getRequestMeta(req),
-      });
-      return id;
-    });
+    const { id: memberId } = await withTransaction((client) => insertMemberRecord(client, req, { body, values, shareCapitalCents, idDocument, idDocumentRef, photoRef }));
     const created = await query(`${memberSelect} WHERE m.id = $1`, [memberId]);
     return res.status(201).json({ success: true, data: mapMember(created.rows[0]), message: 'Member created successfully.' });
   } catch (error) {
@@ -514,6 +527,55 @@ export async function createMember(req, res) {
     if (photoRef) await removeFile(photoRef);
     throw error;
   }
+}
+
+export const MEMBER_IMPORT_MAX_ROWS = 200;
+
+// Bulk registration from a spreadsheet parsed in the browser. Each row is saved
+// on its own savepoint, so one bad row is reported without losing the others.
+// ID documents are not part of an import; they can be attached later.
+export async function importMembers(req, res) {
+  const rows = req.body?.rows;
+  if (!Array.isArray(rows) || rows.length === 0) throw badRequest('No member rows were provided.');
+  if (rows.length > MEMBER_IMPORT_MAX_ROWS) throw badRequest(`Import at most ${MEMBER_IMPORT_MAX_ROWS} members per request.`);
+
+  const results = await withTransaction(async (client) => {
+    const outcome = [];
+    for (const [index, raw] of rows.entries()) {
+      const body = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : {};
+      const rowNumber = Number.isInteger(body.row_number) ? body.row_number : index + 1;
+      if (!body.membership_date) body.membership_date = todayDateOnly();
+      const { errors, values } = validateMemberInput(body);
+      const shareCapitalCents = parseShareCapital(body, errors);
+      if (errors.length) {
+        outcome.push({ row: rowNumber, success: false, errors });
+        continue;
+      }
+      await client.query('SAVEPOINT member_import_row');
+      try {
+        const { id, memberNumber } = await insertMemberRecord(client, req, { body, values, shareCapitalCents, source: 'import' });
+        await client.query('RELEASE SAVEPOINT member_import_row');
+        outcome.push({ row: rowNumber, success: true, id: Number(id), memberNumber, name: `${values.firstName} ${values.lastName}` });
+      } catch (error) {
+        await client.query('ROLLBACK TO SAVEPOINT member_import_row');
+        const message = error instanceof AppError ? error.message
+          : error?.code === '23505' ? 'A member with this email already exists.'
+          : error?.code?.startsWith?.('22') ? 'One of the values has an invalid format.'
+          : null;
+        if (!message) throw error;
+        outcome.push({ row: rowNumber, success: false, errors: [message] });
+      }
+    }
+    return outcome;
+  });
+
+  const imported = results.filter((row) => row.success).length;
+  // Always 200: a partly failed import is a normal outcome reported per row.
+  return res.status(200).json({
+    success: true,
+    message: `${imported} of ${rows.length} member(s) imported.`,
+    data: { imported, failed: rows.length - imported, results },
+  });
 }
 
 export async function updateMember(req, res) {
