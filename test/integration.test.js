@@ -496,6 +496,56 @@ test('ocr: scanned forms are verified, posted to their module, and fakes are blo
   stubAnalysis = DEFAULT_STUB_ANALYSIS;
 });
 
+test('ocr: the paper Agri loan form becomes a pending loan application', { skip }, async () => {
+  const detail = await admin.get(`/api/members/${state.memberId}`);
+  const memberNumber = detail.data.data.member_number;
+  const pending = await admin.get('/api/admin/loan-requests?status=pending&limit=100');
+  for (const request of pending.data.requests.filter((r) => Number(r.memberDatabaseId) === state.memberId)) {
+    await admin.patch(`/api/admin/loan-requests/${request.id}`, { status: 'declined', reason: 'test cleanup' });
+  }
+  const paperForm = (overrides = {}) => ({
+    documentType: 'Loan Form', confidence: 93, ocrText: 'LOAN APPLICATION FORM (AGRI) ACIFAC',
+    extractedData: {
+      formNo: 'LF-0098', applicationDate: '2026-09-20', memberName: 'Juan Dela Cruz', memberNumber, occupation: 'Farmer', yearsFarming: '15',
+      age: '46', civilStatus: 'Married', sex: 'Male', address: 'Purok 1, Amnay', contactNo: '09171234567', email: '',
+      farmLocation: 'Sitio Maligaya, Barahan', farmArea: '2', cropsPlanted: 'Palay', cropSeason: 'Wet season 2026', irrigationType: 'Irrigated',
+      loanMode: 'Combination',
+      fertilizerDescription: 'Urea', fertilizerQuantity: '10', fertilizerUnit: 'bags', fertilizerUnitPrice: '1,500', fertilizerTotal: '15,000',
+      seedsDescription: 'Certified seeds', seedsQuantity: '2', seedsUnit: 'bags', seedsUnitPrice: '2500', seedsTotal: '5000',
+      grandTotal: '20000', cashAmount: '10,000',
+      coMakerName: 'Pedro Cruz', coMakerAddress: 'Purok 2, Amnay', coMakerContact: '09181112222', coMakerRelationship: 'Brother',
+      collateralType: 'Harvest', collateralDetails: 'Wet season palay harvest', ...overrides,
+    },
+    authenticity: { score: 94, verdict: 'genuine', physicalDocument: true, filledIn: true, signaturePresent: true, issues: [] },
+  });
+  const scan = async (analysis, byte) => {
+    stubAnalysis = analysis;
+    const form = new FormData();
+    form.append('source', 'camera');
+    form.append('document', new Blob([Buffer.concat([PNG, Buffer.from([byte])])], { type: 'image/png' }), `loan-${byte}.png`);
+    const response = await admin.request('POST', '/api/ocr/analyze', { form });
+    assert.equal(response.status, 201, JSON.stringify(response.data));
+    return response.data.data;
+  };
+
+  const posted = await scan(paperForm(), 91);
+  assert.equal(posted.posted?.module, 'loans', JSON.stringify(posted.verification));
+  assert.ok(posted.verification.checks.some((check) => check.id === 'term'));
+  const requests = await admin.get('/api/admin/loan-requests?status=pending&limit=100');
+  const request = requests.data.requests.find((r) => String(r.id) === posted.posted.recordId);
+  assert.equal(Number(request.amount), 30000, 'cash 10,000 + in-kind 20,000');
+  assert.equal(request.loanMode, 'combination');
+  assert.equal(request.irrigationType, 'irrigated');
+  assert.equal(request.collateralType, 'Harvest');
+  assert.equal(request.inKindItems.length, 2);
+  assert.equal(request.coMakerName, 'Pedro Cruz');
+
+  const wrongTotals = await scan(paperForm({ formNo: 'LF-0099', fertilizerTotal: '14,000', grandTotal: '19000' }), 92);
+  assert.equal(wrongTotals.posted, null);
+  assert.ok(wrongTotals.verification.checks.some((check) => check.id === 'amounts' && check.status === 'fail'));
+  stubAnalysis = DEFAULT_STUB_ANALYSIS;
+});
+
 test('ocr: retired or busy Gemini models fall back, and failed readings can be retried', { skip }, async () => {
   const scanFile = (bytes, name) => { const form = new FormData(); form.append('document', new Blob([Buffer.concat([PNG, Buffer.from(bytes)])], { type: 'image/png' }), name); return form; };
 

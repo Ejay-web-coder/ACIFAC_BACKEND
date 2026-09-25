@@ -19,6 +19,14 @@ export const UNRECOGNIZED = 'Document Type Not Recognized';
 
 const f = (key, label, options = {}) => ({ key, label, kind: 'text', required: false, ...options });
 
+// Rows of the in-kind farm inputs table on the paper loan form.
+const LOAN_INPUT_ROWS = [
+  ['fertilizer', 'Fertilizer'], ['pesticides', 'Pesticides'], ['herbicides', 'Herbicides'],
+  ['insecticides', 'Insecticides'], ['seeds', 'Seeds'], ['plantChemicals', 'Plant Chemicals for Spray'],
+];
+// Loan term used when the paper form (which has no term) is posted.
+const DEFAULT_LOAN_TERM = '12';
+
 export const FORM_DEFINITIONS = {
   'Membership Form': {
     module: 'members', moduleLabel: 'Membership Management', signatureExpected: true,
@@ -34,15 +42,28 @@ export const FORM_DEFINITIONS = {
   },
   'Loan Form': {
     module: 'loans', moduleLabel: 'Loans & Payments (pending approval)', signatureExpected: true,
-    description: 'Loan application form filled in by a member.',
+    description: 'ACIFAC "Loan Application Form (Agri)" for an agricultural loan, usually two pages: borrower details, farm details, loan mode with the in-kind farm inputs table, cash amount, co-maker, and collateral with the borrower signature.',
+    notes: 'For the in-kind table use the keys <row>Description, <row>Quantity, <row>Unit, <row>UnitPrice and <row>Total for the rows fertilizer, pesticides, herbicides, insecticides, seeds and plantChemicals (Plant Chemicals for Spray); leave a row empty when it is not filled. loanMode is the ticked box: cash, in-kind or combination. sex is Male or Female. irrigationType is rainfed, irrigated or other. collateralType is the ticked box: Land Title / Property, Harvest, or Savings Deposit / Share Capital. Ignore the office-use approval section (APPROVED / DISAPPROVED / FOR EVALUATION and approved amounts).',
     fields: [
-      f('memberNumber', 'Member ID', { required: true }), f('memberName', 'Member Name', { required: true }),
-      f('loanType', 'Loan Type (agricultural, personal, emergency)', { required: true }), f('amount', 'Loan Amount', { kind: 'money', required: true }),
-      f('term', 'Loan Term (months)', { kind: 'integer', required: true }), f('purpose', 'Loan Purpose', { required: true }),
-      f('loanMode', 'Loan Mode (cash, in-kind, combination)'), f('farmArea', 'Farm Area (ha)', { kind: 'number' }),
-      f('monthlyIncome', 'Monthly Income', { kind: 'money' }), f('borrowerPhone', 'Contact Number'), f('borrowerAddress', 'Address'),
-      f('coMakerName', 'Co-maker Name'), f('coMakerAddress', 'Co-maker Address'), f('coMakerContact', 'Co-maker Contact'), f('coMakerRelationship', 'Co-maker Relationship'),
-      f('collateralType', 'Collateral Type'), f('collateralDetails', 'Collateral Details'), f('applicationDate', 'Application Date', { kind: 'date' }),
+      f('formNo', 'Form No.'), f('applicationDate', 'Date of Application', { kind: 'date' }),
+      f('memberName', 'Borrower Name', { required: true }), f('memberNumber', 'Associate No.'),
+      f('occupation', 'Occupation'), f('yearsFarming', 'Years of Farming', { kind: 'number' }),
+      f('age', 'Age', { kind: 'integer' }), f('civilStatus', 'Civil Status'), f('sex', 'Sex'),
+      f('address', 'Address'), f('contactNo', 'Contact No.'), f('email', 'Email'),
+      f('farmLocation', 'Farm Location / Sitio & Barangay'), f('farmArea', 'Total Farm Area (hectares)', { kind: 'number' }),
+      f('cropsPlanted', 'Crops Planted'), f('cropSeason', 'Crop Season / Year'),
+      f('irrigationType', 'Irrigation Type (rainfed, irrigated, other)'), f('irrigationOther', 'Irrigation Other'),
+      f('loanMode', 'Loan Mode (cash, in-kind, combination)', { required: true }),
+      ...LOAN_INPUT_ROWS.flatMap(([key, label]) => [
+        f(`${key}Description`, `${label} - Description`), f(`${key}Quantity`, `${label} - Quantity`, { kind: 'number' }),
+        f(`${key}Unit`, `${label} - Unit`), f(`${key}UnitPrice`, `${label} - Unit Price`, { kind: 'money' }),
+        f(`${key}Total`, `${label} - Total Amount`, { kind: 'money' }),
+      ]),
+      f('grandTotal', 'In-Kind Grand Total', { kind: 'money' }), f('cashAmount', 'Cash Amount Requested (Php)', { kind: 'money' }),
+      f('coMakerName', 'Co-Maker Name'), f('coMakerAddress', 'Co-Maker Address'), f('coMakerContact', 'Co-Maker Contact No.'),
+      f('coMakerRelationship', 'Relationship to Borrower'),
+      f('collateralType', 'Collateral Offered'), f('collateralDetails', 'Description / Details of Collateral'),
+      f('term', 'Loan Term (months) - not on the paper form; 12 if blank', { kind: 'integer' }),
     ],
   },
   'Savings Form': {
@@ -100,7 +121,7 @@ export function publicFormDefinitions() {
 
 export function buildAnalysisPrompt(captureSource) {
   const forms = Object.entries(FORM_DEFINITIONS).map(([type, definition]) => (
-    `- "${type}": ${definition.description} extractedData keys: ${definition.fields.map((field) => `${field.key}${field.required ? ' (required)' : ''}`).join(', ')}.`
+    `- "${type}": ${definition.description} extractedData keys: ${definition.fields.map((field) => `${field.key}${field.required ? ' (required)' : ''}`).join(', ')}.${definition.notes ? ` ${definition.notes}` : ''}`
   )).join('\n');
   return `You read paper forms of ACIFAC, an agricultural cooperative in the Philippines. Return JSON only with exactly these fields:
 documentType (string), confidence (number 0-100, required), ocrText (string, all readable text), extractedData (object of strings), authenticity (object).
@@ -110,6 +131,7 @@ ${forms}
 - "Payment Receipt", "ID Document", "Cooperative Form": reference documents; extractedData may use any short field names.
 - "${UNRECOGNIZED}": anything else, or when confidence is below 70.
 
+A form may span several pages (one PDF or image per page); read every page. Pages may be photographed sideways or upside down; read them in any orientation.
 Extraction rules: use exactly the listed keys for the five forms. Copy values as written; never invent, complete or guess a value — use "" when a field is blank, missing or illegible. Dates as YYYY-MM-DD. Money and numbers as plain digits with optional 2 decimals (no currency sign, no commas).
 
 authenticity must be: { "score": number 0-100 (how likely this is a genuine, unaltered, actually filled-in cooperative form), "verdict": "genuine" | "suspicious" | "fake", "physicalDocument": boolean (true if this is a photo or scan of real paper; false for a photo of a screen, a screenshot, or a digitally generated/edited image), "filledIn": boolean (false if the form is blank or only a template/sample), "signaturePresent": boolean, "issues": [short strings] }.
@@ -235,7 +257,7 @@ async function findMachine(db, reference) {
 // twice (different file, same data) is not posted twice.
 const FINGERPRINT_KEYS = {
   'Membership Form': ['firstName', 'lastName', 'dateOfBirth', 'email'],
-  'Loan Form': ['memberNumber', 'loanType', 'amount', 'term'],
+  'Loan Form': ['memberName', 'formNo', 'applicationDate', 'cashAmount', 'grandTotal', 'loanMode'],
   'Savings Form': ['memberNumber', 'amount', 'date', 'referenceNumber'],
   'Machinery Form': ['memberNumber', 'machinery', 'startDate', 'endDate'],
   'Kadiwa Sales Form': ['encoderName', 'saleDate', 'groceriesPrice', 'vegetablesPrice', 'meatPrice', 'totalExpenses'],
@@ -280,6 +302,46 @@ function checkAuthenticity(definition, authenticity, confidence, add) {
   else add('confidence', 'Reading confidence', 'pass', `AI read the form with ${confidence}% confidence.`);
 }
 
+const pesoText = (cents) => `PHP ${(cents / 100).toLocaleString('en-PH', { minimumFractionDigits: 2 })}`;
+
+// In-kind rows with anything written in them, with their line totals.
+function loanInputLines(data) {
+  return LOAN_INPUT_ROWS.map(([key, label]) => {
+    const quantity = String(data[`${key}Quantity`] || '').trim();
+    const unitPrice = String(data[`${key}UnitPrice`] || '').trim();
+    const written = moneyCents(data[`${key}Total`]);
+    const computed = /^\d+(\.\d{1,2})?$/.test(quantity) && moneyCents(unitPrice) !== null ? Math.round(Number(quantity) * moneyCents(unitPrice)) : null;
+    const filled = [data[`${key}Description`], quantity, data[`${key}Unit`], unitPrice, data[`${key}Total`]].some((value) => String(value || '').trim());
+    return { key, label, quantity, unitPrice, unit: String(data[`${key}Unit`] || '').trim(), description: String(data[`${key}Description`] || '').trim(), written, computed, filled };
+  }).filter((line) => line.filled);
+}
+
+function loanAmounts(data) {
+  const lines = loanInputLines(data);
+  const inKindCents = lines.reduce((sum, line) => sum + (line.computed ?? line.written ?? 0), 0);
+  const cashCents = moneyCents(data.cashAmount) || 0;
+  return { lines, inKindCents, cashCents };
+}
+
+// Amount requested and the in-kind table must add up on the paper form.
+function checkLoanAmounts(data, add) {
+  const mode = loanModeOf(data.loanMode);
+  const { lines, inKindCents, cashCents } = loanAmounts(data);
+  const problems = [];
+  for (const line of lines) {
+    if (line.computed !== null && line.written !== null && Math.abs(line.computed - line.written) > 100) {
+      problems.push(`${line.label}: ${line.quantity} x ${pesoText(moneyCents(line.unitPrice))} = ${pesoText(line.computed)}, but the form says ${pesoText(line.written)}`);
+    }
+  }
+  const grand = moneyCents(data.grandTotal);
+  if (grand && lines.length && Math.abs(grand - inKindCents) > 100) problems.push(`the in-kind rows add up to ${pesoText(inKindCents)}, but the grand total says ${pesoText(grand)}`);
+  if (mode !== 'cash' && !lines.length) problems.push('an in-kind or combination loan needs the farm inputs table filled in');
+  if (mode !== 'in-kind' && !cashCents) problems.push('no cash amount requested is written on the form');
+  if (problems.length) add('amounts', 'Loan amounts', 'fail', `${problems.join('; ')}.`);
+  else add('amounts', 'Loan amounts', 'pass', `Requested ${pesoText(cashCents + inKindCents)}${lines.length ? ` (cash ${pesoText(cashCents)} + in-kind ${pesoText(inKindCents)})` : ''}; the table adds up.`);
+  if (!String(data.term || '').trim()) add('term', 'Loan term', 'pass', `The paper form has no loan term; the standard ${DEFAULT_LOAN_TERM} months will be used. Change it above if the member agreed another term.`);
+}
+
 async function checkRecords(db, documentType, data, add) {
   if (documentType === 'Membership Form') {
     const duplicate = (await db.query(
@@ -306,6 +368,8 @@ async function checkRecords(db, documentType, data, add) {
     } else add('totals', 'Sales totals', 'pass', data.netSales ? 'Category sales minus expenses equal the net sales on the form.' : 'Sales amounts are valid (no net total on the form to cross-check).');
     return {};
   }
+
+  if (documentType === 'Loan Form') checkLoanAmounts(data, add);
 
   const requireActive = documentType !== 'Savings Form';
   const { member, check } = await findMember(db, data, { requireActive });
@@ -396,6 +460,23 @@ function loanModeOf(value) {
   return text.includes('cash') ? 'cash' : text;
 }
 
+function irrigationOf(value) {
+  const text = String(value || '').toLowerCase();
+  if (!text) return undefined;
+  if (text.includes('rain')) return 'rainfed';
+  if (text.includes('irrig')) return 'irrigated';
+  return 'other';
+}
+
+function collateralOf(value) {
+  const text = String(value || '').toLowerCase();
+  if (!text) return undefined;
+  if (text.includes('land') || text.includes('title') || text.includes('property')) return 'Land Title / Property';
+  if (text.includes('harvest')) return 'Harvest';
+  if (text.includes('saving') || text.includes('share')) return 'Savings Deposit / Share Capital';
+  return String(value).trim();
+}
+
 function savingsMethodOf(value) {
   const text = String(value || '').trim().toLowerCase();
   if (!text) return 'Deposit';
@@ -426,13 +507,22 @@ async function saveToModule(client, req, scan, documentType, data, target) {
   if (documentType === 'Loan Form') {
     const member = (await client.query(memberApplicationSelect, [target.memberId])).rows[0];
     if (!member) throw badRequest('The member must be active to apply for a loan.');
+    const { lines, inKindCents, cashCents } = loanAmounts(data);
+    const loanMode = loanModeOf(data.loanMode);
+    const crops = [data.cropsPlanted, data.cropSeason].filter(Boolean).join(', ');
     const application = await prepareApplication(client, {
-      loanType: loanTypeOf(data.loanType), purpose: data.purpose, loanMode: loanModeOf(data.loanMode), term: data.term, amount: data.amount,
-      farmArea: data.farmArea || undefined, borrowerPhone: data.borrowerPhone, borrowerAddress: data.borrowerAddress,
+      loanType: 'agricultural', loanMode, term: data.term || DEFAULT_LOAN_TERM,
+      amount: ((cashCents + inKindCents) / 100).toFixed(2),
+      purpose: `Agricultural loan${crops ? ` for ${crops}` : ''} (${loanMode}) from scanned loan form${data.formNo ? ` no. ${data.formNo}` : ''}.`,
+      farmArea: data.farmArea || undefined, borrowerPhone: data.contactNo, borrowerEmail: data.email, borrowerAddress: data.address,
+      borrowerAge: data.age, borrowerGender: data.sex, borrowerCivilStatus: data.civilStatus, borrowerOccupation: data.occupation,
+      yearsFarming: data.yearsFarming || undefined, farmLocation: data.farmLocation, cropsPlanted: data.cropsPlanted, cropSeason: data.cropSeason,
+      irrigationType: irrigationOf(data.irrigationType), irrigationOther: data.irrigationOther,
+      inKindItems: loanMode === 'cash' ? [] : lines.map((line) => ({ item: line.label, description: line.description, quantity: line.quantity, unit: line.unit, unitPrice: line.unitPrice })),
       coMakerName: data.coMakerName, coMakerAddress: data.coMakerAddress, coMakerContact: data.coMakerContact, coMakerRelationship: data.coMakerRelationship,
-      collateralType: data.collateralType, collateralDetails: data.collateralDetails,
+      collateralType: collateralOf(data.collateralType), collateralDetails: data.collateralDetails,
     }, member);
-    const request = await insertLoanRequest(client, req, { member, application, income: data.monthlyIncome || '0', submittedBy: 'admin' });
+    const request = await insertLoanRequest(client, req, { member, application, income: '0', submittedBy: 'admin' });
     return { module: 'loans', recordId: String(request.id), label: `Loan application #${request.id} submitted for approval` };
   }
 
