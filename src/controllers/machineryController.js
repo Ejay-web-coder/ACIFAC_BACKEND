@@ -34,6 +34,16 @@ const machinerySelect = `
          next_maintenance AS "nextMaintenance", daily_fee AS "dailyFee", updated_at AS "updatedAt"
   FROM machinery`;
 
+let lastRentalRefresh = 0;
+
+// Read endpoints use this: at most once a minute per server instance, and the
+// request does not wait for it. Changes to bookings refresh in their transaction.
+export function refreshRentalStatusesInBackground() {
+  if (Date.now() - lastRentalRefresh < 60000) return;
+  lastRentalRefresh = Date.now();
+  refreshRentalStatuses().catch((error) => console.error('Rental status refresh failed:', error instanceof Error ? error.message : error));
+}
+
 // Operation status follows its dates (completed stays completed), and machine
 // availability follows its operations; "maintenance" is only set by an admin.
 export async function refreshRentalStatuses(db = null) {
@@ -71,7 +81,7 @@ async function assertNoOverlap(client, machineryId, startDate, endDate, excludeR
 }
 
 export async function listMachineryData(req, res) {
-  await refreshRentalStatuses();
+  refreshRentalStatusesInBackground();
   const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 50, maxLimit: 200 });
   const [machinery, requests, operations, operationCount, summary] = await Promise.all([
     query(`${machinerySelect} ORDER BY id`),
@@ -99,7 +109,7 @@ export async function listMachineryData(req, res) {
 
 // Minimal catalogue for members: no member data, only availability.
 export async function listMachineryCatalog(req, res) {
-  await refreshRentalStatuses();
+  refreshRentalStatusesInBackground();
   const result = await query(`SELECT id, name, type, status, daily_fee AS "dailyFee" FROM machinery ORDER BY name`);
   return res.json({ success: true, machinery: result.rows });
 }

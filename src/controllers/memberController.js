@@ -8,7 +8,7 @@ import { assertValidUpload, BUCKETS, removeFile, safeOriginalName, sendStoredFil
 import { notifyMember } from '../services/notificationService.js';
 import { DOCUMENT_TYPES, IMAGE_TYPES } from '../middleware/upload.js';
 import { loanSelect, paymentSelect, requestSelect } from './loanController.js';
-import { refreshLoanStatuses } from '../services/loanService.js';
+import { refreshLoanStatusesInBackground } from '../services/loanService.js';
 
 const STATUSES = ['active', 'inactive', 'suspended', 'archived'];
 const EDITABLE_STATUSES = ['active', 'inactive', 'suspended'];
@@ -192,12 +192,10 @@ export async function downloadMemberDocument(req, res) {
 export async function getMyMemberData(req, res) {
   const memberId = Number(req.user?.member_id);
   if (!Number.isInteger(memberId) || memberId <= 0) throw notFound('No member record is linked to this account.');
-  await refreshLoanStatuses();
+  refreshLoanStatusesInBackground();
 
-  const memberResult = await query(`${memberSelect} WHERE m.id = $1 AND m.status <> 'archived'`, [memberId]);
-  if (!memberResult.rows[0]) throw notFound('Linked member record not found.');
-
-  const [loansResult, shareDetails, paymentsResult, requestsResult, rentalsResult, savings] = await Promise.all([
+  const [memberResult, loansResult, shareDetails, paymentsResult, requestsResult, rentalsResult, savings] = await Promise.all([
+    query(`${memberSelect} WHERE m.id = $1 AND m.status <> 'archived'`, [memberId]),
     query(`${loanSelect} WHERE l.member_id = $1 ORDER BY l.created_at DESC, l.id DESC`, [memberId]),
     getShareDetails(null, memberId),
     query(`${paymentSelect} WHERE l.member_id = $1 ORDER BY p.payment_date DESC, p.id DESC LIMIT 200`, [memberId]),
@@ -214,6 +212,7 @@ export async function getMyMemberData(req, res) {
     ),
     getSavingsDetails(null, memberId),
   ]);
+  if (!memberResult.rows[0]) throw notFound('Linked member record not found.');
 
   const member = mapMember(memberResult.rows[0]);
   return res.status(200).json({

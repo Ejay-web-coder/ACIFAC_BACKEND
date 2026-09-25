@@ -8,7 +8,7 @@ import { sendEmailSafely } from '../services/emailService.js';
 import { loanDecisionEmail, loanSubmittedEmail, paymentEmail } from '../services/emailTemplates.js';
 import { notifyAdmins, notifyMember } from '../services/notificationService.js';
 import {
-  allocatePayment, calculateLoanFinancials, createInstallments, ensureInstallments, LOAN_POLICY, recomputeLoanState, refreshLoanStatuses,
+  allocatePayment, calculateLoanFinancials, createInstallments, ensureInstallments, LOAN_POLICY, recomputeLoanState, refreshLoanStatusesInBackground,
 } from '../services/loanService.js';
 
 const MONEY_PATTERN = /^\d+(\.\d{1,2})?$/;
@@ -238,7 +238,7 @@ function loanFilters(req) {
 }
 
 export async function listLoans(req, res) {
-  await refreshLoanStatuses();
+  refreshLoanStatusesInBackground();
   const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 25, maxLimit: 100 });
   const { where, params } = loanFilters(req);
   const [rows, count, summary] = await Promise.all([
@@ -261,7 +261,7 @@ export async function listLoans(req, res) {
 }
 
 export async function getLoan(req, res) {
-  await refreshLoanStatuses();
+  refreshLoanStatusesInBackground();
   const id = parseId(req.params.id, 'loan ID');
   const loan = await query(`${loanSelect} WHERE l.id = $1`, [id]);
   if (!loan.rows[0]) throw notFound('Loan not found.');

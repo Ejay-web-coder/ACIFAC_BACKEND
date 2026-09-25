@@ -2,8 +2,8 @@ import { query } from '../config/db.js';
 import { SQL_TODAY, TIME_ZONE } from '../config/env.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { badRequest } from '../utils/http.js';
-import { refreshLoanStatuses } from '../services/loanService.js';
-import { refreshRentalStatuses } from './machineryController.js';
+import { refreshLoanStatusesInBackground } from '../services/loanService.js';
+import { refreshRentalStatusesInBackground } from './machineryController.js';
 
 const toNumber = (value) => Number(value || 0);
 
@@ -68,7 +68,8 @@ export async function getAnalytics(req, res) {
   if (!isValidDateOnly(from) || !isValidDateOnly(to)) throw badRequest('Analytics dates must be valid YYYY-MM-DD values.');
   if (from > to) throw badRequest('The analytics start date must be before the end date.');
 
-  await Promise.all([refreshLoanStatuses(), refreshRentalStatuses()]);
+  refreshLoanStatusesInBackground();
+  refreshRentalStatusesInBackground();
   const localDate = (column) => `(${column} AT TIME ZONE '${TIME_ZONE}')::date`;
 
   const [summary, membership, loans, revenue, machinery, sales, memberAnalytics] = await Promise.all([
@@ -220,7 +221,8 @@ export async function getAnalytics(req, res) {
 
 // Everything the admin dashboard shows, in one request.
 export async function getDashboard(req, res) {
-  await Promise.all([refreshLoanStatuses(), refreshRentalStatuses()]);
+  refreshLoanStatusesInBackground();
+  refreshRentalStatusesInBackground();
   const [stats, activities] = await Promise.all([
     query(`
       SELECT

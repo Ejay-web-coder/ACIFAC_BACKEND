@@ -16,6 +16,7 @@ import loanRoutes from './routes/loanRoutes.js';
 import { announcementRoutes, eventRoutes, legalDocumentRoutes, notificationRoutes } from './routes/communicationRoutes.js';
 import { isListening } from './services/events.js';
 import { refreshLoanStatuses } from './services/loanService.js';
+import { refreshRentalStatuses } from './controllers/machineryController.js';
 
 export function createApp() {
   const app = express();
@@ -55,7 +56,7 @@ export function createApp() {
     if (!secret || req.headers.authorization !== `Bearer ${secret}`) {
       return res.status(401).json({ success: false, message: 'Unauthorized.' });
     }
-    await refreshLoanStatuses({ force: true });
+    await Promise.all([refreshLoanStatuses({ force: true }), refreshRentalStatuses()]);
     return res.status(200).json({ ok: true });
   });
 

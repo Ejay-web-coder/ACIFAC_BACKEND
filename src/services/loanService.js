@@ -134,6 +134,14 @@ export async function recomputeLoanState(client, loanId) {
 let lastRefresh = 0;
 let refreshing = null;
 
+// Read endpoints use this: statuses are brought up to date at most once a
+// minute per server instance, without making the request wait. Changes that
+// must be exact (payments, approvals) recompute inside their own transaction,
+// and the daily cron refreshes everything at midnight.
+export function refreshLoanStatusesInBackground() {
+  refreshLoanStatuses().catch((error) => console.error('Loan status refresh failed:', error instanceof Error ? error.message : error));
+}
+
 // Updates overdue status for all open loans and creates due/overdue
 // notifications (each at most once, via dedupe keys). Throttled so that the
 // many read endpoints that call it cost at most one pass per minute.

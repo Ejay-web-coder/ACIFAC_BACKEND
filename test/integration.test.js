@@ -190,7 +190,7 @@ test('accounts: create member login, setup link, forced password change', { skip
   assert.equal(oldSession.status, 401, 'reset revokes existing sessions');
   const reused = await new Client().post('/api/auth/reset-password', { token, newPassword: 'MemberPass2!', confirmPassword: 'MemberPass2!' });
   assert.equal(reused.status, 400, 'token is single-use');
-  const relogin = await member.post('/api/auth/login', { usernameOrEmail: 'juan@example.com', password: 'MemberPass1!' });
+  const relogin = await member.post('/api/auth/login', { usernameOrEmail: 'juan', password: 'MemberPass1!' });
   assert.equal(relogin.status, 200);
   assert.equal(relogin.data.mustChangePassword, false);
 });
