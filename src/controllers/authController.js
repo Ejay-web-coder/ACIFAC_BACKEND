@@ -136,7 +136,8 @@ export async function me(req, res) {
   const result = await query(
     `SELECT u.id, u.member_id, u.username, u.email, u.role, u.account_status, u.must_change_password, u.last_login,
             u.password_changed_at, u.full_name, u.phone, u.position, u.notification_preferences,
-            m.member_number, TRIM(CONCAT_WS(' ', m.first_name, m.middle_name, m.last_name, m.suffix)) AS member_name, m.phone AS member_phone
+            m.member_number, TRIM(CONCAT_WS(' ', m.first_name, m.middle_name, m.last_name, m.suffix)) AS member_name, m.phone AS member_phone,
+            COALESCE(NULLIF(u.email, ''), m.email) AS notification_email
      FROM users u LEFT JOIN members m ON m.id = u.member_id
      WHERE u.id = $1`,
     [currentUserId(req)]
@@ -151,6 +152,8 @@ export async function me(req, res) {
       member_number: row.member_number,
       display_name: row.full_name || row.member_name || row.username,
       notification_preferences: row.notification_preferences,
+      // Where activity emails go: the login email, else the member record's.
+      notification_email: row.notification_email || null,
     },
   });
 }
@@ -192,7 +195,9 @@ export async function updateNotificationPreferences(req, res) {
     smsNotifications: req.body?.smsNotifications === true,
     loanReminders: req.body?.loanReminders !== false,
   };
+  const before = (await query('SELECT notification_preferences FROM users WHERE id = $1', [currentUserId(req)])).rows[0]?.notification_preferences || {};
   await query(`UPDATE users SET notification_preferences = $1, updated_at = NOW() WHERE id = $2`, [JSON.stringify(preferences), currentUserId(req)]);
+  await createAuditLog({ user: req.user, action: 'NOTIFICATION_PREFERENCES_UPDATED', module: 'Accounts', entityType: 'user', entityId: String(currentUserId(req)), description: 'Changed notification settings', oldValues: before, newValues: preferences, ...getRequestMeta(req) });
   return res.status(200).json({ success: true, message: 'Notification settings saved.', preferences });
 }
 

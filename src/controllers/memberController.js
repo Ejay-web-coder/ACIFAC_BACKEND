@@ -6,9 +6,12 @@ import { AppError, badRequest, cleanString, conflict, currentUserId, getRequestM
 import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import { assertValidUpload, BUCKETS, removeFile, safeOriginalName, sendStoredFile, uploadFile } from '../services/storage.js';
 import { notifyMember } from '../services/notificationService.js';
+import { emailMember } from '../services/memberEmails.js';
+import { savingsDepositEmail, shareContributionEmail, welcomeMemberEmail } from '../services/emailTemplates.js';
 import { DOCUMENT_TYPES, IMAGE_TYPES } from '../middleware/upload.js';
 import { loanSelect, paymentSelect, requestSelect } from './loanController.js';
 import { refreshLoanStatusesInBackground } from '../services/loanService.js';
+import { photoMimeType } from './profilePhotoController.js';
 
 const STATUSES = ['active', 'inactive', 'suspended', 'archived'];
 const EDITABLE_STATUSES = ['active', 'inactive', 'suspended'];
@@ -205,14 +208,20 @@ export async function downloadMemberDocument(req, res) {
   const id = req.params.id === undefined ? Number(req.user.member_id) : parseId(req.params.id, 'member ID');
   if (req.user.role !== 'ADMIN' && id !== Number(req.user.member_id)) throw notFound('Document not found.');
   const kind = req.params.kind;
-  if (!['id-document', 'photo'].includes(kind)) throw notFound('Document not found.');
-  const result = await query(`SELECT id_document_path, id_document_name, id_document_type, profile_photo FROM members WHERE id = $1`, [id]);
+  if (!['id-document', 'photo', 'avatar'].includes(kind)) throw notFound('Document not found.');
+  // "avatar": the picture the member chose for their account, else their 2x2 photo.
+  const result = await query(
+    `SELECT m.id_document_path, m.id_document_name, m.id_document_type, m.profile_photo,
+            (SELECT u.profile_photo FROM users u WHERE u.member_id = m.id AND u.profile_photo IS NOT NULL ORDER BY u.id LIMIT 1) AS account_photo
+     FROM members m WHERE m.id = $1`,
+    [id]
+  );
   const row = result.rows[0];
-  const reference = kind === 'id-document' ? row?.id_document_path : row?.profile_photo;
+  const reference = kind === 'id-document' ? row?.id_document_path : kind === 'avatar' ? (row?.account_photo || row?.profile_photo) : row?.profile_photo;
   if (!reference) throw notFound('Document not found.');
   const sent = await sendStoredFile(res, {
     reference,
-    mimeType: kind === 'id-document' ? row.id_document_type : undefined,
+    mimeType: kind === 'id-document' ? row.id_document_type : photoMimeType(reference),
     fileName: kind === 'id-document' ? row.id_document_name : 'profile-photo',
   });
   if (!sent) throw notFound('The stored file could not be found.');
@@ -323,6 +332,7 @@ async function recordContribution(req, memberId, body) {
 export async function addShareContribution(req, res) {
   const memberId = parseId(req.params.id, 'member ID');
   const result = await recordContribution(req, memberId, req.body);
+  void emailMember(memberId, (recipient) => shareContributionEmail({ memberName: recipient.full_name, amount: result.contribution.amount, date: result.contribution.date, total: result.shareDetails.total, maximum: result.shareDetails.maximum }));
   return res.status(201).json({ success: true, data: result.shareDetails, contribution: result.contribution, message: 'Share contribution recorded.' });
 }
 
@@ -398,6 +408,7 @@ export async function createSavingsRecord(req, res) {
   if (!SAVINGS_METHODS.includes(paymentMethod)) throw badRequest(`Payment method must be one of: ${SAVINGS_METHODS.join(', ')}.`);
 
   const result = await withTransaction((client) => insertSavingsDeposit(client, req, { memberId, amountCents, date, paymentMethod, reference, notes }));
+  void emailMember(memberId, (recipient) => savingsDepositEmail({ memberName: recipient.full_name, amount: result.record.amount, date, reference, total: result.total }));
   return res.status(201).json({ success: true, data: result.record, memberTotal: result.total, message: 'Savings recorded.' });
 }
 
@@ -550,6 +561,7 @@ export async function createMember(req, res) {
   try {
     const { id: memberId } = await withTransaction((client) => insertMemberRecord(client, req, { body, values, shareCapitalCents, idDocument, idDocumentRef, photoRef }));
     const created = await query(`${memberSelect} WHERE m.id = $1`, [memberId]);
+    void emailMember(memberId, welcomeMemberEmail({ memberName: created.rows[0].full_name, memberNumber: created.rows[0].member_number, membershipDate: created.rows[0].membership_date }));
     return res.status(201).json({ success: true, data: mapMember(created.rows[0]), message: 'Member created successfully.' });
   } catch (error) {
     await removeFile(idDocumentRef);

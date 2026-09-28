@@ -3,7 +3,7 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
 import { query } from './config/db.js';
-import { getAllowedOrigins, isProduction } from './config/env.js';
+import { isAllowedOrigin, isProduction } from './config/env.js';
 import { csrfProtection, noStore, securityHeaders } from './middleware/security.js';
 import { errorHandler } from './utils/http.js';
 import authRoutes from './routes/authRoutes.js';
@@ -24,9 +24,8 @@ export function createApp() {
   app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || 1));
   app.disable('x-powered-by');
 
-  const allowedOrigins = getAllowedOrigins();
   app.use(cors({
-    origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin.replace(/\/$/, ''))),
+    origin: (origin, callback) => callback(null, !origin || isAllowedOrigin(origin)),
     credentials: true,
     allowedHeaders: ['Content-Type', 'X-Requested-With'],
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],

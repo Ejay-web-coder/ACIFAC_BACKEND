@@ -1,7 +1,9 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { changePassword, forgotPassword, login, logout, me, resetPassword, updateNotificationPreferences, updateProfile } from '../controllers/authController.js';
+import { deleteProfilePhoto, getProfilePhoto, uploadProfilePhoto } from '../controllers/profilePhotoController.js';
 import { requireAuth } from '../middleware/auth.js';
+import { profilePhotoUpload } from '../middleware/upload.js';
 
 const router = express.Router();
 
@@ -30,5 +32,9 @@ router.post('/reset-password', resetLimiter, resetPassword);
 router.post('/change-password', requireAuth, changePassword);
 router.patch('/profile', requireAuth, updateProfile);
 router.patch('/notification-preferences', requireAuth, updateNotificationPreferences);
+// Own picture only; see profilePhotoController.
+router.get('/profile-photo', requireAuth, getProfilePhoto);
+router.post('/profile-photo', requireAuth, profilePhotoUpload.single('photo'), uploadProfilePhoto);
+router.delete('/profile-photo', requireAuth, deleteProfilePhoto);
 
 export default router;

@@ -72,3 +72,55 @@ export function rentalDecisionEmail({ machineryName, startDate, endDate, status,
     `<p>Your rental request for <strong>${escapeHtml(machineryName)}</strong> (${escapeHtml(startDate)} to ${escapeHtml(endDate)}) was <strong>${decision}</strong>.</p><p>Rental fee: ${formatAmount(rentalFee)}</p>`
   );
 }
+
+// --- Member activity ------------------------------------------------------------
+// `fromPaperForm` marks records the OCR scanner created from a scanned form.
+const paperNote = (fromPaperForm) => (fromPaperForm ? ' It was recorded from your paper form.' : '');
+
+export function savingsDepositEmail({ memberName, amount, date, reference, total, fromPaperForm = false }) {
+  return message(
+    'ACIFAC savings deposit recorded',
+    `Hello ${memberName},\n\nA savings deposit of ${formatAmount(amount)} was recorded on ${date}${reference ? ` (reference ${reference})` : ''}.${paperNote(fromPaperForm)}\nYour total savings are now ${formatAmount(total)}.`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>A savings deposit of <strong>${formatAmount(amount)}</strong> was recorded on ${escapeHtml(date)}${reference ? ` (reference ${escapeHtml(reference)})` : ''}.${escapeHtml(paperNote(fromPaperForm))}</p><p>Your total savings are now <strong>${formatAmount(total)}</strong>.</p>`
+  );
+}
+
+export function shareContributionEmail({ memberName, amount, date, total, maximum }) {
+  return message(
+    'ACIFAC share capital contribution recorded',
+    `Hello ${memberName},\n\nA share capital contribution of ${formatAmount(amount)} was recorded on ${date}.\nYour total share capital is now ${formatAmount(total)} of the ${formatAmount(maximum)} maximum.`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>A share capital contribution of <strong>${formatAmount(amount)}</strong> was recorded on ${escapeHtml(date)}.</p><p>Your total share capital is now <strong>${formatAmount(total)}</strong> of the ${formatAmount(maximum)} maximum.</p>`
+  );
+}
+
+export function loanApplicationReceivedEmail({ memberName, requestId, amount, loanType, term, fromPaperForm = false }) {
+  return message(
+    'ACIFAC received your loan application',
+    `Hello ${memberName},\n\nWe received your ${loanType} loan application #${requestId} for ${formatAmount(amount)} (${term} months).${paperNote(fromPaperForm)}\nThe cooperative will review it and email you the decision.`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>We received your ${escapeHtml(loanType)} loan application <strong>#${escapeHtml(requestId)}</strong> for <strong>${formatAmount(amount)}</strong> (${escapeHtml(term)} months).${escapeHtml(paperNote(fromPaperForm))}</p><p>The cooperative will review it and email you the decision.</p>`
+  );
+}
+
+export function loanReminderEmail({ title, message: body }) {
+  return message(
+    `ACIFAC: ${title}`,
+    `${body}\n\nPlease settle it at the ACIFAC office. You can see your loan schedule in the member portal under Loan Status.`,
+    `<p>${escapeHtml(body)}</p><p>Please settle it at the ACIFAC office. You can see your loan schedule in the member portal under <strong>Loan Status</strong>.</p>`
+  );
+}
+
+export function rentalRequestReceivedEmail({ memberName, machineryName, startDate, endDate, rentalFee, fromPaperForm = false }) {
+  return message(
+    'ACIFAC received your machinery rental request',
+    `Hello ${memberName},\n\nWe received your request to rent ${machineryName} from ${startDate} to ${endDate} (rental fee ${formatAmount(rentalFee)}).${paperNote(fromPaperForm)}\nYou will get another email when it is approved or declined.`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>We received your request to rent <strong>${escapeHtml(machineryName)}</strong> from ${escapeHtml(startDate)} to ${escapeHtml(endDate)} (rental fee ${formatAmount(rentalFee)}).${escapeHtml(paperNote(fromPaperForm))}</p><p>You will get another email when it is approved or declined.</p>`
+  );
+}
+
+export function welcomeMemberEmail({ memberName, memberNumber, membershipDate, fromPaperForm = false }) {
+  return message(
+    'Welcome to ACIFAC',
+    `Hello ${memberName},\n\nWelcome to the Amnay-Cabagan Irrigators and Farmers Agriculture Cooperative. Your member number is ${memberNumber}, effective ${membershipDate}.${paperNote(fromPaperForm)}\nKeep this number for loans, savings and machinery rentals.`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>Welcome to the Amnay-Cabagan Irrigators and Farmers Agriculture Cooperative. Your member number is <strong>${escapeHtml(memberNumber)}</strong>, effective ${escapeHtml(membershipDate)}.${escapeHtml(paperNote(fromPaperForm))}</p><p>Keep this number for loans, savings and machinery rentals.</p>`
+  );
+}

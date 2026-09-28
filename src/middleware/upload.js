@@ -20,3 +20,5 @@ function memoryUpload(maxBytes, allowed) {
 export const memberDocumentUpload = memoryUpload(5 * 1024 * 1024, DOCUMENT_TYPES);
 export const ocrDocumentUpload = memoryUpload(10 * 1024 * 1024, DOCUMENT_TYPES);
 export const legalDocumentUpload = memoryUpload(10 * 1024 * 1024, DOCUMENT_TYPES);
+// Pictures are resized in the browser to about 100 KB; 5 MB leaves room for originals.
+export const profilePhotoUpload = memoryUpload(5 * 1024 * 1024, IMAGE_TYPES);

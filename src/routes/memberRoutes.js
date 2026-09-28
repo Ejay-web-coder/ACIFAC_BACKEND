@@ -16,6 +16,7 @@ import {
   updateMember,
 } from '../controllers/memberController.js';
 import { createMemberLoanRequest } from '../controllers/loanController.js';
+import { getMyActivity } from '../controllers/memberActivityController.js';
 import { requireAdmin, requireAuth, requireMember } from '../middleware/auth.js';
 import { memberDocumentUpload } from '../middleware/upload.js';
 
@@ -27,6 +28,7 @@ router.use(requireAuth);
 router.get('/me', requireMember, getMyMemberData);
 router.post('/me/loan-requests', requireMember, createMemberLoanRequest);
 router.get('/me/documents/:kind', requireMember, downloadMemberDocument);
+router.get('/me/activity', requireMember, getMyActivity);
 
 // Everything below is admin-only: member lists expose personal data.
 router.use(requireAdmin);

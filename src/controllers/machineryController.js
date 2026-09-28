@@ -6,7 +6,9 @@ import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFo
 import { centsToString, parseMoneyInput } from '../utils/money.js';
 import { notifyAdmins, notifyMember } from '../services/notificationService.js';
 import { sendEmailSafely } from '../services/emailService.js';
-import { rentalDecisionEmail } from '../services/emailTemplates.js';
+import { rentalDecisionEmail, rentalRequestReceivedEmail } from '../services/emailTemplates.js';
+import { keepAlive } from '../utils/background.js';
+import { emailMember } from '../services/memberEmails.js';
 
 // Rental duration keeps the existing ACIFAC rule: days = end_date - start_date,
 // minimum 1 (a same-day rental counts as one day). Fee = daily_fee x days.
@@ -41,7 +43,7 @@ let lastRentalRefresh = 0;
 export function refreshRentalStatusesInBackground() {
   if (Date.now() - lastRentalRefresh < 60000) return;
   lastRentalRefresh = Date.now();
-  refreshRentalStatuses().catch((error) => console.error('Rental status refresh failed:', error instanceof Error ? error.message : error));
+  keepAlive(refreshRentalStatuses().catch((error) => console.error('Rental status refresh failed:', error instanceof Error ? error.message : error)));
 }
 
 // Operation status follows its dates (completed stays completed), and machine
@@ -216,6 +218,7 @@ export async function createRentalRequest(req, res) {
   if (!Number.isInteger(requestedMemberId) || requestedMemberId <= 0) throw badRequest('A valid member is required.');
 
   const request = await withTransaction((client) => insertRentalRequest(client, req, { machineryId, memberId: requestedMemberId, purpose, notes, startDate, endDate }));
+  void emailMember(request.memberDatabaseId, (recipient) => rentalRequestReceivedEmail({ memberName: recipient.full_name, machineryName: request.machineryName, startDate: request.startDate, endDate: request.endDate, rentalFee: request.rentalFee }));
   return res.status(201).json({ success: true, request });
 }
 

@@ -306,6 +306,8 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   assert.ok(Number(overdue.data.loan.overdueAmount) > 0);
   const overdueNotes = await pool.query(`SELECT COUNT(*)::int AS n FROM notifications WHERE type = 'payment_overdue' AND user_id = $1`, [state.memberUserId]);
   assert.equal(overdueNotes.rows[0].n, overdue.data.loan.overdueInstallments, 'one notification per overdue installment, no duplicates');
+  const overdueMail = sentEmails.filter((mail) => /Loan payment overdue/.test(mail.subject));
+  assert.equal(overdueMail.length, overdue.data.loan.overdueInstallments, 'one overdue email per installment, none repeated by the second refresh');
 
   const rest = await admin.post(`/api/admin/loans/${state.loanId}/payments`, { amount: overdue.data.loan.balance, paymentDate: overdue.data.loan.dateApproved });
   assert.equal(rest.status, 201, JSON.stringify(rest.data));
@@ -576,6 +578,47 @@ test('ocr: retired or busy Gemini models fall back, and failed readings can be r
   assert.equal(again.status, 409);
 });
 
+test('member emails: savings, share capital, loan application, scanned forms, opt-out', { skip }, async () => {
+  const address = (await pool.query(
+    `SELECT COALESCE(NULLIF(u.email, ''), m.email) AS email FROM members m LEFT JOIN users u ON u.member_id = m.id WHERE m.id = $1`, [state.memberId]
+  )).rows[0].email;
+  const mailsFor = (pattern) => sentEmails.filter((mail) => mail.to === address && pattern.test(mail.subject));
+  // Emails go out after the response; wait briefly for them.
+  const waitForMail = async (pattern, count) => {
+    for (let i = 0; i < 60 && mailsFor(pattern).length < count; i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+    return mailsFor(pattern);
+  };
+
+  const savingsBefore = mailsFor(/savings deposit recorded/i).length;
+  const saved = await admin.post('/api/members/savings', { memberId: state.memberId, amount: '123.45', date: '2026-09-01', paymentMethod: 'Cash', reference: 'EMAIL-1' });
+  assert.equal(saved.status, 201, JSON.stringify(saved.data));
+  const savingsMail = await waitForMail(/savings deposit recorded/i, savingsBefore + 1);
+  assert.equal(savingsMail.length, savingsBefore + 1);
+  assert.match(savingsMail.at(-1).text, /PHP 123\.45/);
+  assert.match(savingsMail.at(-1).text, /Juan/);
+
+  const share = await admin.post(`/api/members/${state.memberId}/share-contributions`, { amount: '100', contributionDate: '2026-09-01' });
+  assert.equal(share.status, 201, JSON.stringify(share.data));
+  assert.equal((await waitForMail(/share capital contribution recorded/i, 1)).length >= 1, true);
+
+  const applicationsBefore = mailsFor(/received your loan application/i).length;
+  const applied = await member.post('/api/members/me/loan-requests', { loanType: 'personal', loanMode: 'cash', purpose: 'Seeds', amount: '5000', term: '6', farmArea: '2', borrowerPhone: '09171234567', borrowerAddress: 'Purok 1, Amnay' });
+  assert.equal(applied.status, 201, JSON.stringify(applied.data));
+  const applicationMail = await waitForMail(/received your loan application/i, applicationsBefore + 1);
+  assert.ok(applicationMail.some((mail) => mail.text.includes(`#${applied.data.request.id}`)));
+
+  // Records the OCR scanner saved earlier told the member they came from a paper form.
+  assert.ok(sentEmails.some((mail) => mail.to === address && /paper form/.test(mail.text)));
+
+  // Turning off Email notifications stops activity emails.
+  await member.patch('/api/auth/notification-preferences', { emailNotifications: false, loanReminders: true });
+  const quietBefore = mailsFor(/savings deposit recorded/i).length;
+  await admin.post('/api/members/savings', { memberId: state.memberId, amount: '10', date: '2026-09-01', paymentMethod: 'Cash', reference: 'EMAIL-2' });
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.equal(mailsFor(/savings deposit recorded/i).length, quietBefore, 'no email after opting out');
+  await member.patch('/api/auth/notification-preferences', { emailNotifications: true, loanReminders: true });
+});
+
 test('notifications, announcements and live updates', { skip }, async () => {
   const events = [];
   const controller = new AbortController();
@@ -654,6 +697,86 @@ test('settings: profile, preferences, legal documents', { skip }, async () => {
   assert.equal((await admin.request('GET', `/api/legal-documents/${uploaded.data.data.id}/file`, { raw: true })).status, 200);
   assert.equal((await admin.request('DELETE', `/api/legal-documents/${uploaded.data.data.id}`)).status, 200);
   assert.equal((await admin.get('/api/legal-documents')).data.data.length, 0);
+});
+
+test('member activity log: own actions, office actions, filters, privacy', { skip }, async () => {
+  const before = await member.get('/api/auth/me');
+  assert.equal((await member.request('PATCH', '/api/auth/profile', { body: { phone: '09175550000' } })).status, 200);
+  assert.equal((await member.patch('/api/auth/notification-preferences', { emailNotifications: true, loanReminders: false })).status, 200);
+  await member.patch('/api/auth/notification-preferences', { emailNotifications: true, loanReminders: true });
+  assert.equal((await new Client().post('/api/auth/login', { usernameOrEmail: 'juan', password: 'Wrong-password-1' })).status, 401);
+  // Another member's savings must never show up in Juan's log.
+  const second = await admin.get(`/api/members/${state.secondMemberId}`);
+  assert.equal((await admin.post('/api/members/savings', { memberId: state.secondMemberId, amount: '77', date: '2026-09-01', paymentMethod: 'Cash', reference: 'OTHER-1' })).status, 201);
+
+  const all = await member.get('/api/members/me/activity?limit=50');
+  assert.equal(all.status, 200, JSON.stringify(all.data));
+  const actions = all.data.data.map((entry) => entry.action);
+  for (const action of ['LOGIN', 'PROFILE_UPDATED', 'NOTIFICATION_PREFERENCES_UPDATED', 'LOGIN_FAILURE', 'SAVINGS_DEPOSIT_CREATED', 'LOAN_APPLICATION_SUBMITTED']) assert.ok(actions.includes(action), action);
+  const profile = all.data.data.find((entry) => entry.action === 'PROFILE_UPDATED');
+  assert.equal(profile.actor, 'you');
+  assert.ok(profile.changes.includes('phone number'));
+  assert.equal(all.data.data.find((entry) => entry.action === 'LOGIN_FAILURE').status, 'failed');
+  const office = all.data.data.find((entry) => entry.action === 'SAVINGS_DEPOSIT_CREATED');
+  assert.equal(office.actor, 'office');
+  assert.equal(office.device, null);
+  assert.equal(office.ipAddress, null);
+  assert.ok(!JSON.stringify(all.data).includes('testadmin'), 'administrator names are never shown');
+  assert.ok(!JSON.stringify(all.data).includes(second.data.data.member_number), 'no entries about other members');
+  assert.ok(all.data.summary.lastSignIn);
+  assert.ok(all.data.summary.failedSignIns30Days >= 1);
+
+  const onlySavings = await member.get('/api/members/me/activity?category=savings&limit=50');
+  assert.ok(onlySavings.data.data.length > 0 && onlySavings.data.data.every((entry) => entry.category === 'savings'));
+  const onlyOffice = await member.get('/api/members/me/activity?actor=office&limit=50');
+  assert.ok(onlyOffice.data.data.every((entry) => entry.actor === 'office'));
+  const onlyMine = await member.get('/api/members/me/activity?actor=me&limit=50');
+  assert.ok(onlyMine.data.data.length > 0 && onlyMine.data.data.every((entry) => entry.actor === 'you'));
+  const failed = await member.get('/api/members/me/activity?status=FAILED');
+  assert.ok(failed.data.data.length > 0 && failed.data.data.every((entry) => entry.status === 'failed'));
+  const future = await member.get('/api/members/me/activity?fromDate=2999-01-01');
+  assert.equal(future.data.pagination.total, 0);
+  const searched = await member.get('/api/members/me/activity?search=signed%20in');
+  assert.ok(searched.data.data.length > 0 && searched.data.data.every((entry) => entry.action === 'LOGIN'));
+  const paged = await member.get('/api/members/me/activity?limit=2&page=2');
+  assert.equal(paged.data.data.length, 2);
+  assert.equal((await member.get('/api/members/me/activity?category=nope')).status, 400);
+  assert.equal((await admin.get('/api/members/me/activity')).status, 403, 'members only');
+
+  await member.request('PATCH', '/api/auth/profile', { body: { phone: before.data.user.phone } });
+});
+
+test('profile pictures: own only, admins see members, members never see admins', { skip }, async () => {
+  const photoForm = (bytes) => { const form = new FormData(); form.append('photo', new Blob([bytes], { type: 'image/png' }), 'me.png'); return form; };
+  const adminPicture = Buffer.concat([PNG, Buffer.from('admin')]);
+  const memberPicture = Buffer.concat([PNG, Buffer.from('member')]);
+
+  assert.equal((await admin.request('GET', '/api/auth/profile-photo', { raw: true })).status, 404);
+  const notImage = await admin.request('POST', '/api/auth/profile-photo', { form: (() => { const f = new FormData(); f.append('photo', new Blob([Buffer.from('not an image')], { type: 'image/png' }), 'x.png'); return f; })() });
+  assert.equal(notImage.status, 400);
+  assert.equal((await admin.request('POST', '/api/auth/profile-photo', { form: photoForm(adminPicture) })).status, 200);
+  const adminOwn = await admin.request('GET', '/api/auth/profile-photo', { raw: true });
+  assert.equal(adminOwn.status, 200);
+  assert.equal(adminOwn.headers.get('content-type'), 'image/png');
+  assert.deepEqual(Buffer.from(await adminOwn.arrayBuffer()), adminPicture);
+
+  // The member only ever receives their own picture, never the admin's.
+  assert.equal((await member.request('POST', '/api/auth/profile-photo', { form: photoForm(memberPicture) })).status, 200);
+  const memberOwn = await member.request('GET', '/api/auth/profile-photo', { raw: true });
+  assert.deepEqual(Buffer.from(await memberOwn.arrayBuffer()), memberPicture);
+  assert.equal((await member.request('GET', `/api/members/${state.secondMemberId}/documents/avatar`, { raw: true })).status, 403, 'members cannot reach other members pictures');
+
+  // Admins see a member's picture in Associates.
+  const seenByAdmin = await admin.request('GET', `/api/members/${state.memberId}/documents/avatar`, { raw: true });
+  assert.equal(seenByAdmin.status, 200);
+  assert.deepEqual(Buffer.from(await seenByAdmin.arrayBuffer()), memberPicture);
+
+  assert.equal((await member.request('DELETE', '/api/auth/profile-photo')).status, 200);
+  // A 2x2 registration photo on the member record is not used as the member's picture.
+  await pool.query(`UPDATE members SET profile_photo = 'local://member-photos/test/registration.png' WHERE id = $1`, [state.memberId]);
+  assert.equal((await member.request('GET', '/api/auth/profile-photo', { raw: true })).status, 404);
+  await pool.query('UPDATE members SET profile_photo = NULL WHERE id = $1', [state.memberId]);
+  assert.equal((await admin.request('DELETE', '/api/auth/profile-photo')).status, 200);
 });
 
 test('sessions: forgot password, change password, deactivation, logout', { skip }, async () => {

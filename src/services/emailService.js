@@ -1,4 +1,5 @@
 import nodemailer from 'nodemailer';
+import { keepAlive } from '../utils/background.js';
 import { query } from '../config/db.js';
 import { getFrontendUrl } from '../config/env.js';
 
@@ -46,15 +47,18 @@ async function userAllowsEmail(userId) {
 // Never throws: email is sent after the database transaction has committed, so
 // a delivery failure cannot undo or corrupt the recorded change.
 // `essential` emails (account setup, password reset) ignore the opt-out.
-export async function sendEmailSafely({ to, subject, text, html, relatedUserId = null, essential = false }) {
-  if (!to) return { sent: false, skipped: true };
-  try {
-    if (!essential && !(await userAllowsEmail(relatedUserId))) return { sent: false, skipped: true };
-    return await sendEmail({ to, subject, text, html });
-  } catch (error) {
-    console.error('Email delivery error:', error instanceof Error ? error.message : error);
-    return { sent: false, error };
-  }
+// Registered with keepAlive so a serverless function is not frozen mid-send.
+export function sendEmailSafely({ to, subject, text, html, relatedUserId = null, essential = false }) {
+  if (!to) return Promise.resolve({ sent: false, skipped: true });
+  return keepAlive((async () => {
+    try {
+      if (!essential && !(await userAllowsEmail(relatedUserId))) return { sent: false, skipped: true };
+      return await sendEmail({ to, subject, text, html });
+    } catch (error) {
+      console.error('Email delivery error:', error instanceof Error ? error.message : error);
+      return { sent: false, error };
+    }
+  })());
 }
 
 export async function sendTestEmail(recipient) {

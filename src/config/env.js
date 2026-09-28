@@ -24,6 +24,17 @@ export function getAllowedOrigins() {
     .filter(Boolean);
 }
 
+// In development the Vite dev server is also opened from this computer's
+// network address (a phone on the same Wi-Fi, or 127.0.0.1), and that address
+// changes whenever the network does. Outside production, plain-http origins
+// on localhost or a private network address are accepted as well.
+const PRIVATE_DEV_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1|10(\.\d{1,3}){3}|192\.168(\.\d{1,3}){2}|172\.(1[6-9]|2\d|3[01])(\.\d{1,3}){2}):\d{2,5}$/;
+
+export function isAllowedOrigin(origin) {
+  const value = String(origin || '').replace(/\/$/, '');
+  return getAllowedOrigins().includes(value) || (!isProduction && PRIVATE_DEV_ORIGIN.test(value));
+}
+
 export function getFrontendUrl() {
   return String(process.env.FRONTEND_URL || process.env.APP_URL || (isProduction ? '' : 'http://localhost:5173')).replace(/\/$/, '');
 }

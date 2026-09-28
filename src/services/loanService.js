@@ -1,4 +1,7 @@
 import { query, withTransaction } from '../config/db.js';
+import { keepAlive } from '../utils/background.js';
+import { emailNotifiedUsers } from './memberEmails.js';
+import { loanReminderEmail } from './emailTemplates.js';
 import { SQL_TODAY } from '../config/env.js';
 import { centsToString, toCents } from '../utils/money.js';
 
@@ -139,7 +142,7 @@ let refreshing = null;
 // must be exact (payments, approvals) recompute inside their own transaction,
 // and the daily cron refreshes everything at midnight.
 export function refreshLoanStatusesInBackground() {
-  refreshLoanStatuses().catch((error) => console.error('Loan status refresh failed:', error instanceof Error ? error.message : error));
+  keepAlive(refreshLoanStatuses().catch((error) => console.error('Loan status refresh failed:', error instanceof Error ? error.message : error)));
 }
 
 // Updates overdue status for all open loans and creates due/overdue
@@ -176,7 +179,7 @@ export async function refreshLoanStatuses({ force = false } = {}) {
 
     const money = `'PHP ' || to_char(i.amount_due - i.amount_paid, 'FM999,999,990.00')`;
     // Member: installment due within 3 days (respects the loan reminder preference).
-    await query(
+    const dueSoon = await query(
       `INSERT INTO notifications (user_id, type, title, message, severity, link, entity_type, entity_id, dedupe_key)
        SELECT u.id, 'payment_due', 'Loan payment due soon',
               format('Installment %s of loan %s (%s) is due on %s.', i.installment_number, l.loan_number, ${money}, to_char(i.due_date, 'FMMonth DD, YYYY')),
@@ -186,10 +189,11 @@ export async function refreshLoanStatuses({ force = false } = {}) {
        JOIN users u ON u.member_id = l.member_id AND u.account_status = 'ACTIVE'
        WHERE i.amount_paid < i.amount_due AND i.due_date BETWEEN ${SQL_TODAY} AND ${SQL_TODAY} + 3
          AND COALESCE((u.notification_preferences ->> 'loanReminders')::boolean, true)
-       ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`
+       ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+       RETURNING user_id, title, message`
     );
     // Member: installment overdue.
-    await query(
+    const overdue = await query(
       `INSERT INTO notifications (user_id, type, title, message, severity, link, entity_type, entity_id, dedupe_key)
        SELECT u.id, 'payment_overdue', 'Loan payment overdue',
               format('Installment %s of loan %s (%s) was due on %s and is now overdue.', i.installment_number, l.loan_number, ${money}, to_char(i.due_date, 'FMMonth DD, YYYY')),
@@ -198,8 +202,12 @@ export async function refreshLoanStatuses({ force = false } = {}) {
        JOIN loans l ON l.id = i.loan_id AND l.status <> 'paid'
        JOIN users u ON u.member_id = l.member_id AND u.account_status = 'ACTIVE'
        WHERE i.amount_paid < i.amount_due AND i.due_date < ${SQL_TODAY}
-       ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`
+       ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+       RETURNING user_id, title, message`
     );
+    // Each reminder is created once per installment (dedupe key), so only the
+    // new ones returned here are emailed.
+    await emailNotifiedUsers([...dueSoon.rows, ...overdue.rows], loanReminderEmail);
     // Admins: one notification per overdue installment.
     await query(
       `INSERT INTO notifications (user_id, type, title, message, severity, link, entity_type, entity_id, dedupe_key)

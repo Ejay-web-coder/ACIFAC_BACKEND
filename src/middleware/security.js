@@ -1,4 +1,4 @@
-import { getAllowedOrigins } from '../config/env.js';
+import { isAllowedOrigin } from '../config/env.js';
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
@@ -9,7 +9,7 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 export function csrfProtection(req, res, next) {
   if (SAFE_METHODS.has(req.method)) return next();
   const origin = req.headers.origin ? String(req.headers.origin).replace(/\/$/, '') : null;
-  if (origin && !getAllowedOrigins().includes(origin)) {
+  if (origin && !isAllowedOrigin(origin)) {
     return res.status(403).json({ success: false, message: 'Request origin is not allowed.' });
   }
   if (req.headers['x-requested-with'] !== 'XMLHttpRequest') {

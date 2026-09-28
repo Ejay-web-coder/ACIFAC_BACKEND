@@ -5,7 +5,9 @@ import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, optionalString, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import { sendEmailSafely } from '../services/emailService.js';
-import { loanDecisionEmail, loanSubmittedEmail, paymentEmail } from '../services/emailTemplates.js';
+import { loanApplicationReceivedEmail, loanDecisionEmail, loanSubmittedEmail, paymentEmail } from '../services/emailTemplates.js';
+import { emailMember } from '../services/memberEmails.js';
+import { keepAlive } from '../utils/background.js';
 import { notifyAdmins, notifyMember } from '../services/notificationService.js';
 import {
   allocatePayment, calculateLoanFinancials, createInstallments, ensureInstallments, LOAN_POLICY, recomputeLoanState, refreshLoanStatusesInBackground,
@@ -340,7 +342,9 @@ export async function createLoan(req, res) {
     return id;
   });
   const result = await query(`${loanSelect} WHERE l.id = $1`, [loanId]);
-  return res.status(201).json({ success: true, loan: result.rows[0] });
+  const loan = result.rows[0];
+  void emailMember(loan.memberDatabaseId, loanDecisionEmail({ requestId: loan.id, amount: loan.amount, interestRate: loan.interestRate, term: loan.term, status: 'approved', totalRepayment: loan.totalAmount, monthlyPayment: loan.monthlyPayment }));
+  return res.status(201).json({ success: true, loan });
 }
 
 export async function reviewLoanRequest(req, res) {
@@ -527,12 +531,13 @@ export async function createMemberLoanRequest(req, res) {
     return insertLoanRequest(client, req, { member, application, income });
   });
 
-  void (async () => {
+  void keepAlive((async () => {
     const admins = await query(`SELECT id, email FROM users WHERE role = 'ADMIN' AND account_status = 'ACTIVE' AND email IS NOT NULL`);
     const email = loanSubmittedEmail({ memberName: request.memberName, memberNumber: request.memberNumber, amount: request.amount, requestId: request.id });
     await Promise.all(admins.rows.map((admin) => sendEmailSafely({ ...email, to: admin.email, relatedUserId: admin.id })));
-  })().catch((error) => console.error('Loan submission email failed:', error.message));
+  })().catch((error) => console.error('Loan submission email failed:', error.message)));
 
+  void emailMember(request.memberDatabaseId, (recipient) => loanApplicationReceivedEmail({ memberName: recipient.full_name, requestId: request.id, amount: request.amount, loanType: request.loanType, term: request.term }));
   return res.status(201).json({ success: true, request });
 }
 

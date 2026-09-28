@@ -8,6 +8,7 @@ import {
   buildAnalysisPrompt, DOCUMENT_TYPES, FORM_DEFINITIONS, isPostable, normalizeAuthenticity, normalizeDocumentType, normalizeExtractedData,
   postDocument, publicFormDefinitions, UNRECOGNIZED, verifyDocument,
 } from '../services/documentRouting.js';
+import { emailMember } from '../services/memberEmails.js';
 
 const SUPPORTED_TYPES = new Set(DOCUMENT_TYPES);
 // Minimum AI reading confidence before a fully verified form is posted
@@ -231,7 +232,7 @@ async function saveVerification(id, verification) {
 // Posts a scan to its module inside one transaction with the scan update, so a
 // form is never recorded twice and never marked posted without its record.
 async function postScan(req, id, { automatic }) {
-  return withTransaction(async (client) => {
+  const posted = await withTransaction(async (client) => {
     const scan = (await client.query('SELECT * FROM document_scans WHERE id = $1 FOR UPDATE', [id])).rows[0];
     if (!scan) throw notFound('Document scan not found.');
     if (scan.posted_at) throw conflict(`This document was already posted (${scan.posted_module} ${scan.posted_record_id}).`);
@@ -255,6 +256,9 @@ async function postScan(req, id, { automatic }) {
     });
     return { scan: updated, result };
   });
+  // The member hears about the record the scanner created (after commit).
+  if (posted.result.memberId && posted.result.email) void emailMember(posted.result.memberId, posted.result.email);
+  return posted;
 }
 
 const EXTRACTED_VALUE_MAX = 2000;

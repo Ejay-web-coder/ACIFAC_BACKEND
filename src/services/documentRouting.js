@@ -6,6 +6,7 @@ import { insertMemberRecord, parseShareCapital, SAVINGS_METHODS, insertSavingsDe
 import { insertLoanRequest, memberApplicationSelect, prepareApplication } from '../controllers/loanController.js';
 import { insertRentalRequest } from '../controllers/machineryController.js';
 import { insertKadiwaSale } from '../controllers/kadiwaController.js';
+import { loanApplicationReceivedEmail, rentalRequestReceivedEmail, savingsDepositEmail, welcomeMemberEmail } from './emailTemplates.js';
 
 // Scanned cooperative forms: what each one contains, how the AI must report
 // it, how it is checked against the database, and where it is saved.
@@ -501,7 +502,10 @@ async function saveToModule(client, req, scan, documentType, data, target) {
       body, values, shareCapitalCents, source: 'ocr', idDocumentRef: scan.stored_file_path,
       idDocument: { originalname: scan.original_file_name, mimetype: scan.mime_type, size: Number(scan.file_size) },
     });
-    return { module: 'members', recordId: memberNumber, databaseId: Number(id), label: `Member ${memberNumber} registered` };
+    return {
+      module: 'members', recordId: memberNumber, databaseId: Number(id), label: `Member ${memberNumber} registered`,
+      memberId: Number(id), email: (recipient) => welcomeMemberEmail({ memberName: recipient.full_name, memberNumber, membershipDate: values.membershipDate, fromPaperForm: true }),
+    };
   }
 
   if (documentType === 'Loan Form') {
@@ -523,7 +527,10 @@ async function saveToModule(client, req, scan, documentType, data, target) {
       collateralType: collateralOf(data.collateralType), collateralDetails: data.collateralDetails,
     }, member);
     const request = await insertLoanRequest(client, req, { member, application, income: '0', submittedBy: 'admin' });
-    return { module: 'loans', recordId: String(request.id), label: `Loan application #${request.id} submitted for approval` };
+    return {
+      module: 'loans', recordId: String(request.id), label: `Loan application #${request.id} submitted for approval`,
+      memberId: Number(member.id), email: (recipient) => loanApplicationReceivedEmail({ memberName: recipient.full_name, requestId: request.id, amount: request.amount, loanType: request.loanType, term: request.term, fromPaperForm: true }),
+    };
   }
 
   if (documentType === 'Savings Form') {
@@ -533,7 +540,10 @@ async function saveToModule(client, req, scan, documentType, data, target) {
       memberId: target.memberId, amountCents, date: data.date, paymentMethod: savingsMethodOf(data.paymentMethod),
       reference: data.referenceNumber || null, notes: [data.notes, `Recorded from scanned savings form #${scan.id}.`].filter(Boolean).join(' ').slice(0, 1000),
     });
-    return { module: 'savings', recordId: String(result.record.id), label: `Savings deposit #${result.record.id} recorded` };
+    return {
+      module: 'savings', recordId: String(result.record.id), label: `Savings deposit #${result.record.id} recorded`,
+      memberId: target.memberId, email: (recipient) => savingsDepositEmail({ memberName: recipient.full_name, amount: result.record.amount, date: data.date, reference: data.referenceNumber, total: result.total, fromPaperForm: true }),
+    };
   }
 
   if (documentType === 'Machinery Form') {
@@ -541,7 +551,10 @@ async function saveToModule(client, req, scan, documentType, data, target) {
       machineryId: target.machineryId, memberId: target.memberId, purpose: data.purpose,
       notes: [data.notes, `From scanned machinery form #${scan.id}.`].filter(Boolean).join(' ').slice(0, 1000), startDate: data.startDate, endDate: data.endDate,
     });
-    return { module: 'machinery', recordId: String(request.id), label: `Rental request #${request.id} submitted for approval` };
+    return {
+      module: 'machinery', recordId: String(request.id), label: `Rental request #${request.id} submitted for approval`,
+      memberId: target.memberId, email: (recipient) => rentalRequestReceivedEmail({ memberName: recipient.full_name, machineryName: request.machineryName, startDate: request.startDate, endDate: request.endDate, rentalFee: request.rentalFee, fromPaperForm: true }),
+    };
   }
 
   if (documentType === 'Kadiwa Sales Form') {
