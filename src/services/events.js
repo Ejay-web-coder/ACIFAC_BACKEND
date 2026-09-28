@@ -8,7 +8,10 @@ import { loadSessionUser } from '../middleware/auth.js';
 // Clients then re-fetch through the normal authorised API, so no record data
 // ever travels over this channel.
 
-const ADMIN_ONLY_TABLES = new Set(['users', 'kadiwa_inventory', 'kadiwa_sales', 'document_scans']);
+const ADMIN_ONLY_TABLES = new Set([
+  'users', 'kadiwa_inventory', 'kadiwa_sales', 'document_scans',
+  'machinery_services', 'machinery_service_payments', 'machinery_service_rates', 'machinery_expenses', 'machinery_period_balances',
+]);
 const PUBLIC_TABLES = new Set(['machinery', 'announcements']);
 const HEARTBEAT_MS = 25000;
 

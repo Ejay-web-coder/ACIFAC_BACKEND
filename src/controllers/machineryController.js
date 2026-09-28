@@ -33,8 +33,12 @@ const operationSelect = `
 
 const machinerySelect = `
   SELECT id, name, type, status, acquisition_date AS "acquisitionDate", last_maintenance AS "lastMaintenance",
-         next_maintenance AS "nextMaintenance", daily_fee AS "dailyFee", updated_at AS "updatedAt"
+         next_maintenance AS "nextMaintenance", daily_fee AS "dailyFee", updated_at AS "updatedAt",
+         delivery_date AS "deliveryDate", condition, parent_machinery_id AS "parentMachineryId", pricing_mode AS "pricingMode"
   FROM machinery`;
+
+const CONDITIONS = ['operational', 'non_operational', 'always_repair', 'idle'];
+const PRICING_MODES = ['per_day', 'per_service'];
 
 let lastRentalRefresh = 0;
 
@@ -109,10 +113,11 @@ export async function listMachineryData(req, res) {
   });
 }
 
-// Minimal catalogue for members: no member data, only availability.
+// Minimal catalogue for members: no member data, only availability. Machines
+// paid per service (per hectare or per 100 bags) are not booked by the day.
 export async function listMachineryCatalog(req, res) {
   refreshRentalStatusesInBackground();
-  const result = await query(`SELECT id, name, type, status, daily_fee AS "dailyFee" FROM machinery ORDER BY name`);
+  const result = await query(`SELECT id, name, type, status, daily_fee AS "dailyFee" FROM machinery WHERE pricing_mode = 'per_day' ORDER BY name`);
   return res.json({ success: true, machinery: result.rows });
 }
 
@@ -126,7 +131,16 @@ function readMachineryInput(body, { partial = false } = {}) {
     values.type = cleanString(body.type, 80);
     if (!values.type) throw badRequest('Machinery type is required.');
   }
-  if (!partial || body.dailyFee !== undefined) {
+  if (!partial || body.pricingMode !== undefined) {
+    const mode = body.pricingMode ?? 'per_day';
+    if (!PRICING_MODES.includes(mode)) throw badRequest('Pricing must be per day or per service.');
+    values.pricing_mode = mode;
+  }
+  // Per-service machines are priced by their service rates; a daily fee is optional.
+  const dailyFeeOptional = !partial && values.pricing_mode === 'per_service' && (body.dailyFee === undefined || body.dailyFee === '');
+  if (dailyFeeOptional) {
+    values.daily_fee = '0.00';
+  } else if (!partial || body.dailyFee !== undefined) {
     const cents = parseMoneyInput(body.dailyFee, { allowZero: true, max: 1000000 });
     if (cents === null) throw badRequest('Daily fee must be a non-negative amount.');
     values.daily_fee = centsToString(cents);
@@ -135,6 +149,17 @@ function readMachineryInput(body, { partial = false } = {}) {
     values.acquisition_date = cleanString(body.acquisitionDate, 10);
     if (!isValidDateOnly(values.acquisition_date)) throw badRequest('A valid acquisition date is required.');
   }
+  if (body.deliveryDate !== undefined) {
+    const value = optionalString(body.deliveryDate, 10);
+    if (value && !isValidDateOnly(value)) throw badRequest('Delivery date must be a valid date.');
+    values.delivery_date = value;
+  }
+  if (body.condition !== undefined) {
+    const value = optionalString(body.condition, 20);
+    if (value && !CONDITIONS.includes(value)) throw badRequest('Condition must be operational, non-operational, always under repair or idle.');
+    values.condition = value;
+  }
+  if (body.parentMachineryId !== undefined) values.parent_machinery_id = optionalString(body.parentMachineryId, 20);
   for (const [key, column] of [['lastMaintenance', 'last_maintenance'], ['nextMaintenance', 'next_maintenance']]) {
     if (body[key] !== undefined) {
       const value = optionalString(body[key], 10);
@@ -149,16 +174,32 @@ function readMachineryInput(body, { partial = false } = {}) {
   return values;
 }
 
+// An implement (e.g. a Rotavator) attaches to the machine that pulls it, one
+// level deep: the parent cannot itself be attached, and a machine with
+// implements cannot be attached to another.
+async function assertParent(client, id, parentId) {
+  if (!parentId) return;
+  if (parentId === id) throw badRequest('A machine cannot be attached to itself.');
+  const parent = (await client.query('SELECT id, parent_machinery_id FROM machinery WHERE id = $1', [parentId])).rows[0];
+  if (!parent) throw badRequest('The machine to attach to was not found.');
+  if (parent.parent_machinery_id) throw badRequest('That machine is itself attached to another machine. Attach to the main machine instead.');
+  if (id && (await client.query('SELECT 1 FROM machinery WHERE parent_machinery_id = $1 LIMIT 1', [id])).rows[0]) {
+    throw badRequest('This machine has implements attached, so it cannot be attached to another machine.');
+  }
+}
+
 export async function createMachinery(req, res) {
   const values = readMachineryInput(req.body || {});
   const machine = await withTransaction(async (client) => {
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['acifac-machinery-id']);
+    await assertParent(client, null, values.parent_machinery_id);
     const next = await client.query(`SELECT COALESCE(MAX(NULLIF(regexp_replace(id, '\\D', '', 'g'), '')::int), 0) + 1 AS n FROM machinery WHERE id ~ '^M-[0-9]+$'`);
     const id = `M-${String(next.rows[0].n).padStart(3, '0')}`;
     await client.query(
-      `INSERT INTO machinery (id, name, type, daily_fee, status, acquisition_date, last_maintenance, next_maintenance)
-       VALUES ($1, $2, $3, $4::numeric, $5, $6, $7, $8)`,
-      [id, values.name, values.type, values.daily_fee, values.status || 'available', values.acquisition_date, values.last_maintenance ?? null, values.next_maintenance ?? null]
+      `INSERT INTO machinery (id, name, type, daily_fee, status, acquisition_date, last_maintenance, next_maintenance, delivery_date, condition, parent_machinery_id, pricing_mode)
+       VALUES ($1, $2, $3, $4::numeric, $5, $6, $7, $8, $9, $10, $11, $12)`,
+      [id, values.name, values.type, values.daily_fee, values.status || 'available', values.acquisition_date, values.last_maintenance ?? null, values.next_maintenance ?? null,
+        values.delivery_date ?? null, values.condition ?? null, values.parent_machinery_id ?? null, values.pricing_mode]
     );
     await createAuditLog({ client, user: req.user, action: 'MACHINERY_CREATED', module: 'Machinery', entityType: 'machinery', entityId: id, description: `Added machinery ${values.name}`, newValues: values, ...getRequestMeta(req) });
     return (await client.query(`${machinerySelect} WHERE id = $1`, [id])).rows[0];
@@ -173,6 +214,10 @@ export async function updateMachinery(req, res) {
   const machine = await withTransaction(async (client) => {
     const before = (await client.query(`${machinerySelect} WHERE id = $1 FOR UPDATE`, [id])).rows[0];
     if (!before) throw notFound('Machinery not found.');
+    if (values.parent_machinery_id !== undefined) {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['acifac-machinery-id']);
+      await assertParent(client, id, values.parent_machinery_id);
+    }
     const columns = Object.keys(values);
     await client.query(
       `UPDATE machinery SET ${columns.map((column, index) => `${column} = $${index + 2}`).join(', ')}, updated_at = NOW() WHERE id = $1`,
@@ -188,8 +233,9 @@ export async function updateMachinery(req, res) {
 // Inserts a pending rental request inside the caller's transaction. Shared by
 // the booking form and by OCR-posted machinery forms.
 export async function insertRentalRequest(client, req, { machineryId, memberId, purpose, notes, startDate, endDate }) {
-  const machine = (await client.query('SELECT id, name, daily_fee, status FROM machinery WHERE id = $1 FOR UPDATE', [cleanString(String(machineryId), 20)])).rows[0];
+  const machine = (await client.query('SELECT id, name, daily_fee, status, pricing_mode FROM machinery WHERE id = $1 FOR UPDATE', [cleanString(String(machineryId), 20)])).rows[0];
   if (!machine) throw notFound('Machinery not found.');
+  if (machine.pricing_mode === 'per_service') throw conflict(`${machine.name} is paid per service, not rented by the day. Ask the cooperative office to schedule it.`);
   if (machine.status === 'maintenance') throw conflict('That machinery is under maintenance and cannot be booked right now.');
   await assertNoOverlap(client, machine.id, startDate, endDate);
   const member = (await client.query(`SELECT id, TRIM(CONCAT_WS(' ', first_name, middle_name, last_name, suffix)) AS full_name FROM members WHERE id = $1 AND status = 'active'`, [memberId])).rows[0];

@@ -361,6 +361,126 @@ test('machinery: catalogue, request, approve, overlap protection, member status'
   assert.equal(blocked.status, 409);
 });
 
+test('machinery services: dated rates, fees, payments, expenses and the PhilMech report', { skip }, async () => {
+  // Seeded by sql/017: per-service machines stay out of the per-day booking.
+  const fleet = (await admin.get('/api/machinery')).data.machinery;
+  const tractor = fleet.find((row) => row.name === 'Tractor with Rotavator');
+  const harvester = fleet.find((row) => row.name === 'Harvester' && row.pricingMode === 'per_service');
+  assert.equal(tractor.pricingMode, 'per_service');
+  assert.equal(tractor.deliveryDate, '2025-02-21');
+  assert.equal(tractor.condition, 'always_repair');
+  assert.equal(harvester.deliveryDate, '2020-12-08');
+  assert.equal(fleet.find((row) => row.id === 'M-004').parentMachineryId, tractor.id);
+  const catalog = (await member.get('/api/machinery/catalog')).data.machinery;
+  assert.ok(catalog.every((row) => row.id !== tractor.id && row.id !== harvester.id));
+  assert.ok(catalog.some((row) => row.id === 'M-003'), 'per-day machines such as the Water Pump are still bookable');
+  const perDay = await member.post('/api/machinery/requests', { machineryId: tractor.id, startDate: '2099-01-01', endDate: '2099-01-02', purpose: 'Plowing' });
+  assert.equal(perDay.status, 409);
+  assert.match(perDay.data.message, /paid per service/);
+  assert.equal((await member.get('/api/machinery/services')).status, 403);
+
+  // The report's member cases use the registered test member (the fee does not depend on the name).
+  const galopeId = state.memberId;
+
+  const quote = await admin.post('/api/machinery/services/quote', { machineryId: tractor.id, serviceType: 'rotavator', serviceDate: '2026-06-10', clientCategory: 'member', areaHa: '1.5' });
+  assert.equal(quote.status, 200, JSON.stringify(quote.data));
+  assert.equal(quote.data.quote.feeAmount, '5700.00');
+  const early = await admin.post('/api/machinery/services/quote', { machineryId: tractor.id, serviceType: 'Squadrone', serviceDate: '2026-03-15', clientCategory: 'member', areaHa: '1' });
+  assert.equal(early.status, 400);
+  assert.match(early.data.message, /No Squadrone rate/);
+
+  const base = { machineryId: tractor.id, croppingPeriod: '1st', year: 2026 };
+  const rotavator = await admin.post('/api/machinery/services', { ...base, serviceType: 'Rotavator', serviceDate: '2026-06-10', clientCategory: 'member', memberDatabaseId: galopeId, areaHa: '1.5', amountPaid: '4000' });
+  assert.equal(rotavator.status, 201, JSON.stringify(rotavator.data));
+  assert.equal(rotavator.data.service.clientName, 'Juan Dela Cruz', 'a member\'s name and address come from the member record');
+  assert.ok(rotavator.data.service.clientAddress);
+  assert.equal(rotavator.data.service.feeAmount, '5700.00');
+  assert.equal(rotavator.data.service.balance, '1700.00');
+  assert.equal(rotavator.data.service.paymentStatus, 'partial');
+
+  const squadrone = await admin.post('/api/machinery/services', { ...base, serviceType: 'Squadrone', serviceDate: '2026-06-11', clientCategory: 'non_member', clientName: 'Eleseo Acosta', clientAddress: 'Calintaan', areaHa: '1', amountPaid: '2000' });
+  assert.equal(squadrone.status, 201, JSON.stringify(squadrone.data));
+  assert.equal(squadrone.data.service.feeAmount, '3400.00');
+  assert.equal(squadrone.data.service.balance, '1400.00');
+  assert.equal(squadrone.data.service.memberDatabaseId, null);
+
+  const harvestBase = { machineryId: harvester.id, serviceType: 'Harvesting', serviceDate: '2026-05-05', croppingPeriod: '1st', year: 2026, totalBags: '100', bagValue: '1000' };
+  const memberHarvest = await admin.post('/api/machinery/services', { ...harvestBase, clientCategory: 'member', memberDatabaseId: galopeId, areaHa: '2' });
+  const guestHarvest = await admin.post('/api/machinery/services', { ...harvestBase, clientCategory: 'non_member', clientName: 'Rosa Reyes', kgPerBag: '50', pricePerKg: '14', bagValue: '' });
+  assert.equal(memberHarvest.status, 201, JSON.stringify(memberHarvest.data));
+  assert.equal(memberHarvest.data.service.feeBags, '10.00');
+  assert.equal(memberHarvest.data.service.feeAmount, '10000.00');
+  assert.equal(guestHarvest.data.service.feeBags, '12.00');
+  assert.equal(guestHarvest.data.service.bagValue, '700.00');
+  assert.equal(guestHarvest.data.service.feeAmount, '8400.00');
+
+  // A changed fee needs a reason and keeps the fee from the rate.
+  const tudling = { ...base, serviceType: 'Tudling', serviceDate: '2026-06-12', clientCategory: 'non_member', clientName: 'Pedro Santos', areaHa: '1', feeAmount: '1500' };
+  assert.equal((await admin.post('/api/machinery/services', tudling)).status, 400);
+  const discounted = await admin.post('/api/machinery/services', { ...tudling, feeOverrideReason: 'Board-approved discount' });
+  assert.equal(discounted.status, 201, JSON.stringify(discounted.data));
+  assert.equal(discounted.data.service.computedFeeAmount, '1800.00');
+  assert.equal(discounted.data.service.feeAmount, '1500.00');
+  assert.equal(discounted.data.service.paymentStatus, 'unpaid');
+
+  const serviceId = rotavator.data.service.id;
+  const over = await admin.post(`/api/machinery/services/${serviceId}/payments`, { amount: '1700.01', paymentDate: '2026-06-20' });
+  assert.equal(over.status, 400);
+  const paid = await admin.post(`/api/machinery/services/${serviceId}/payments`, { amount: '1700', paymentDate: '2026-06-20' });
+  assert.equal(paid.status, 201, JSON.stringify(paid.data));
+  assert.equal(paid.data.service.paymentStatus, 'full');
+  assert.equal(paid.data.payments.length, 2);
+  const voided = await admin.request('DELETE', `/api/machinery/services/${serviceId}/payments/${paid.data.payments[1].id}`);
+  assert.equal(voided.data.service.balance, '1700.00');
+  assert.equal((await admin.request('DELETE', `/api/machinery/services/${serviceId}`)).status, 409, 'services with payments are not deleted');
+  const lowered = await admin.patch(`/api/machinery/services/${serviceId}`, { ...base, serviceType: 'Rotavator', serviceDate: '2026-06-10', clientCategory: 'member', memberDatabaseId: galopeId, areaHa: '1' });
+  assert.equal(lowered.status, 409, 'the fee cannot drop below what was collected');
+
+  // A new open-ended rate ends the previous one the day before.
+  const newRate = await admin.post(`/api/machinery/${tractor.id}/rates`, { serviceType: 'tudling', unit: 'per_ha', memberRate: '2000', nonMemberRate: '2200', effectiveFrom: '2026-07-01' });
+  assert.equal(newRate.status, 201, JSON.stringify(newRate.data));
+  const rates = (await admin.get(`/api/machinery/${tractor.id}/rates`)).data.rates.filter((rate) => rate.serviceType === 'Tudling');
+  assert.deepEqual(rates.map((rate) => [rate.effectiveFrom, rate.effectiveTo, rate.memberRate]), [['2026-01-01', '2026-06-30', '1800.00'], ['2026-07-01', null, '2000.00']]);
+  const julyQuote = await admin.post('/api/machinery/services/quote', { machineryId: tractor.id, serviceType: 'Tudling', serviceDate: '2026-07-02', clientCategory: 'non_member', areaHa: '1' });
+  assert.equal(julyQuote.data.quote.feeAmount, '2200.00');
+  assert.equal((await admin.post(`/api/machinery/${tractor.id}/rates`, { serviceType: 'Tudling', unit: 'per_ha', memberRate: '1', nonMemberRate: '1', effectiveFrom: '2026-06-01', effectiveTo: '2026-06-10' })).status, 409);
+  assert.equal((await admin.request('DELETE', `/api/machinery/rates/${rates[0].id}`)).status, 409, 'a rate used by a service is ended, not deleted');
+
+  const fuel = await admin.post('/api/machinery/expenses', { machineryId: tractor.id, expenseDate: '2026-06-01', croppingPeriod: '1st', year: 2026, category: 'fuel', amount: '2500', description: 'Diesel' });
+  assert.equal(fuel.status, 201, JSON.stringify(fuel.data));
+  await admin.post('/api/machinery/expenses', { machineryId: 'M-004', expenseDate: '2026-06-05', croppingPeriod: '1st', year: 2026, category: 'repair_maintenance', amount: '3000', description: 'Rotavator blades' });
+  const late = await admin.post('/api/machinery/expenses', { machineryId: tractor.id, expenseDate: '2026-08-15', croppingPeriod: '1st', year: 2026, category: 'labor', amount: '1500' });
+  const expenses = await admin.get(`/api/machinery/expenses?croppingPeriod=1st&year=2026`);
+  assert.equal(expenses.data.totals.total, '7000.00');
+  assert.equal((await admin.put('/api/machinery/period-balances', { machineryId: tractor.id, croppingPeriod: '1st', year: 2026, beginningCash: '10000', otherIncome: '500' })).status, 200);
+
+  const report = await admin.get(`/api/machinery/reports/philmech?croppingPeriod=1st&year=2026&fromMonth=1&toMonth=7`);
+  assert.equal(report.status, 200, JSON.stringify(report.data));
+  const tractorReport = report.data.report.machines.find((row) => row.machineryId === tractor.id);
+  assert.deepEqual(tractorReport.implements, [{ id: 'M-004', name: 'Rotavator' }]);
+  assert.deepEqual(tractorReport.summary.farmers, { member: 1, nonMember: 2, total: 3 });
+  assert.deepEqual(tractorReport.summary.areaHa, { member: '1.5000', nonMember: '2.0000', total: '3.5000' });
+  assert.deepEqual(tractorReport.summary.grossIncome, { collected: '6000.00', collectibles: '4600.00', total: '10600.00' });
+  assert.equal(tractorReport.summary.operatingExpenses, '7000.00');
+  assert.equal(tractorReport.summary.availableFunds, '3600.00');
+  assert.deepEqual(tractorReport.cashFlow.outflows, { fuel: '2500.00', labor: '1500.00', repair_maintenance: '3000.00', other: '0.00' });
+  assert.equal(tractorReport.cashFlow.totalSourceOfCash, '16500.00');
+  assert.equal(tractorReport.cashFlow.netCashFlow, '9500.00');
+  assert.equal(tractorReport.clientTotals.accountsReceivable, '4600.00');
+  assert.deepEqual(tractorReport.warnings.map((warning) => warning.code), ['EXPENSE_OUTSIDE_MONTHS', 'FEE_CHANGED', 'UNPAID_NO_PAYMENT']);
+  const harvestReport = report.data.report.machines.find((row) => row.machineryId === harvester.id);
+  assert.deepEqual(harvestReport.summary.bags, { member: '100.00', nonMember: '100.00', total: '200.00' });
+  assert.ok(harvestReport.warnings.some((warning) => warning.code === 'SERVICE_WITHOUT_AREA'));
+
+  assert.equal((await admin.request('DELETE', `/api/machinery/expenses/${late.data.expense.id}`)).status, 200);
+  assert.equal((await admin.request('DELETE', `/api/machinery/services/${discounted.data.service.id}`)).status, 200);
+  const actions = (await pool.query(`SELECT action FROM audit_logs WHERE module = 'Machinery' AND action LIKE 'MACHINERY_%' GROUP BY action ORDER BY action`)).rows.map((row) => row.action);
+  for (const action of ['MACHINERY_EXPENSE_DELETED', 'MACHINERY_EXPENSE_RECORDED', 'MACHINERY_PERIOD_BALANCE_RECORDED', 'MACHINERY_RATE_ADDED', 'MACHINERY_RATE_UPDATED',
+    'MACHINERY_SERVICE_DELETED', 'MACHINERY_SERVICE_PAYMENT_RECEIVED', 'MACHINERY_SERVICE_PAYMENT_VOIDED', 'MACHINERY_SERVICE_RECORDED']) {
+    assert.ok(actions.includes(action), `${action} is audited`);
+  }
+});
+
 test('kadiwa: sales decrement stock, reject overselling and race safely', { skip }, async () => {
   const before = await admin.get('/api/kadiwa');
   const rice = before.data.inventory.find((item) => item.id === 'INV-001');
