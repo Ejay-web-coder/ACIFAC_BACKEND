@@ -1,17 +1,40 @@
 import { query, withTransaction } from '../config/db.js';
-import { buildAuthCookieOptions, digestToken, generateSecureToken, sanitizeUser, SESSION_TTL_MS } from '../utils/auth.js';
+import {
+  buildAuthCookieOptions, buildResetGrantCookieOptions, digestToken, generateSecureToken, generateVerificationCode, sanitizeUser, SESSION_TTL_MS,
+  LOGIN_IP_MAX_FAILURES, LOGIN_LOCK_MINUTES, LOGIN_MAX_FAILED_ATTEMPTS, RESET_CODE_MAX_ATTEMPTS, RESET_CODE_RESEND_SECONDS, RESET_CODE_TTL_MINUTES,
+  RESET_CODES_PER_EMAIL_PER_HOUR, RESET_CODES_PER_IP_PER_HOUR, RESET_GRANT_COOKIE, RESET_GRANT_TTL_MINUTES,
+} from '../utils/auth.js';
 import { validatePasswordPolicy, hashPassword, verifyPassword } from '../utils/password.js';
 import { createAuditLog } from '../utils/audit.js';
-import { badRequest, cleanString, currentUserId, getRequestMeta, optionalString } from '../utils/http.js';
+import { keepAlive } from '../utils/background.js';
+import { badRequest, cleanString, currentUserId, getRequestMeta, optionalString, withCode } from '../utils/http.js';
 import { sendEmailSafely } from '../services/emailService.js';
-import { passwordResetEmail } from '../services/emailTemplates.js';
+import { passwordResetCodeEmail } from '../services/emailTemplates.js';
 import { notifyUser } from '../services/notificationService.js';
+import { clearFailures, findActiveLock, registerFailure, throttleKeys } from '../services/loginThrottle.js';
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_PATTERN = /^[+0-9()\s.-]{7,30}$/;
 // Used to spend the same bcrypt time when the user does not exist.
 let dummyHashPromise = null;
 const getDummyHash = () => (dummyHashPromise ??= hashPassword(generateSecureToken(16)));
+
+const INVALID_CREDENTIALS_MESSAGE = 'Invalid username or password.';
+const ACCOUNT_LIMITS = { maxAttempts: LOGIN_MAX_FAILED_ATTEMPTS, lockMinutes: LOGIN_LOCK_MINUTES };
+const IP_LIMITS = { maxAttempts: LOGIN_IP_MAX_FAILURES, lockMinutes: LOGIN_LOCK_MINUTES };
+
+function sendLoginLocked(res, lock) {
+  const minutes = Math.max(1, Math.ceil(lock.retryAfterSeconds / 60));
+  res.setHeader('Retry-After', String(lock.retryAfterSeconds));
+  return res.status(429).json({
+    success: false,
+    code: 'LOGIN_LOCKED',
+    message: `Too many failed login attempts. Please try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+    // Seconds left on the server's lock; the login page counts down from this.
+    retryAfterSeconds: lock.retryAfterSeconds,
+    lockedUntil: lock.lockedUntil,
+  });
+}
 
 // Members sign in with their username or member number; email sign-in is kept
 // for administrators only.
@@ -48,9 +71,32 @@ export async function login(req, res) {
   if (!identifier || !password) throw badRequest('Username/email and password are required.');
 
   const user = await findUserByIdentifier(identifier);
+  // The lockout follows the account whichever name it is signed in with
+  // (username, email or member number). Names that match no account lock the
+  // same way, so a lockout never reveals whether an account exists.
+  const accountKey = user ? throttleKeys.user(user.id) : throttleKeys.name(identifier);
+  const ipKey = throttleKeys.ip(req.ip);
+  const auditUser = user ? { id: user.id, username: user.username, role: user.role } : null;
+
+  // Checked before the password, so a locked account gives no hint whether a
+  // guess was right.
+  const activeLock = await findActiveLock([accountKey, ipKey]);
+  if (activeLock) {
+    if (activeLock.key === accountKey) {
+      // Hammering a locked account still uses up the address's allowance.
+      await registerFailure(ipKey, IP_LIMITS);
+      if (user) {
+        await createAuditLog({ user: auditUser, action: 'LOGIN_BLOCKED', module: 'Authentication', entityType: 'user', entityId: String(user.id), description: 'Sign-in attempt while locked', ...getRequestMeta(req), status: 'FAILED', details: { reason: 'account_locked', retry_after_seconds: activeLock.retryAfterSeconds } });
+      }
+    }
+    return sendLoginLocked(res, activeLock);
+  }
+
   const isValidPassword = await verifyPassword(password, user?.password_hash || await getDummyHash());
 
   if (!user || !isValidPassword) {
+    const account = await registerFailure(accountKey, { ...ACCOUNT_LIMITS, userId: user?.id ?? null });
+    const address = await registerFailure(ipKey, IP_LIMITS);
     await createAuditLog({
       userId: user?.id ?? null,
       action: 'LOGIN_FAILURE',
@@ -60,9 +106,27 @@ export async function login(req, res) {
       description: 'Failed sign-in attempt',
       ...getRequestMeta(req),
       status: 'FAILED',
-      details: { identifier, reason: user ? 'invalid_password' : 'user_not_found' },
+      details: { identifier, reason: user ? 'invalid_password' : 'user_not_found', attempts_remaining: account.attemptsRemaining },
     });
-    return res.status(401).json({ success: false, message: 'Invalid credentials.' });
+
+    const lock = account.locked ? account : address.locked ? address : null;
+    if (lock) {
+      await createAuditLog({
+        user: auditUser,
+        action: account.locked ? 'LOGIN_LOCKED' : 'LOGIN_IP_LOCKED',
+        module: 'Authentication',
+        entityType: 'user',
+        entityId: user ? String(user.id) : null,
+        description: account.locked
+          ? `Sign-in locked for ${LOGIN_LOCK_MINUTES} minutes after ${LOGIN_MAX_FAILED_ATTEMPTS} failed attempts`
+          : `Sign-ins from this address locked for ${LOGIN_LOCK_MINUTES} minutes after repeated failures`,
+        ...getRequestMeta(req),
+        status: 'FAILED',
+        details: { identifier, locked_until: lock.lockedUntil },
+      });
+      return sendLoginLocked(res, lock);
+    }
+    return res.status(401).json({ success: false, code: 'INVALID_CREDENTIALS', message: INVALID_CREDENTIALS_MESSAGE, attemptsRemaining: account.attemptsRemaining });
   }
 
   // Status is only revealed after a correct password, so it cannot be used to
@@ -82,6 +146,8 @@ export async function login(req, res) {
     // Housekeeping: drop this user's long-expired sessions.
     await client.query(`DELETE FROM sessions WHERE user_id = $1 AND expires_at < NOW() - INTERVAL '30 days'`, [user.id]);
     await client.query(`UPDATE users SET last_login = NOW(), updated_at = NOW() WHERE id = $1`, [user.id]);
+    // A successful sign-in resets the failed-attempt count.
+    await clearFailures(accountKey, client);
   });
 
   res.cookie('session_token', sessionToken, buildAuthCookieOptions());
@@ -201,71 +267,267 @@ export async function updateNotificationPreferences(req, res) {
   return res.status(200).json({ success: true, message: 'Notification settings saved.', preferences });
 }
 
+// ----- Forgot password: emailed 6-digit code ----------------------------------
+// 1. POST /forgot-password {email}      emails a code (same reply for every address)
+// 2. POST /verify-reset-code {email, code}  sets the httpOnly reset grant cookie
+// 3. POST /reset-password {newPassword, confirmPassword}  uses the grant once
+// Emailed links (account setup, office resets) still call /reset-password with
+// their token.
+
+const RESET_CODE_SENT_MESSAGE = 'If an account with that email exists, a verification code has been sent.';
+const resetSessionExpired = () => withCode(badRequest('Your password reset session has expired. Please request a new code.'), 'RESET_SESSION_EXPIRED');
+
+function readEmail(body) {
+  const email = cleanString(body?.email, 255).toLowerCase();
+  if (!email || !EMAIL_PATTERN.test(email)) throw badRequest('Please enter a valid email address.');
+  return email;
+}
+
+// The active account for an address: its login email, else its member
+// record's (the same address account emails already go to).
+async function findActiveUserByEmail(email) {
+  const result = await query(
+    `SELECT u.id, u.username, u.role, COALESCE(NULLIF(u.email, ''), m.email) AS delivery_email
+     FROM users u LEFT JOIN members m ON m.id = u.member_id
+     WHERE u.account_status = 'ACTIVE' AND LOWER(COALESCE(NULLIF(u.email, ''), m.email)) = $1
+     ORDER BY (LOWER(u.email) = $1) DESC NULLS LAST, u.id
+     LIMIT 1`,
+    [email]
+  );
+  return result.rows[0] || null;
+}
+
 export async function forgotPassword(req, res) {
-  const identifier = cleanString(req.body?.usernameOrEmail, 255);
-  if (!identifier) throw badRequest('Email or username is required.');
-  const genericResponse = { success: true, message: 'If an account exists, reset instructions have been sent.' };
+  const email = readEmail(req.body);
+  const emailDigest = digestToken(email);
+  const ip = req.ip || null;
 
-  const user = await findUserByIdentifier(identifier);
-  if (!user || user.account_status !== 'ACTIVE') return res.status(200).json(genericResponse);
+  // Every address takes the same path, account or not: the same checks, a
+  // stored code (for an unknown address: no account and a code nobody ever
+  // receives) and the same reply. Only the email itself differs, and it is
+  // sent after the reply, so neither the answer nor its timing tells whether
+  // the address is registered.
+  const user = await findActiveUserByEmail(email);
+  const code = generateVerificationCode();
+  const codeHash = await hashPassword(code);
 
-  const token = generateSecureToken(32);
-  const digest = digestToken(token);
-  await withTransaction(async (client) => {
-    // Only the newest link stays valid.
-    await client.query(`UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL`, [user.id]);
+  const limited = await withTransaction(async (client) => {
+    // One request per address at a time, so the resend cooldown cannot be raced.
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`password-reset:${emailDigest}`]);
+    const usage = (await client.query(
+      `SELECT GREATEST(0, CEIL(EXTRACT(EPOCH FROM (MAX(created_at) FILTER (WHERE email_digest = $1) + make_interval(secs => $3) - NOW()))))::int AS cooldown_seconds,
+              COUNT(*) FILTER (WHERE email_digest = $1)::int AS email_requests,
+              COUNT(*) FILTER (WHERE ip_address = $2)::int AS ip_requests
+       FROM password_reset_codes
+       WHERE created_at > NOW() - INTERVAL '1 hour' AND (email_digest = $1 OR ip_address = $2)`,
+      [emailDigest, ip, RESET_CODE_RESEND_SECONDS]
+    )).rows[0];
+    if (usage.cooldown_seconds > 0) {
+      return { code: 'RESET_CODE_COOLDOWN', retryAfterSeconds: usage.cooldown_seconds, message: `Please wait ${usage.cooldown_seconds} seconds before requesting another code.` };
+    }
+    if (usage.email_requests >= RESET_CODES_PER_EMAIL_PER_HOUR || usage.ip_requests >= RESET_CODES_PER_IP_PER_HOUR) {
+      return { code: 'RESET_RATE_LIMITED', message: 'Too many verification code requests. Please try again later.' };
+    }
+    // Only the newest code for an address can be used.
     await client.query(
-      `INSERT INTO password_reset_tokens (user_id, token_hash, token_digest, expires_at)
-       VALUES ($1, $2::text, $2::text, NOW() + INTERVAL '15 minutes')`,
-      [user.id, digest]
+      `UPDATE password_reset_codes SET invalidated_at = NOW(), invalidated_reason = 'REPLACED' WHERE email_digest = $1 AND invalidated_at IS NULL`,
+      [emailDigest]
     );
-    await createAuditLog({ client, userId: user.id, action: 'PASSWORD_RESET_REQUESTED', module: 'Authentication', entityType: 'user', entityId: String(user.id), description: 'Password reset requested', ...getRequestMeta(req) });
+    await client.query(
+      `INSERT INTO password_reset_codes (email_digest, user_id, code_hash, expires_at, ip_address)
+       VALUES ($1, $2, $3, NOW() + make_interval(mins => $4), $5)`,
+      [emailDigest, user?.id ?? null, codeHash, RESET_CODE_TTL_MINUTES, ip]
+    );
+    return null;
   });
 
-  if (user.email) {
-    const email = passwordResetEmail({ username: user.username, token });
-    void sendEmailSafely({ ...email, to: user.email, relatedUserId: user.id, essential: true });
+  if (limited) {
+    if (limited.retryAfterSeconds) res.setHeader('Retry-After', String(limited.retryAfterSeconds));
+    return res.status(429).json({ success: false, ...limited });
   }
-  // Exposed only to automated tests; never in production responses.
-  if (process.env.NODE_ENV === 'test') res.setHeader('X-Test-Reset-Token', token);
-  return res.status(200).json(genericResponse);
+
+  // Housekeeping: codes older than a day are finished with.
+  await query(`DELETE FROM password_reset_codes WHERE created_at < NOW() - INTERVAL '1 day'`)
+    .catch((error) => console.error('Reset code cleanup failed:', error.message));
+
+  if (user) {
+    const meta = getRequestMeta(req);
+    const auditUser = { id: user.id, username: user.username, role: user.role };
+    const base = { user: auditUser, module: 'Authentication', entityType: 'user', entityId: String(user.id), ...meta };
+    keepAlive((async () => {
+      await createAuditLog({ ...base, action: 'PASSWORD_RESET_REQUESTED', description: 'Password reset requested' });
+      const delivery = await sendEmailSafely({ ...passwordResetCodeEmail({ code, expiresInMinutes: RESET_CODE_TTL_MINUTES }), to: user.delivery_email, relatedUserId: user.id, essential: true });
+      await createAuditLog({
+        ...base,
+        action: 'PASSWORD_RESET_CODE_SENT',
+        description: delivery.sent ? 'Password reset code emailed' : 'Password reset code could not be emailed',
+        status: delivery.sent ? 'SUCCESS' : 'FAILED',
+        details: { delivered: Boolean(delivery.sent), ...(delivery.sent ? {} : { reason: delivery.skipped ? 'email_not_configured' : 'delivery_failed' }) },
+      });
+    })());
+  }
+  return res.status(200).json({
+    success: true,
+    message: RESET_CODE_SENT_MESSAGE,
+    expiresInSeconds: RESET_CODE_TTL_MINUTES * 60,
+    resendAvailableInSeconds: RESET_CODE_RESEND_SECONDS,
+  });
+}
+
+const CODE_RESULTS = {
+  invalid: [400, 'RESET_CODE_INVALID', 'Invalid verification code.'],
+  expired: [400, 'RESET_CODE_EXPIRED', 'This verification code has expired. Please request a new code.'],
+  used: [400, 'RESET_CODE_USED', 'This verification code has already been used. Please request a new code.'],
+  locked: [429, 'RESET_CODE_LOCKED', 'Too many incorrect attempts. Please request a new code.'],
+};
+
+export async function verifyResetCode(req, res) {
+  const email = readEmail(req.body);
+  const code = cleanString(req.body?.code, 20);
+  const reply = (result) => {
+    const [status, errorCode, message] = CODE_RESULTS[result];
+    return res.status(status).json({ success: false, code: errorCode, message });
+  };
+  if (!/^\d{6}$/.test(code)) return reply('invalid');
+
+  const grant = generateSecureToken(32);
+  const outcome = await withTransaction(async (client) => {
+    // Only the newest code for the address counts. The row lock serialises
+    // attempts, so parallel guesses cannot slip past the attempt limit.
+    const row = (await client.query(
+      `SELECT c.id, c.user_id, c.code_hash, c.failed_attempts, c.verified_at, c.invalidated_at, c.invalidated_reason,
+              c.expires_at <= NOW() AS expired, u.username, u.role
+       FROM password_reset_codes c LEFT JOIN users u ON u.id = c.user_id
+       WHERE c.email_digest = $1
+       ORDER BY c.created_at DESC, c.id DESC LIMIT 1
+       FOR UPDATE OF c`,
+      [digestToken(email)]
+    )).rows[0];
+    if (!row) return { result: 'invalid' };
+    if (row.invalidated_reason === 'TOO_MANY_ATTEMPTS') return { result: 'locked', row };
+    if (row.invalidated_at || row.verified_at) return { result: 'used', row };
+    if (row.expired) return { result: 'expired', row };
+
+    // A code stored for an unknown address never matches: it was never sent.
+    const matches = (await verifyPassword(code, row.code_hash)) && row.user_id !== null;
+    if (!matches) {
+      const attempts = row.failed_attempts + 1;
+      const exhausted = attempts >= RESET_CODE_MAX_ATTEMPTS;
+      await client.query(
+        `UPDATE password_reset_codes
+         SET failed_attempts = $2,
+             invalidated_at = CASE WHEN $3::boolean THEN NOW() END,
+             invalidated_reason = CASE WHEN $3::boolean THEN 'TOO_MANY_ATTEMPTS' END
+         WHERE id = $1`,
+        [row.id, attempts, exhausted]
+      );
+      return { result: exhausted ? 'locked' : 'invalid', row, attempts, counted: true };
+    }
+
+    await client.query(
+      `UPDATE password_reset_codes SET verified_at = NOW(), grant_digest = $2, grant_expires_at = NOW() + make_interval(mins => $3) WHERE id = $1`,
+      [row.id, digestToken(grant), RESET_GRANT_TTL_MINUTES]
+    );
+    return { result: 'verified', row };
+  });
+
+  const { result, row } = outcome;
+  if (row?.user_id && (result === 'verified' || outcome.counted)) {
+    await createAuditLog({
+      user: { id: row.user_id, username: row.username, role: row.role },
+      action: result === 'verified' ? 'PASSWORD_RESET_CODE_VERIFIED' : 'PASSWORD_RESET_CODE_FAILED',
+      module: 'Authentication',
+      entityType: 'user',
+      entityId: String(row.user_id),
+      description: result === 'verified' ? 'Password reset code verified' : result === 'locked' ? 'Password reset code cancelled after too many incorrect attempts' : 'Incorrect password reset code entered',
+      ...getRequestMeta(req),
+      status: result === 'verified' ? 'SUCCESS' : 'FAILED',
+      details: result === 'verified' ? {} : { attempts: outcome.attempts, invalidated: result === 'locked' },
+    });
+  }
+  if (result !== 'verified') return reply(result);
+
+  res.cookie(RESET_GRANT_COOKIE, grant, buildResetGrantCookieOptions());
+  return res.status(200).json({ success: true, message: 'Code verified. You can now create a new password.', expiresInSeconds: RESET_GRANT_TTL_MINUTES * 60 });
 }
 
 export async function resetPassword(req, res) {
   const { token, newPassword, confirmPassword } = req.body || {};
-  if (!token || !newPassword || !confirmPassword) throw badRequest('Token and new password are required.');
+  // Emailed links send their token; the emailed-code flow presents the
+  // httpOnly grant cookie set when its code was verified.
+  const linkToken = typeof token === 'string' && token ? token : null;
+  const grant = linkToken ? null : req.cookies?.[RESET_GRANT_COOKIE];
+  if (typeof newPassword !== 'string' || typeof confirmPassword !== 'string' || !newPassword || !confirmPassword) {
+    throw badRequest('Please enter and confirm your new password.');
+  }
   if (newPassword !== confirmPassword) throw badRequest('Passwords do not match.');
   const policy = validatePasswordPolicy(newPassword);
   if (!policy.isValid) throw badRequest(policy.errors[0]);
+  if (!linkToken && (typeof grant !== 'string' || !grant)) throw resetSessionExpired();
 
   const newHash = await hashPassword(newPassword);
   const user = await withTransaction(async (client) => {
-    const tokenResult = await client.query(
-      `SELECT t.id, t.user_id FROM password_reset_tokens t
-       WHERE t.token_digest = $1 AND t.used_at IS NULL AND t.expires_at > NOW()
-       FOR UPDATE`,
-      [digestToken(String(token))]
-    );
-    const match = tokenResult.rows[0];
-    if (!match) throw badRequest('This reset link is invalid or has expired. Please request a new one.');
+    let userId;
+    let codeId = null;
+    if (linkToken) {
+      const match = (await client.query(
+        `SELECT t.id, t.user_id FROM password_reset_tokens t
+         WHERE t.token_digest = $1 AND t.used_at IS NULL AND t.expires_at > NOW()
+         FOR UPDATE`,
+        [digestToken(linkToken)]
+      )).rows[0];
+      if (!match) throw badRequest('This reset link is invalid or has expired. Please request a new one.');
+      userId = match.user_id;
+    } else {
+      const match = (await client.query(
+        `SELECT id, user_id FROM password_reset_codes
+         WHERE grant_digest = $1 AND invalidated_at IS NULL AND grant_expires_at > NOW() AND user_id IS NOT NULL
+         FOR UPDATE`,
+        [digestToken(grant)]
+      )).rows[0];
+      if (!match) throw resetSessionExpired();
+      userId = match.user_id;
+      codeId = match.id;
+    }
+
+    const current = (await client.query(`SELECT password_hash FROM users WHERE id = $1 FOR UPDATE`, [userId])).rows[0];
+    if (current && await verifyPassword(newPassword, current.password_hash)) {
+      throw badRequest('Your new password must be different from your current password.');
+    }
 
     const userResult = await client.query(
       `UPDATE users SET password_hash = $1, password_changed_at = NOW(), must_change_password = FALSE, updated_at = NOW()
        WHERE id = $2 RETURNING id, username, role, account_status`,
-      [newHash, match.user_id]
+      [newHash, userId]
     );
-    await client.query(`UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL`, [match.user_id]);
-    await client.query(`UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, [match.user_id]);
+    // Every outstanding link, code and session of this account ends here.
+    await client.query(`UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL`, [userId]);
+    await client.query(
+      `UPDATE password_reset_codes SET invalidated_at = NOW(), invalidated_reason = CASE WHEN id = $2 THEN 'USED' ELSE 'PASSWORD_CHANGED' END
+       WHERE user_id = $1 AND invalidated_at IS NULL`,
+      [userId, codeId]
+    );
+    await client.query(`UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
+    // Proving control of the email also lifts a sign-in lockout.
+    await clearFailures(throttleKeys.user(userId), client);
     const updatedUser = userResult.rows[0];
-    await createAuditLog({ client, user: updatedUser, action: 'PASSWORD_RESET_COMPLETED', module: 'Authentication', entityType: 'user', entityId: String(updatedUser.id), description: `Password reset completed for ${updatedUser.username}`, ...getRequestMeta(req) });
+    await createAuditLog({ client, user: updatedUser, action: 'PASSWORD_RESET_COMPLETED', module: 'Authentication', entityType: 'user', entityId: String(updatedUser.id), description: `Password reset completed for ${updatedUser.username}`, details: { method: linkToken ? 'email_link' : 'email_code' }, ...getRequestMeta(req) });
     await notifyUser(client, updatedUser.id, { type: 'password_reset', title: 'Password changed', message: 'Your password was reset. If this was not you, contact the ACIFAC office immediately.', severity: 'warning' });
     return updatedUser;
   });
 
+  if (!linkToken) res.clearCookie(RESET_GRANT_COOKIE, buildResetGrantCookieOptions({ includeMaxAge: false }));
   if (user.account_status !== 'ACTIVE') {
     return res.status(200).json({ success: true, message: 'Password reset successfully, but this account is not active. Please contact the ACIFAC office.' });
   }
-  return res.status(200).json({ success: true, message: 'Password reset successfully. You can now sign in.' });
+  return res.status(200).json({ success: true, message: 'Password reset successful.' });
+}
+
+// GET /api/auth/session: how long the signed-in session has left. Requests
+// marked "X-Session-Activity: passive" check without counting as activity.
+export async function sessionStatus(req, res) {
+  const { idleTimeoutSeconds, idleExpiresInSeconds, sessionExpiresInSeconds } = req.authSession;
+  return res.status(200).json({ success: true, idleTimeoutSeconds, idleExpiresInSeconds, sessionExpiresInSeconds });
 }
 
 export async function changePassword(req, res) {
@@ -289,6 +551,7 @@ export async function changePassword(req, res) {
     );
     await client.query(`UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
     await client.query(`UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL`, [userId]);
+    await client.query(`UPDATE password_reset_codes SET invalidated_at = NOW(), invalidated_reason = 'PASSWORD_CHANGED' WHERE user_id = $1 AND invalidated_at IS NULL`, [userId]);
     await createAuditLog({ client, user, action: 'PASSWORD_CHANGED', module: 'Authentication', entityType: 'user', entityId: String(userId), description: `Password changed for ${user.username}`, ...getRequestMeta(req) });
   });
 

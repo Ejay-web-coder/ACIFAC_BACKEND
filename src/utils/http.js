@@ -13,6 +13,8 @@ export const badRequest = (message, details) => new AppError(400, message, detai
 export const notFound = (message = 'Record not found.') => new AppError(404, message);
 export const conflict = (message) => new AppError(409, message);
 export const forbidden = (message = 'You do not have access to this resource.') => new AppError(403, message);
+// Adds a machine-readable code (sent as `code`) that the frontend can act on.
+export const withCode = (error, code) => Object.assign(error, { code });
 
 export function getRequestMeta(req) {
   return {
@@ -74,6 +76,7 @@ export function errorHandler(err, req, res, next) {
   return res.status(httpError.status).json({
     success: false,
     message: httpError.message,
+    ...(httpError.code ? { code: httpError.code } : {}),
     ...(httpError.details ? { errors: httpError.details } : {}),
   });
 }

@@ -9,6 +9,19 @@ React (Vercel)  →  Express API (this repo)  →  Supabase PostgreSQL (+ privat
 * Authentication: bcrypt passwords, `users` + `sessions` tables, httpOnly `session_token` cookie (8 h).
 * Every route checks the session, the account status (INACTIVE/LOCKED sessions are revoked immediately),
   forced password changes, and the role. Members can only read their own records.
+* Login security (all enforced in PostgreSQL, so it holds across browsers, tabs and server instances):
+  * the 3rd wrong password in a row locks that account for 20 minutes, whichever sign-in name is used;
+    names with no account lock the same way, and each client address is locked after
+    `LOGIN_IP_MAX_FAILURES` (default 20) failures (`login_throttles`);
+  * a session ends after 20 minutes without activity (`sessions.last_activity_at`). Requests sent with
+    `X-Session-Activity: passive` (the browser's background refreshes) and the live-update stream don't count;
+  * forgot password emails a 6-digit code (bcrypt-hashed in `password_reset_codes`, 10 minutes, 5 attempts,
+    60-second resend cooldown, 5 codes per address and `RESET_CODES_PER_IP_PER_HOUR` (default 15) per client
+    address per hour). Every address gets the same reply. A verified code sets a short-lived httpOnly
+    `password_reset_grant` cookie that allows one password change. The change ends all sessions and lifts a
+    lockout. Emailed links (account setup, office resets) still use `password_reset_tokens`.
+  * Endpoints: `POST /api/auth/login`, `/logout`, `/forgot-password`, `/verify-reset-code`,
+    `/reset-password`; `GET /api/auth/me`, `/session`.
 * Money is calculated in PostgreSQL `NUMERIC` or integer centavos, never floating point.
 * Live updates: database triggers → `pg_notify` → one `LISTEN` connection → Server-Sent Events
   (`GET /api/events`). Events carry only `{table, op}`; browsers re-fetch through the authorised API.
@@ -32,7 +45,7 @@ TEST_DATABASE_URL=postgres://... npm test  # + end-to-end API tests on a disposa
 
 The integration suite covers authentication, authorisation, members, savings, share capital,
 loans/installments/overdue, machinery, Kadiwa stock, OCR, notifications, announcements, live updates,
-analytics and session revocation.
+analytics, session revocation, login lockouts, emailed reset codes and the inactivity timeout.
 
 ## Deployment (Render, see `render.yaml`)
 

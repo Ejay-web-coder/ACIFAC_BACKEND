@@ -1,12 +1,18 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
-import { changePassword, forgotPassword, login, logout, me, resetPassword, updateNotificationPreferences, updateProfile } from '../controllers/authController.js';
+import {
+  changePassword, forgotPassword, login, logout, me, resetPassword, sessionStatus, updateNotificationPreferences, updateProfile, verifyResetCode,
+} from '../controllers/authController.js';
 import { deleteProfilePhoto, getProfilePhoto, uploadProfilePhoto } from '../controllers/profilePhotoController.js';
 import { requireAuth } from '../middleware/auth.js';
 import { profilePhotoUpload } from '../middleware/upload.js';
 
 const router = express.Router();
 
+// These in-memory limiters are a coarse per-instance flood guard only. The
+// lockout, resend cooldown and attempt limits themselves are enforced in
+// PostgreSQL (see loginThrottle.js and the password_reset_codes checks), so
+// they hold across server instances, browsers and direct API calls.
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -24,10 +30,28 @@ const resetLimiter = rateLimit({
   message: { success: false, message: 'Too many reset attempts. Please try again later.' },
 });
 
+const forgotLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, code: 'RESET_RATE_LIMITED', message: 'Too many verification code requests. Please try again later.' },
+});
+
+const verifyCodeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, code: 'RESET_CODE_LOCKED', message: 'Too many verification attempts. Please try again later.' },
+});
+
 router.post('/login', loginLimiter, login);
 router.post('/logout', logout);
 router.get('/me', requireAuth, me);
-router.post('/forgot-password', resetLimiter, forgotPassword);
+router.get('/session', requireAuth, sessionStatus);
+router.post('/forgot-password', forgotLimiter, forgotPassword);
+router.post('/verify-reset-code', verifyCodeLimiter, verifyResetCode);
 router.post('/reset-password', resetLimiter, resetPassword);
 router.post('/change-password', requireAuth, changePassword);
 router.patch('/profile', requireAuth, updateProfile);

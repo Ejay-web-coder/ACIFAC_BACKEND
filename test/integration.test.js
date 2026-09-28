@@ -24,18 +24,24 @@ const sentEmails = [];
 const ORIGIN = 'http://localhost:5173';
 const PNG = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000', 'hex');
 
+// A browser: keeps its cookies and, when given one, its own client address
+// (sent as X-Forwarded-For, which the app trusts from one proxy hop).
 class Client {
-  constructor() { this.cookie = ''; }
+  constructor(ip = null) { this.cookies = new Map(); this.ip = ip; }
+  get cookie() { return [...this.cookies].map(([name, value]) => `${name}=${value}`).join('; '); }
   async request(method, url, { body, form, headers = {}, raw = false } = {}) {
-    const init = { method, headers: { Origin: ORIGIN, 'X-Requested-With': 'XMLHttpRequest', ...headers } };
-    if (this.cookie) init.headers.Cookie = this.cookie;
+    const init = { method, headers: { Origin: ORIGIN, 'X-Requested-With': 'XMLHttpRequest', ...(this.ip ? { 'X-Forwarded-For': this.ip } : {}), ...headers } };
+    if (this.cookies.size) init.headers.Cookie = this.cookie;
     if (form) init.body = form;
     else if (body !== undefined) { init.body = JSON.stringify(body); init.headers['Content-Type'] = 'application/json'; }
     const response = await fetch(`${baseUrl}${url}`, init);
-    const setCookie = response.headers.get('set-cookie');
-    if (setCookie) {
-      const token = /session_token=([^;]*)/.exec(setCookie)?.[1];
-      this.cookie = token ? `session_token=${token}` : '';
+    for (const header of response.headers.getSetCookie()) {
+      const [pair, ...attributes] = header.split(';');
+      const name = pair.slice(0, pair.indexOf('=')).trim();
+      const value = pair.slice(pair.indexOf('=') + 1).trim();
+      const expires = attributes.map((part) => /^\s*expires=(.*)$/i.exec(part)?.[1]).find(Boolean);
+      if (!value || (expires && new Date(expires) <= new Date())) this.cookies.delete(name);
+      else this.cookies.set(name, value);
     }
     if (raw) return response;
     const data = await response.json().catch(() => ({}));
@@ -62,12 +68,42 @@ const admin = new Client();
 const member = new Client();
 const state = {};
 
+// Emails are sent after the response; waits for one to arrive.
+async function waitForMail(predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const found = sentEmails.findLast(predicate);
+    if (found) return found;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error('Expected email was not sent.');
+}
+
+// The code in the newest reset email to `to` that is not in `seen`.
+async function nextResetCode(to, seen = new Set()) {
+  const mail = await waitForMail((entry) => entry.to === to && entry.subject === 'ACIFAC Password Reset' && !seen.has(/\b(\d{6})\b/.exec(entry.text)?.[1]));
+  const code = /\b(\d{6})\b/.exec(mail.text)[1];
+  seen.add(code);
+  return { code, mail };
+}
+
+async function createLoginUser(username, email, password) {
+  const { hashPassword } = await import('../src/utils/password.js');
+  const result = await pool.query(
+    `INSERT INTO users (username, email, password_hash, role, account_status, must_change_password) VALUES ($1, $2, $3, 'ADMIN', 'ACTIVE', FALSE) RETURNING id`,
+    [username, email, await hashPassword(password)]
+  );
+  return result.rows[0].id;
+}
+
 before(async () => {
   if (skip) return;
   const docs = fs.mkdtempSync(path.join(os.tmpdir(), 'acifac-docs-'));
   Object.assign(process.env, {
     DATABASE_URL: TEST_DB, DATABASE_SSL: 'disable', NODE_ENV: 'test', CORS_ORIGIN: ORIGIN, FRONTEND_URL: ORIGIN,
     MEMBER_DOCUMENT_DIR: docs, OCR_AI_API_KEY: 'test-key', API_RATE_LIMIT_PER_MINUTE: '100000', EMAIL_FROM: 'test@acifac.local',
+    // Small enough for the per-address lockout test to reach.
+    LOGIN_IP_MAX_FAILURES: '6',
   });
   // Blank (not delete): src/config/env.js loads .env with dotenv, which only
   // fills variables that are unset, and .env points at the real services.
@@ -900,13 +936,16 @@ test('profile pictures: own only, admins see members, members never see admins',
 });
 
 test('sessions: forgot password, change password, deactivation, logout', { skip }, async () => {
-  const forgot = await new Client().post('/api/auth/forgot-password', { usernameOrEmail: 'juan' });
-  const token = forgot.headers.get('x-test-reset-token');
-  assert.ok(token);
-  const unknown = await new Client().post('/api/auth/forgot-password', { usernameOrEmail: 'nobody' });
+  // Members reset with the email on their account, like administrators.
+  const resetter = new Client('10.0.1.1');
+  const forgot = await resetter.post('/api/auth/forgot-password', { email: 'JUAN@example.com' });
+  assert.equal(forgot.status, 200);
+  const unknown = await new Client('10.0.1.2').post('/api/auth/forgot-password', { email: 'nobody@example.com' });
   assert.equal(unknown.data.message, forgot.data.message, 'no account enumeration');
-  assert.equal((await new Client().post('/api/auth/reset-password', { token, newPassword: 'weak', confirmPassword: 'weak' })).status, 400);
-  assert.equal((await new Client().post('/api/auth/reset-password', { token, newPassword: 'ResetPass1!', confirmPassword: 'ResetPass1!' })).status, 200);
+  const { code } = await nextResetCode('juan@example.com');
+  assert.equal((await resetter.post('/api/auth/verify-reset-code', { email: 'juan@example.com', code })).status, 200);
+  assert.equal((await resetter.post('/api/auth/reset-password', { newPassword: 'weak', confirmPassword: 'weak' })).status, 400);
+  assert.equal((await resetter.post('/api/auth/reset-password', { newPassword: 'ResetPass1!', confirmPassword: 'ResetPass1!' })).status, 200);
   assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'juan', password: 'ResetPass1!' })).status, 200);
 
   const change = await member.post('/api/auth/change-password', { currentPassword: 'ResetPass1!', newPassword: 'ChangedPass1!', confirmPassword: 'ChangedPass1!' });
@@ -929,4 +968,264 @@ test('sessions: forgot password, change password, deactivation, logout', { skip 
   assert.equal((await member.get('/api/auth/me')).status, 401);
   const leaked = await pool.query(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE details::text ILIKE '%password_hash%' OR old_values::text ILIKE '%password_hash%' OR new_values::text ILIKE '%$2b$%'`);
   assert.equal(leaked.rows[0].n, 0, 'no password hashes in audit logs');
+});
+
+// ----- Login security ------------------------------------------------------------
+
+test('login lockout: third wrong password locks the account for 20 minutes everywhere', { skip }, async () => {
+  const userId = await createLoginUser('lockme', 'lockme@acifac.local', 'LockPass1!');
+  const accountKey = `user:${userId}`;
+  const browser = new Client('10.0.2.1');
+
+  // Attempts 1 and 2: the usual error, counted on the account.
+  const first = await browser.post('/api/auth/login', { usernameOrEmail: 'lockme', password: 'Wrong-pass-1' });
+  assert.equal(first.status, 401);
+  assert.equal(first.data.code, 'INVALID_CREDENTIALS');
+  assert.equal(first.data.message, 'Invalid username or password.');
+  assert.equal(first.data.attemptsRemaining, 2);
+  // The same account under another sign-in name shares the count.
+  const second = await new Client('10.0.2.2').post('/api/auth/login', { usernameOrEmail: 'LOCKME@acifac.local', password: 'Wrong-pass-2' });
+  assert.equal(second.status, 401);
+  assert.equal(second.data.attemptsRemaining, 1);
+  assert.equal((await pool.query('SELECT failed_attempts FROM login_throttles WHERE throttle_key = $1', [accountKey])).rows[0].failed_attempts, 2);
+
+  // Attempt 3: locked for 20 minutes.
+  const third = await browser.post('/api/auth/login', { usernameOrEmail: 'lockme', password: 'Wrong-pass-3' });
+  assert.equal(third.status, 429);
+  assert.equal(third.data.code, 'LOGIN_LOCKED');
+  assert.equal(third.data.message, 'Too many failed login attempts. Please try again in 20 minutes.');
+  assert.ok(third.data.retryAfterSeconds > 1190 && third.data.retryAfterSeconds <= 1200, String(third.data.retryAfterSeconds));
+  assert.equal(third.headers.get('retry-after'), String(third.data.retryAfterSeconds));
+  const stored = await pool.query(`SELECT locked_until > NOW() + INTERVAL '19 minutes' AS locked FROM login_throttles WHERE throttle_key = $1`, [accountKey]);
+  assert.equal(stored.rows[0].locked, true);
+
+  // During the lock the correct password is refused: same browser, a fresh
+  // browser (refresh / other tab / other browser) and a bare API call alike.
+  for (const client of [browser, new Client('10.0.2.3'), new Client('10.0.2.4')]) {
+    const blocked = await client.post('/api/auth/login', { usernameOrEmail: 'lockme', password: 'LockPass1!' });
+    assert.equal(blocked.status, 429);
+    assert.equal(blocked.data.code, 'LOGIN_LOCKED');
+    assert.ok(blocked.data.retryAfterSeconds <= third.data.retryAfterSeconds);
+    assert.equal(client.cookies.has('session_token'), false, 'no session while locked');
+  }
+  const bare = await fetch(`${baseUrl}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'X-Forwarded-For': '10.0.2.5' }, body: JSON.stringify({ usernameOrEmail: 'lockme', password: 'LockPass1!' }) });
+  assert.equal(bare.status, 429);
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM sessions WHERE user_id = $1', [userId])).rows[0].n, 0);
+
+  // The lock ends after 20 minutes (simulated): sign-in works and the count resets.
+  await pool.query(`UPDATE login_throttles SET locked_until = NOW() - INTERVAL '1 second' WHERE throttle_key = $1`, [accountKey]);
+  const after = await browser.post('/api/auth/login', { usernameOrEmail: 'lockme', password: 'LockPass1!' });
+  assert.equal(after.status, 200, JSON.stringify(after.data));
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM login_throttles WHERE throttle_key = $1', [accountKey])).rows[0].n, 0, 'success clears the count');
+  const fresh = await new Client('10.0.2.6').post('/api/auth/login', { usernameOrEmail: 'lockme', password: 'Wrong-pass-4' });
+  assert.equal(fresh.data.attemptsRemaining, 2, 'full allowance after a successful sign-in');
+
+  const audit = await pool.query(`SELECT action FROM audit_logs WHERE user_id = $1 OR entity_id = $2`, [userId, String(userId)]);
+  const actions = audit.rows.map((row) => row.action);
+  for (const action of ['LOGIN_FAILURE', 'LOGIN_LOCKED', 'LOGIN_BLOCKED', 'LOGIN']) assert.ok(actions.includes(action), action);
+  const leaked = await pool.query(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE details::text LIKE '%LockPass1!%' OR details::text LIKE '%Wrong-pass%'`);
+  assert.equal(leaked.rows[0].n, 0, 'passwords are never logged');
+});
+
+test('login lockout: unknown names lock the same way, and each address has a limit', { skip }, async () => {
+  const guesser = new Client('10.0.3.1');
+  const replies = [];
+  for (let attempt = 0; attempt < 3; attempt += 1) replies.push(await guesser.post('/api/auth/login', { usernameOrEmail: 'no-such-user', password: 'Wrong-pass-1' }));
+  assert.deepEqual(replies.map((reply) => reply.status), [401, 401, 429], 'identical to a real account');
+  assert.deepEqual(replies.slice(0, 2).map((reply) => reply.data.attemptsRemaining), [2, 1]);
+  assert.equal(replies[2].data.code, 'LOGIN_LOCKED');
+
+  // Password spraying: many names from one address (LOGIN_IP_MAX_FAILURES=6 here).
+  const sprayer = new Client('10.0.3.2');
+  const statuses = [];
+  for (let attempt = 0; attempt < 6; attempt += 1) statuses.push((await sprayer.post('/api/auth/login', { usernameOrEmail: `spray-${attempt}`, password: 'Wrong-pass-1' })).status);
+  assert.deepEqual(statuses, [401, 401, 401, 401, 401, 429]);
+  const lockedAddress = await sprayer.post('/api/auth/login', { usernameOrEmail: 'testadmin', password: 'AdminPass1!' });
+  assert.equal(lockedAddress.status, 429, 'even a correct password from the locked address');
+  assert.equal((await new Client('10.0.3.3').post('/api/auth/login', { usernameOrEmail: 'testadmin', password: 'AdminPass1!' })).status, 200, 'other addresses are unaffected');
+});
+
+test('password reset: emailed 6-digit code, limits, single use, sessions ended', { skip }, async () => {
+  const userId = await createLoginUser('resetme', 'resetme@acifac.local', 'OldPass1!');
+  const email = 'resetme@acifac.local';
+  const seen = new Set();
+  const browser = new Client('10.0.4.1');
+  const signedIn = new Client('10.0.4.9');
+  assert.equal((await signedIn.post('/api/auth/login', { usernameOrEmail: 'resetme', password: 'OldPass1!' })).status, 200);
+  const allowRequest = () => pool.query(`UPDATE password_reset_codes SET created_at = created_at - INTERVAL '61 seconds'`);
+
+  assert.equal((await browser.post('/api/auth/forgot-password', { email: 'not-an-email' })).status, 400);
+
+  // Registered and unknown addresses get exactly the same reply.
+  const known = await browser.post('/api/auth/forgot-password', { email: 'ResetMe@acifac.local' });
+  const unknown = await new Client('10.0.4.2').post('/api/auth/forgot-password', { email: 'ghost@acifac.local' });
+  assert.equal(known.status, 200);
+  assert.deepEqual(unknown.data, known.data);
+  assert.equal(known.data.message, 'If an account with that email exists, a verification code has been sent.');
+  assert.equal(known.data.resendAvailableInSeconds, 60);
+  const { code: firstCode, mail } = await nextResetCode(email, seen);
+  assert.match(firstCode, /^\d{6}$/);
+  assert.match(mail.text, /Your verification code is:/);
+  assert.match(mail.text, /This code expires in 10 minutes\./);
+  assert.ok(!/https?:\/\//.test(mail.text) && !mail.html.includes('href'), 'no link, code only');
+  assert.ok(!sentEmails.some((entry) => entry.to === 'ghost@acifac.local'), 'nothing is sent to unknown addresses');
+  const rows = await pool.query('SELECT code_hash FROM password_reset_codes WHERE user_id = $1', [userId]);
+  assert.ok(rows.rows[0].code_hash.startsWith('$2') && !rows.rows[0].code_hash.includes(firstCode), 'only a bcrypt hash is stored');
+
+  // Resend cooldown, the same for unknown addresses.
+  const tooSoon = await browser.post('/api/auth/forgot-password', { email });
+  assert.equal(tooSoon.status, 429);
+  assert.equal(tooSoon.data.code, 'RESET_CODE_COOLDOWN');
+  assert.ok(tooSoon.data.retryAfterSeconds > 0 && tooSoon.data.retryAfterSeconds <= 60);
+  assert.equal((await new Client('10.0.4.2').post('/api/auth/forgot-password', { email: 'ghost@acifac.local' })).data.code, 'RESET_CODE_COOLDOWN');
+
+  // Wrong, malformed and unknown-address codes.
+  const wrongCode = firstCode === '000000' ? '000001' : '000000';
+  const wrong = await browser.post('/api/auth/verify-reset-code', { email, code: wrongCode });
+  assert.equal(wrong.status, 400);
+  assert.equal(wrong.data.message, 'Invalid verification code.');
+  assert.equal((await browser.post('/api/auth/verify-reset-code', { email, code: '12ab56' })).data.code, 'RESET_CODE_INVALID');
+  assert.equal((await browser.post('/api/auth/verify-reset-code', { email: 'ghost@acifac.local', code: firstCode })).data.code, 'RESET_CODE_INVALID');
+
+  // Expired code.
+  await pool.query(`UPDATE password_reset_codes SET expires_at = NOW() - INTERVAL '1 second' WHERE user_id = $1`, [userId]);
+  const expired = await browser.post('/api/auth/verify-reset-code', { email, code: firstCode });
+  assert.equal(expired.status, 400);
+  assert.equal(expired.data.code, 'RESET_CODE_EXPIRED');
+  assert.equal(expired.data.message, 'This verification code has expired. Please request a new code.');
+
+  // A new code replaces the old one; five wrong guesses cancel it.
+  await allowRequest();
+  assert.equal((await browser.post('/api/auth/forgot-password', { email })).status, 200);
+  const { code: secondCode } = await nextResetCode(email, seen);
+  assert.equal((await browser.post('/api/auth/verify-reset-code', { email, code: firstCode === secondCode ? wrongCode : firstCode })).data.code, 'RESET_CODE_INVALID', 'old code no longer works');
+  const guesses = [];
+  const badGuess = secondCode === '999999' ? '999998' : '999999';
+  for (let attempt = 0; attempt < 4; attempt += 1) guesses.push(await browser.post('/api/auth/verify-reset-code', { email, code: badGuess }));
+  assert.deepEqual(guesses.map((guess) => guess.status), [400, 400, 400, 429]);
+  assert.equal(guesses.at(-1).data.code, 'RESET_CODE_LOCKED');
+  assert.equal((await browser.post('/api/auth/verify-reset-code', { email, code: secondCode })).data.code, 'RESET_CODE_LOCKED', 'the right code is refused after too many attempts');
+
+  // Correct code: an httpOnly grant cookie for the auth routes, nothing in the body.
+  await allowRequest();
+  assert.equal((await browser.post('/api/auth/forgot-password', { email })).status, 200);
+  const { code } = await nextResetCode(email, seen);
+  const verified = await browser.post('/api/auth/verify-reset-code', { email, code });
+  assert.equal(verified.status, 200, JSON.stringify(verified.data));
+  const grantCookie = verified.headers.getSetCookie().find((header) => header.startsWith('password_reset_grant='));
+  assert.match(grantCookie, /HttpOnly/i);
+  assert.match(grantCookie, /Path=\/api\/auth/);
+  const grant = browser.cookies.get('password_reset_grant');
+  assert.ok(grant && !JSON.stringify(verified.data).includes(grant));
+  assert.equal((await browser.post('/api/auth/verify-reset-code', { email, code })).data.code, 'RESET_CODE_USED');
+
+  // New password rules.
+  const mismatch = await browser.post('/api/auth/reset-password', { newPassword: 'NewPass1!', confirmPassword: 'NewPass2!' });
+  assert.equal(mismatch.status, 400);
+  assert.equal(mismatch.data.message, 'Passwords do not match.');
+  assert.match((await browser.post('/api/auth/reset-password', { newPassword: 'short', confirmPassword: 'short' })).data.message, /at least 8 characters/);
+  assert.match((await browser.post('/api/auth/reset-password', { newPassword: 'OldPass1!', confirmPassword: 'OldPass1!' })).data.message, /different from your current password/);
+  const noGrant = await new Client('10.0.4.3').post('/api/auth/reset-password', { newPassword: 'NewPass1!', confirmPassword: 'NewPass1!' });
+  assert.equal(noGrant.data.code, 'RESET_SESSION_EXPIRED');
+
+  // Lock the account first: a completed reset also lifts the lockout.
+  for (let attempt = 0; attempt < 3; attempt += 1) await new Client('10.0.4.4').post('/api/auth/login', { usernameOrEmail: 'resetme', password: 'Wrong-pass-1' });
+  const reset = await browser.post('/api/auth/reset-password', { newPassword: 'NewPass1!', confirmPassword: 'NewPass1!' });
+  assert.equal(reset.status, 200, JSON.stringify(reset.data));
+  assert.equal(reset.data.message, 'Password reset successful.');
+  assert.equal(browser.cookies.has('password_reset_grant'), false, 'grant cookie cleared');
+
+  // Single use: neither the code nor the grant works again.
+  assert.equal((await browser.post('/api/auth/verify-reset-code', { email, code })).data.code, 'RESET_CODE_USED');
+  const replay = await fetch(`${baseUrl}/api/auth/reset-password`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', Cookie: `password_reset_grant=${grant}` }, body: JSON.stringify({ newPassword: 'Other1pass!', confirmPassword: 'Other1pass!' }) });
+  assert.equal((await replay.json()).code, 'RESET_SESSION_EXPIRED');
+
+  // Old sessions are ended; the new password works, the old one does not.
+  assert.equal((await signedIn.get('/api/auth/me')).status, 401);
+  assert.equal((await new Client('10.0.4.5').post('/api/auth/login', { usernameOrEmail: 'resetme', password: 'OldPass1!' })).status, 401);
+  assert.equal((await new Client('10.0.4.6').post('/api/auth/login', { usernameOrEmail: 'resetme', password: 'NewPass1!' })).status, 200);
+
+  const audit = await pool.query('SELECT action, description, details, old_values, new_values FROM audit_logs WHERE user_id = $1 ORDER BY id', [userId]);
+  const actions = audit.rows.map((row) => row.action);
+  for (const action of ['PASSWORD_RESET_REQUESTED', 'PASSWORD_RESET_CODE_SENT', 'PASSWORD_RESET_CODE_FAILED', 'PASSWORD_RESET_CODE_VERIFIED', 'PASSWORD_RESET_COMPLETED']) assert.ok(actions.includes(action), action);
+  const logged = JSON.stringify(audit.rows);
+  for (const secret of [...seen, grant, 'NewPass1!']) assert.ok(!logged.includes(secret), 'codes, grants and passwords are never logged');
+});
+
+test('password reset: hourly limit per address', { skip }, async () => {
+  const client = new Client('10.0.5.1');
+  const statuses = [];
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await pool.query(`UPDATE password_reset_codes SET created_at = created_at - INTERVAL '61 seconds' WHERE ip_address = '10.0.5.1'`);
+    statuses.push((await client.post('/api/auth/forgot-password', { email: 'flood@acifac.local' })).status);
+  }
+  assert.deepEqual(statuses, [200, 200, 200, 200, 200, 429]);
+});
+
+test('sessions: 20 minutes without activity ends the session on the server', { skip }, async () => {
+  await createLoginUser('idleuser', 'idle@acifac.local', 'IdlePass1!');
+  const browser = new Client('10.0.6.1');
+  assert.equal((await browser.post('/api/auth/login', { usernameOrEmail: 'idleuser', password: 'IdlePass1!' })).status, 200);
+  const token = browser.cookies.get('session_token');
+  const { createHash } = await import('node:crypto');
+  const digest = createHash('sha256').update(token).digest('hex');
+  const setIdle = (minutes) => pool.query(`UPDATE sessions SET last_activity_at = NOW() - make_interval(mins => $2) WHERE token_digest = $1`, [digest, minutes]);
+  const idleSeconds = async () => (await pool.query(`SELECT EXTRACT(EPOCH FROM NOW() - last_activity_at)::int AS s FROM sessions WHERE token_digest = $1`, [digest])).rows[0].s;
+
+  const status = await browser.get('/api/auth/session');
+  assert.equal(status.status, 200);
+  assert.equal(status.data.idleTimeoutSeconds, 1200);
+  assert.ok(status.data.idleExpiresInSeconds > 1190);
+
+  // Background checks (passive) and the live-update stream do not count as activity.
+  await setIdle(10);
+  const passive = await browser.get('/api/auth/session', { headers: { 'X-Session-Activity': 'passive' } });
+  assert.ok(passive.data.idleExpiresInSeconds <= 600 && passive.data.idleExpiresInSeconds > 590, String(passive.data.idleExpiresInSeconds));
+  const stream = new AbortController();
+  const events = await fetch(`${baseUrl}/api/events`, { headers: { Cookie: browser.cookie }, signal: stream.signal });
+  assert.ok([200, 204].includes(events.status), String(events.status));
+  stream.abort();
+  assert.ok(await idleSeconds() >= 599, 'still idle');
+
+  // Real requests do count, even at 19 minutes.
+  await setIdle(19);
+  assert.equal((await browser.get('/api/auth/me')).status, 200);
+  assert.ok(await idleSeconds() < 5, 'activity recorded');
+
+  // 20 minutes idle: refused, cookie cleared, session revoked and recorded.
+  await setIdle(21);
+  const expired = await browser.get('/api/notifications');
+  assert.equal(expired.status, 401);
+  assert.equal(expired.data.code, 'SESSION_IDLE_TIMEOUT');
+  assert.equal(expired.data.message, 'Your session expired because of inactivity. Please log in again.');
+  assert.equal(browser.cookies.has('session_token'), false, 'cookie cleared');
+  assert.ok((await pool.query('SELECT revoked_at FROM sessions WHERE token_digest = $1', [digest])).rows[0].revoked_at);
+  const expiries = `SELECT COUNT(*)::int AS n FROM audit_logs WHERE action = 'SESSION_EXPIRED' AND user_name_snapshot = 'idleuser'`;
+  assert.equal((await pool.query(expiries)).rows[0].n, 1);
+
+  // A refresh (or a copy of the old cookie) cannot bring it back.
+  const stale = new Client('10.0.6.1');
+  for (const url of ['/api/auth/me', '/api/auth/session', '/api/notifications']) {
+    stale.cookies.set('session_token', token);
+    assert.equal((await stale.get(url)).status, 401, url);
+  }
+  assert.equal((await pool.query(expiries)).rows[0].n, 1, 'recorded once');
+});
+
+test('password reset: members without a login email use the email on their member record', { skip }, async () => {
+  const { hashPassword } = await import('../src/utils/password.js');
+  const member = await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status, farm_area_ha, date_of_birth)
+     VALUES ('ACIFAC-2026-900', 'Rosa', 'Reyes', 'rosa@example.com', '09170000900', 'Purok 9', '2026-01-15', 0, 'active', 1, '1990-01-01') RETURNING id`
+  );
+  await pool.query(
+    `INSERT INTO users (member_id, username, email, password_hash, role, account_status) VALUES ($1, 'rosa', NULL, $2, 'MEMBER', 'ACTIVE')`,
+    [member.rows[0].id, await hashPassword('RosaPass1!')]
+  );
+  const browser = new Client('10.0.7.1');
+  assert.equal((await browser.post('/api/auth/forgot-password', { email: 'rosa@example.com' })).status, 200);
+  const { code } = await nextResetCode('rosa@example.com');
+  assert.equal((await browser.post('/api/auth/verify-reset-code', { email: 'rosa@example.com', code })).status, 200);
+  assert.equal((await browser.post('/api/auth/reset-password', { newPassword: 'RosaNew1!', confirmPassword: 'RosaNew1!' })).status, 200);
+  assert.equal((await new Client('10.0.7.2').post('/api/auth/login', { usernameOrEmail: 'ACIFAC-2026-900', password: 'RosaNew1!' })).status, 200, 'member number sign-in with the new password');
 });

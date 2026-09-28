@@ -1,5 +1,6 @@
 import { createDedicatedClient } from '../config/db.js';
-import { loadSessionUser } from '../middleware/auth.js';
+import { endIdleSession, loadSession } from '../middleware/auth.js';
+import { getRequestMeta } from '../utils/http.js';
 
 // Live updates: PostgreSQL triggers call pg_notify('acifac_events', {table, op,
 // memberId?, userId?}) after a change commits. One LISTEN connection per backend
@@ -110,13 +111,15 @@ export function eventStream(req, res) {
   const connection = { res, user: req.user };
   connections.add(connection);
 
-  // The heartbeat also re-checks the session so a revoked or deactivated
-  // account stops receiving updates within one interval.
+  // The heartbeat also re-checks the session so a revoked, deactivated or
+  // idle (timed-out) session stops receiving updates within one interval.
+  // It never counts as activity itself.
   const heartbeat = setInterval(async () => {
     try {
-      const session = await loadSessionUser(req.cookies?.session_token);
-      if (!session || session.account_status !== 'ACTIVE') {
-        res.write('event: session-ended\ndata: {}\n\n');
+      const session = await loadSession(req.cookies?.session_token);
+      if (!session || session.idle_expired || session.account_status !== 'ACTIVE') {
+        if (session?.idle_expired) await endIdleSession(session, getRequestMeta(req));
+        res.write(`event: session-ended\ndata: ${JSON.stringify({ reason: session?.idle_expired ? 'inactivity' : 'ended' })}\n\n`);
         res.end();
         return;
       }

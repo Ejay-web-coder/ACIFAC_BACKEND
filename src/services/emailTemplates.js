@@ -28,6 +28,15 @@ export function passwordResetEmail({ username, token, expiresIn = '15 minutes' }
   );
 }
 
+// The code is only ever in this email: never in a link, log or response.
+export function passwordResetCodeEmail({ code, expiresInMinutes = 10 }) {
+  return message(
+    'ACIFAC Password Reset',
+    `ACIFAC Password Reset\n\nYour verification code is:\n\n${code}\n\nThis code expires in ${expiresInMinutes} minutes.\n\nIf you did not request a password reset, you can ignore this email.`,
+    `<h2 style="margin:0 0 12px">ACIFAC Password Reset</h2><p>Your verification code is:</p><p style="margin:8px 0;font-size:28px;font-weight:bold;letter-spacing:6px">${escapeHtml(code)}</p><p>This code expires in ${escapeHtml(expiresInMinutes)} minutes.</p><p>If you did not request a password reset, you can ignore this email.</p>`
+  );
+}
+
 export function accountCreatedEmail({ memberName, username, token }) {
   const link = buildLink('/reset-password', token);
   return message(

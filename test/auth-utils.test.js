@@ -2,8 +2,35 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import bcrypt from 'bcryptjs';
 import { hashPassword, verifyPassword, validatePasswordPolicy } from '../src/utils/password.js';
-import { matchSessionToken } from '../src/utils/auth.js';
+import { buildResetGrantCookieOptions, generateVerificationCode, matchSessionToken } from '../src/utils/auth.js';
 import { buildAuditLogPayload, summarizeAuditChanges } from '../src/utils/audit.js';
+import { passwordResetCodeEmail } from '../src/services/emailTemplates.js';
+
+test('generateVerificationCode returns exactly six random digits', () => {
+  const codes = new Set();
+  for (let index = 0; index < 2000; index += 1) {
+    const code = generateVerificationCode();
+    assert.match(code, /^\d{6}$/);
+    codes.add(code);
+  }
+  assert.ok(codes.size > 1990, 'codes do not repeat in practice');
+  assert.ok([...codes].some((code) => code.startsWith('0')), 'leading zeros are kept');
+});
+
+test('password reset code email carries the code and expiry, and no link', () => {
+  const email = passwordResetCodeEmail({ code: '482913', expiresInMinutes: 10 });
+  assert.equal(email.subject, 'ACIFAC Password Reset');
+  assert.match(email.text, /Your verification code is:\n\n482913\n\nThis code expires in 10 minutes\./);
+  assert.match(email.text, /If you did not request a password reset, you can ignore this email\./);
+  assert.ok(email.html.includes('482913') && !email.html.includes('href'));
+});
+
+test('reset grant cookie is httpOnly, short-lived and limited to the auth routes', () => {
+  const options = buildResetGrantCookieOptions();
+  assert.equal(options.httpOnly, true);
+  assert.equal(options.path, '/api/auth');
+  assert.equal(options.maxAge, 10 * 60 * 1000);
+});
 
 test('validatePasswordPolicy rejects weak passwords', () => {
   assert.equal(validatePasswordPolicy('weak').isValid, false);
