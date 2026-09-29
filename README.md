@@ -71,5 +71,7 @@ and the hourly overdue job run.
 | Overdue | a loan is overdue when any installment is unpaid after its due date (no grace period) |
 | Share capital | `share_contributions`, capped at ₱20,000 per member |
 | Savings | separate `savings_transactions` ledger (deposits), not capped, not share capital |
-| Rentals | days = end date − start date (minimum 1); fee = daily fee × days; no overlapping bookings |
-| Kadiwa | selling inventory items decrements stock inside a locked transaction; overselling is rejected |
+| Member name | `members.full_name` is generated: first, middle, last name and suffix, single-spaced |
+| Rentals | days = end date − start date (minimum 1); fee = daily fee × days; no overlapping bookings. An approved `rental_requests` row becomes a `machinery_operations` booking |
+| Machinery services | `machinery_services` records each job done (per ha, per 100 bags or per day) and its payments, for the PhilMech report. Bookings stay in `machinery_operations`; a service may link to its rental request |
+| Kadiwa | selling inventory items decrements stock inside a locked transaction; overselling is rejected; cash only (`kadiwa_sales.payment_method`) |
