@@ -21,6 +21,8 @@ let stubAnalysis = DEFAULT_STUB_ANALYSIS;
 const geminiCalls = [];
 let pool;
 const sentEmails = [];
+const sentTexts = [];
+let smsMode = 'ok';
 const ORIGIN = 'http://localhost:5173';
 const PNG = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000', 'hex');
 
@@ -79,6 +81,16 @@ async function waitForMail(predicate, timeoutMs = 5000) {
   throw new Error('Expected email was not sent.');
 }
 
+async function waitForText(predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const found = sentTexts.findLast(predicate);
+    if (found) return found;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error('Expected text message was not sent.');
+}
+
 // The code in the newest reset email to `to` that is not in `seen`.
 async function nextResetCode(to, seen = new Set()) {
   const mail = await waitForMail((entry) => entry.to === to && entry.subject === 'ACIFAC Password Reset' && !seen.has(/\b(\d{6})\b/.exec(entry.text)?.[1]));
@@ -110,8 +122,17 @@ before(async () => {
   Object.assign(process.env, { GEMINI_API_KEY: '', SUPABASE_URL: '', SUPABASE_SERVICE_ROLE_KEY: '', SUPABASE_DB_URL: TEST_DB, SUPABASE_DB_LISTEN_URL: TEST_DB });
 
   stubServer = http.createServer((req, res) => {
-    req.resume();
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
     req.on('end', () => {
+      const textbee = /^\/textbee\/gateway\/devices\/([^/]+)\/send-sms$/.exec(req.url);
+      if (textbee) {
+        if (smsMode === 'fail') { res.writeHead(503, { 'Content-Type': 'application/json' }); res.end('{"error":"device offline"}'); return; }
+        sentTexts.push({ device: textbee[1], apiKey: req.headers['x-api-key'], ...JSON.parse(Buffer.concat(chunks).toString()) });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ data: { success: true, smsBatchId: `batch-${sentTexts.length}` } }));
+        return;
+      }
       const gemini = /\/gemini\/models\/([^:]+):generateContent/.exec(req.url);
       if (gemini) {
         geminiCalls.push(gemini[1]);
@@ -126,6 +147,11 @@ before(async () => {
     });
   }).listen(0);
   process.env.OCR_AI_URL = `http://127.0.0.1:${stubServer.address().port}/v1/chat/completions`;
+  // Texts go to the stub, at any hour and without the pause between them.
+  Object.assign(process.env, {
+    TEXTBEE_API_URL: `http://127.0.0.1:${stubServer.address().port}/textbee`, TEXTBEE_API_KEY: 'test-textbee-key', TEXTBEE_DEVICE_ID: 'test-device',
+    SMS_SEND_HOURS: '0-24', SMS_SEND_GAP_MS: '0',
+  });
 
   const { createApp } = await import('../src/app.js');
   const { getPool } = await import('../src/config/db.js');
@@ -344,6 +370,17 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   assert.equal(overdueNotes.rows[0].n, overdue.data.loan.overdueInstallments, 'one notification per overdue installment, no duplicates');
   const overdueMail = sentEmails.filter((mail) => /Loan payment overdue/.test(mail.subject));
   assert.equal(overdueMail.length, overdue.data.loan.overdueInstallments, 'one overdue email per installment, none repeated by the second refresh');
+  // The same reminders are texted, once each, to the mobile number on the member record.
+  const { flushSmsOutbox } = await import('../src/services/smsService.js');
+  await flushSmsOutbox();
+  const overdueTexts = sentTexts.filter((text) => /is now overdue\. Please pay at the ACIFAC office\.\n- ACIFAC Administrator$/.test(text.message));
+  assert.equal(overdueTexts.length, overdue.data.loan.overdueInstallments, 'one overdue text per installment');
+  for (const text of overdueTexts) {
+    assert.deepEqual([text.recipients, text.device, text.apiKey], [['+639178888888'], 'test-device', 'test-textbee-key']);
+    assert.ok(text.message.startsWith('Installment ') && text.message.length <= 160, text.message);
+  }
+  const outbox = await pool.query(`SELECT status, COUNT(*)::int AS n FROM sms_outbox GROUP BY status`);
+  assert.deepEqual(outbox.rows, [{ status: 'sent', n: sentTexts.length }]);
 
   const rest = await admin.post(`/api/admin/loans/${state.loanId}/payments`, { amount: overdue.data.loan.balance, paymentDate: overdue.data.loan.dateApproved });
   assert.equal(rest.status, 201, JSON.stringify(rest.data));
@@ -362,6 +399,32 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   assert.equal(decline.status, 200);
   const memberNotes = await member.get('/api/notifications');
   assert.ok(memberNotes.data.data.some((n) => n.type === 'loan_declined' && /Incomplete documents/.test(n.message)));
+});
+
+test('sms: a text the phone gateway refuses is retried later; members can switch SMS off', { skip }, async () => {
+  const { flushSmsOutbox, queueSmsForUsers } = await import('../src/services/smsService.js');
+  const textsBefore = sentTexts.length;
+  const row = async () => (await pool.query(`SELECT status, attempts, last_error, retry_at > NOW() AS waiting FROM sms_outbox WHERE message = 'ACIFAC: retry test'`)).rows[0];
+
+  smsMode = 'fail';
+  assert.equal(await queueSmsForUsers([{ user_id: state.memberUserId }], () => 'ACIFAC: retry test'), 1);
+  assert.equal(await flushSmsOutbox(), 0);
+  const failed = await row();
+  assert.deepEqual([failed.status, failed.attempts, failed.waiting], ['pending', 1, true]);
+  assert.match(failed.last_error, /503/);
+
+  smsMode = 'ok';
+  assert.equal(await flushSmsOutbox(), 0, 'not retried before retry_at');
+  await pool.query(`UPDATE sms_outbox SET retry_at = NOW() WHERE message = 'ACIFAC: retry test'`);
+  assert.equal(await flushSmsOutbox(), 1);
+  assert.deepEqual([(await row()).status, (await row()).attempts], ['sent', 2]);
+  assert.equal(sentTexts.length, textsBefore + 1);
+
+  const off = await member.patch('/api/auth/notification-preferences', { emailNotifications: true, smsNotifications: false, loanReminders: true });
+  assert.equal(off.data.preferences.smsNotifications, false);
+  assert.equal(await queueSmsForUsers([{ user_id: state.memberUserId }], () => 'ACIFAC: switched off'), 0);
+  const on = await member.patch('/api/auth/notification-preferences', { emailNotifications: true, loanReminders: true });
+  assert.equal(on.data.preferences.smsNotifications, true, 'SMS is on unless switched off');
 });
 
 test('machinery: catalogue, request, approve, overlap protection, member status', { skip }, async () => {
@@ -1223,9 +1286,91 @@ test('password reset: members without a login email use the email on their membe
     [member.rows[0].id, await hashPassword('RosaPass1!')]
   );
   const browser = new Client('10.0.7.1');
+  const textsBefore = sentTexts.length;
   assert.equal((await browser.post('/api/auth/forgot-password', { email: 'rosa@example.com' })).status, 200);
   const { code } = await nextResetCode('rosa@example.com');
   assert.equal((await browser.post('/api/auth/verify-reset-code', { email: 'rosa@example.com', code })).status, 200);
   assert.equal((await browser.post('/api/auth/reset-password', { newPassword: 'RosaNew1!', confirmPassword: 'RosaNew1!' })).status, 200);
   assert.equal((await new Client('10.0.7.2').post('/api/auth/login', { usernameOrEmail: 'ACIFAC-2026-900', password: 'RosaNew1!' })).status, 200, 'member number sign-in with the new password');
+  assert.equal(sentTexts.length, textsBefore, 'a code asked for by email is only emailed');
+});
+
+test('password reset: by mobile number, texted to the number on the member record', { skip }, async () => {
+  const phoneBrowser = new Client('10.0.8.1');
+  assert.equal((await phoneBrowser.post('/api/auth/forgot-password', { phone: '0917-000' })).status, 400);
+
+  // Any format of the number works, and an unknown number gets the same reply.
+  const known = await phoneBrowser.post('/api/auth/forgot-password', { phone: '+63 917 000 0900' });
+  const unknown = await new Client('10.0.8.2').post('/api/auth/forgot-password', { phone: '09170000999' });
+  assert.equal(known.status, 200, JSON.stringify(known.data));
+  assert.deepEqual(unknown.data, known.data);
+  assert.equal(known.data.message, 'If an account with that mobile number exists, a verification code has been sent.');
+  const text = await waitForText((entry) => entry.recipients[0] === '+639170000900');
+  const code = /code: (\d{6})\./.exec(text.message)[1];
+  assert.equal(text.message, `ACIFAC password reset code: ${code}. It expires in 10 minutes. Do not share it. If you did not ask for it, ignore this text.\n- ACIFAC Administrator`);
+  assert.ok(!sentTexts.some((entry) => entry.recipients[0] === '+639170000999'), 'nothing is texted to unknown numbers');
+  assert.ok(!sentEmails.some((mail) => mail.to === 'rosa@example.com' && mail.text.includes(code)), 'a code asked for by number is only texted');
+
+  assert.equal((await phoneBrowser.post('/api/auth/verify-reset-code', { email: 'rosa@example.com', code })).status, 400, 'the code belongs to the number, not the email');
+  assert.equal((await phoneBrowser.post('/api/auth/verify-reset-code', { phone: '09170000900', code })).status, 200);
+  assert.equal((await phoneBrowser.post('/api/auth/reset-password', { newPassword: 'RosaText1!', confirmPassword: 'RosaText1!' })).status, 200);
+  assert.equal((await new Client('10.0.8.3').post('/api/auth/login', { usernameOrEmail: 'rosa', password: 'RosaText1!' })).status, 200);
+
+  // A number shared by two accounts resets neither: the code could not say which.
+  const { hashPassword } = await import('../src/utils/password.js');
+  const sibling = await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status, farm_area_ha, date_of_birth)
+     VALUES ('ACIFAC-2026-901', 'Ramon', 'Reyes', 'ramon@example.com', '0917 000 0900', 'Purok 9', '2026-01-15', 0, 'active', 1, '1988-01-01') RETURNING id`
+  );
+  await pool.query(`INSERT INTO users (member_id, username, email, password_hash, role, account_status) VALUES ($1, 'ramon', NULL, $2, 'MEMBER', 'ACTIVE')`, [sibling.rows[0].id, await hashPassword('RamonPass1!')]);
+  await pool.query(`UPDATE password_reset_codes SET created_at = created_at - INTERVAL '61 seconds'`);
+  const shared = await new Client('10.0.8.4').post('/api/auth/forgot-password', { phone: '09170000900' });
+  const textsAfter = sentTexts.length;
+  assert.deepEqual(shared.data, known.data);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(sentTexts.length, textsAfter, 'nothing is texted to a shared number');
+});
+
+test('change password in settings: a code by text or email instead of the current password', { skip }, async () => {
+  const { hashPassword } = await import('../src/utils/password.js');
+  const created = await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status, farm_area_ha, date_of_birth)
+     VALUES ('ACIFAC-2026-902', 'Lito', 'Cruz', 'lito@example.com', '0918-555-0902', 'Purok 2', '2026-01-15', 0, 'active', 1, '1985-01-01') RETURNING id`
+  );
+  await pool.query(`INSERT INTO users (member_id, username, email, password_hash, role, account_status) VALUES ($1, 'lito', NULL, $2, 'MEMBER', 'ACTIVE')`, [created.rows[0].id, await hashPassword('LitoPass1!')]);
+  const lito = new Client('10.0.9.1');
+  assert.equal((await lito.post('/api/auth/login', { usernameOrEmail: 'lito', password: 'LitoPass1!' })).status, 200);
+  const me = (await lito.get('/api/auth/me')).data.user;
+  assert.deepEqual([me.phone, me.sms_available, me.notification_email], ['0918-555-0902', true, 'lito@example.com']);
+
+  // By text: the code goes to the number on the account, never one sent in the request.
+  const texted = await lito.post('/api/auth/change-password/code', { channel: 'sms', phone: '09170000999' });
+  assert.equal(texted.status, 200, JSON.stringify(texted.data));
+  assert.equal(texted.data.sentTo, '0918 ••• 0902');
+  const text = await waitForText((entry) => entry.recipients[0] === '+639185550902');
+  const code = /code: (\d{6})\./.exec(text.message)[1];
+  assert.equal((await lito.post('/api/auth/change-password/code', { channel: 'sms' })).data.code, 'RESET_CODE_COOLDOWN');
+
+  assert.equal((await lito.post('/api/auth/change-password', { newPassword: 'LitoNew1!', confirmPassword: 'LitoNew1!' })).status, 400, 'a code or the current password is required');
+  const wrong = await lito.post('/api/auth/change-password', { code: code === '000000' ? '111111' : '000000', newPassword: 'LitoNew1!', confirmPassword: 'LitoNew1!' });
+  assert.deepEqual([wrong.status, wrong.data.code], [400, 'RESET_CODE_INVALID']);
+  const same = await lito.post('/api/auth/change-password', { code, newPassword: 'LitoPass1!', confirmPassword: 'LitoPass1!' });
+  assert.equal(same.status, 400, 'the new password must differ');
+  const changed = await lito.post('/api/auth/change-password', { code, newPassword: 'LitoNew1!', confirmPassword: 'LitoNew1!' });
+  assert.equal(changed.status, 200, JSON.stringify(changed.data));
+  assert.equal((await lito.get('/api/auth/me')).status, 401, 'every session ends');
+  assert.equal((await lito.post('/api/auth/login', { usernameOrEmail: 'lito', password: 'LitoNew1!' })).status, 200);
+
+  // By email, to the member record's address. A used code does not work twice.
+  await pool.query(`UPDATE password_reset_codes SET created_at = created_at - INTERVAL '61 seconds'`);
+  const emailed = await lito.post('/api/auth/change-password/code', { channel: 'email' });
+  assert.deepEqual([emailed.status, emailed.data.sentTo], [200, 'l•••@example.com']);
+  const { code: emailCode } = await nextResetCode('lito@example.com');
+  assert.equal((await lito.post('/api/auth/change-password', { code, newPassword: 'LitoNew2!', confirmPassword: 'LitoNew2!' })).data.code, 'RESET_CODE_INVALID', 'the texted code was replaced');
+  assert.equal((await lito.post('/api/auth/change-password', { code: emailCode, newPassword: 'LitoNew2!', confirmPassword: 'LitoNew2!' })).status, 200);
+  assert.equal((await new Client('10.0.9.2').post('/api/auth/login', { usernameOrEmail: 'lito', password: 'LitoNew2!' })).status, 200);
+
+  const actions = (await pool.query(`SELECT action, details FROM audit_logs WHERE user_id = (SELECT id FROM users WHERE username = 'lito') ORDER BY id`)).rows;
+  assert.deepEqual(actions.filter((row) => row.action === 'PASSWORD_CHANGED').map((row) => row.details.method), ['code', 'code']);
+  assert.ok(actions.some((row) => row.action === 'PASSWORD_CHANGE_CODE_SENT' && row.details.channel === 'sms'));
 });

@@ -8,6 +8,6 @@
     { "source": "/(.*)", "destination": "/api" }
   ],
   "crons": [
-    { "path": "/api/cron/refresh-loans", "schedule": "0 16 * * *" }
+    { "path": "/api/cron/refresh-loans", "schedule": "0 0 * * *" }
   ]
 }

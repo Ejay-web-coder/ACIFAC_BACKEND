@@ -2,6 +2,7 @@ import { query, withTransaction } from '../config/db.js';
 import { keepAlive } from '../utils/background.js';
 import { emailNotifiedUsers } from './memberEmails.js';
 import { loanReminderEmail } from './emailTemplates.js';
+import { flushSmsOutbox, loanReminderSms, queueSmsForUsers } from './smsService.js';
 import { SQL_TODAY } from '../config/env.js';
 import { centsToString, toCents } from '../utils/money.js';
 
@@ -206,8 +207,11 @@ export async function refreshLoanStatuses({ force = false } = {}) {
        RETURNING user_id, title, message`
     );
     // Each reminder is created once per installment (dedupe key), so only the
-    // new ones returned here are emailed.
+    // new ones returned here are emailed and texted. Texts are queued; the
+    // flush sends them now if it is daytime, else on a later refresh.
     await emailNotifiedUsers([...dueSoon.rows, ...overdue.rows], loanReminderEmail);
+    await queueSmsForUsers([...dueSoon.rows, ...overdue.rows], loanReminderSms);
+    void flushSmsOutbox();
     // Admins: one notification per overdue installment.
     await query(
       `INSERT INTO notifications (user_id, type, title, message, severity, link, entity_type, entity_id, dedupe_key)

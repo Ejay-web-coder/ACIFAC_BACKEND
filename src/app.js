@@ -17,6 +17,7 @@ import { announcementRoutes, eventRoutes, legalDocumentRoutes, notificationRoute
 import { isListening } from './services/events.js';
 import { refreshLoanStatuses } from './services/loanService.js';
 import { refreshRentalStatuses } from './controllers/machineryController.js';
+import { flushSmsOutbox } from './services/smsService.js';
 
 export function createApp() {
   const app = express();
@@ -50,12 +51,16 @@ export function createApp() {
 
   // Vercel Cron replacement for the hourly timer in server.js. Vercel sends
   // "Authorization: Bearer <CRON_SECRET>" with every scheduled invocation.
+  // It runs at 00:00 UTC (08:00 in Manila), inside the SMS sending hours, so
+  // reminder texts queued overnight go out every morning even if nobody opens
+  // the system that day.
   app.get('/api/cron/refresh-loans', async (req, res) => {
     const secret = process.env.CRON_SECRET;
     if (!secret || req.headers.authorization !== `Bearer ${secret}`) {
       return res.status(401).json({ success: false, message: 'Unauthorized.' });
     }
     await Promise.all([refreshLoanStatuses({ force: true }), refreshRentalStatuses()]);
+    await flushSmsOutbox();
     return res.status(200).json({ ok: true });
   });
 

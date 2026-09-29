@@ -38,5 +38,9 @@ services:
         sync: false
       - key: EMAIL_FROM
         sync: false
+      - key: TEXTBEE_API_KEY
+        sync: false
+      - key: TEXTBEE_DEVICE_ID
+        sync: false
       - key: GEMINI_API_KEY
         sync: false

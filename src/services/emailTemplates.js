@@ -28,7 +28,8 @@ export function passwordResetEmail({ username, token, expiresIn = '15 minutes' }
   );
 }
 
-// The code is only ever in this email: never in a link, log or response.
+// The code is only ever in this email and its text message (smsService.js):
+// never in a link, log or response.
 export function passwordResetCodeEmail({ code, expiresInMinutes = 10 }) {
   return message(
     'ACIFAC Password Reset',

@@ -1,7 +1,8 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import {
-  changePassword, forgotPassword, login, logout, me, resetPassword, sessionStatus, updateNotificationPreferences, updateProfile, verifyResetCode,
+  changePassword, forgotPassword, login, logout, me, resetPassword, sendPasswordChangeCode, sessionStatus, updateNotificationPreferences, updateProfile,
+  verifyResetCode,
 } from '../controllers/authController.js';
 import { deleteProfilePhoto, getProfilePhoto, uploadProfilePhoto } from '../controllers/profilePhotoController.js';
 import { requireAuth } from '../middleware/auth.js';
@@ -53,6 +54,7 @@ router.get('/session', requireAuth, sessionStatus);
 router.post('/forgot-password', forgotLimiter, forgotPassword);
 router.post('/verify-reset-code', verifyCodeLimiter, verifyResetCode);
 router.post('/reset-password', resetLimiter, resetPassword);
+router.post('/change-password/code', requireAuth, forgotLimiter, sendPasswordChangeCode);
 router.post('/change-password', requireAuth, changePassword);
 router.patch('/profile', requireAuth, updateProfile);
 router.patch('/notification-preferences', requireAuth, updateNotificationPreferences);
