@@ -31,7 +31,7 @@ React (Vercel)  →  Express API (this repo)  →  Supabase PostgreSQL (+ privat
 ```bash
 cp .env.example .env        # fill in SUPABASE_DB_URL etc.
 npm install
-npm run migrate             # applies sql/*.sql once each (tracked in app_schema_migrations)
+npm run migrate             # optional: npm start / npm run dev also apply new sql/*.sql files on start
 ADMIN_USERNAME=admin ADMIN_EMAIL=you@example.com ADMIN_PASSWORD='A-Strong-Pass1!' npm run create-admin
 npm run dev
 ```
@@ -53,8 +53,11 @@ analytics, session revocation, login lockouts, emailed reset codes and the inact
 2. Enter the secret variables (`SUPABASE_DB_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`,
    `CORS_ORIGIN`, `FRONTEND_URL`, email and OCR keys). `SUPABASE_DB_URL` must be the **session pooler
    (port 5432) or direct** connection string; the transaction pooler (6543) cannot `LISTEN`.
-3. After the first deploy run `npm run migrate` from a Render shell (safe to repeat), then
-   `npm run create-admin` with `ADMIN_*` variables to create the first administrator.
+3. Migrations run automatically: on every start the server applies any new `sql/*.sql` file
+   (tracked in `app_schema_migrations`) before accepting requests, and exits if one fails, so a bad
+   deploy keeps the previous version running. On Vercel they run on the first request after a cold
+   start. Set `AUTO_MIGRATE=false` to turn this off and use `npm run migrate` instead.
+   After the first deploy run `npm run create-admin` with `ADMIN_*` variables to create the first administrator.
 4. Check `https://<service>.onrender.com/api/health` → `{"ok":true,"liveUpdates":true}`.
 
 Any Node 20+ host works the same way (`npm ci && npm start`); keep it a long-running server so SSE

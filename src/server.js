@@ -3,11 +3,23 @@ import { isProduction, validateProductionEnv } from './config/env.js';
 import { startEventListener, stopEventListener } from './services/events.js';
 import { refreshLoanStatuses } from './services/loanService.js';
 import { getPool } from './config/db.js';
+import { applyMigrations, autoMigrateEnabled } from './services/migrations.js';
 
 const missing = validateProductionEnv();
 if (missing.length) {
   console.error(`Missing required production configuration: ${missing.join(', ')}`);
   process.exit(1);
+}
+
+// New sql/*.sql files are applied before the server accepts requests. If one
+// fails the process exits, so a deploy never serves code against an old schema.
+if (autoMigrateEnabled()) {
+  try {
+    await applyMigrations();
+  } catch (error) {
+    console.error(error.message);
+    process.exit(1);
+  }
 }
 
 const app = createApp();
