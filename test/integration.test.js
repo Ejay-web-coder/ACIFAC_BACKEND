@@ -55,7 +55,7 @@ class Client {
   put(url, body) { return this.request('PUT', url, { body }); }
 }
 
-function memberForm(overrides = {}, file = PNG) {
+function memberForm(overrides = {}, file = PNG, signatures = 0) {
   const form = new FormData();
   const fields = {
     first_name: 'Juan', last_name: 'Dela Cruz', email: 'juan@example.com', phone: '09171234567', address: 'Purok 1, Amnay',
@@ -63,6 +63,7 @@ function memberForm(overrides = {}, file = PNG) {
   };
   for (const [key, value] of Object.entries(fields)) form.append(key, value);
   if (file) form.append('idDocument', new Blob([file], { type: 'image/png' }), 'id.png');
+  for (let index = 1; index <= signatures; index += 1) form.append('signatures', new Blob([PNG], { type: 'image/png' }), `signature-${index}.png`);
   return form;
 }
 
@@ -196,9 +197,10 @@ test('auth: admin login, CSRF protection and /me', { skip }, async () => {
 test('members: create, validate, duplicate, view document, update, archive, restore', { skip }, async () => {
   const invalidFile = await admin.request('POST', '/api/members', { form: memberForm({}, Buffer.from('not an image')) });
   assert.equal(invalidFile.status, 400);
-  const created = await admin.request('POST', '/api/members', { form: memberForm() });
+  const created = await admin.request('POST', '/api/members', { form: memberForm({}, PNG, 3) });
   assert.equal(created.status, 201, JSON.stringify(created.data));
   state.memberId = created.data.data.id;
+  assert.equal(created.data.data.signature_count, 3);
   assert.match(created.data.data.member_number, /^ACIFAC-\d{4}-001$/);
   assert.equal(created.data.data.share_capital, 1000);
 
@@ -218,6 +220,11 @@ test('members: create, validate, duplicate, view document, update, archive, rest
   const doc = await admin.request('GET', `/api/members/${state.memberId}/documents/id-document`, { raw: true });
   assert.equal(doc.status, 200);
   assert.deepEqual(Buffer.from(await doc.arrayBuffer()), PNG);
+  const signature = await admin.request('GET', `/api/members/${state.memberId}/documents/signature-3`, { raw: true });
+  assert.equal(signature.status, 200);
+  assert.deepEqual(Buffer.from(await signature.arrayBuffer()), PNG);
+  const noSignature = await admin.request('GET', `/api/members/${state.secondMemberId}/documents/signature-1`, { raw: true });
+  assert.equal(noSignature.status, 404);
 
   const detail = await admin.get(`/api/members/${state.memberId}`);
   const updated = await admin.put(`/api/members/${state.memberId}`, { ...detail.data.data, phone: '09179999999', membership_date: detail.data.data.membership_date });

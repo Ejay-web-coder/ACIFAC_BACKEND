@@ -41,6 +41,7 @@ router.post('/import', importMembers);
 router.post('/', memberDocumentUpload.fields([
   { name: 'idDocument', maxCount: 1 },
   { name: 'profilePhoto', maxCount: 1 },
+  { name: 'signatures', maxCount: 3 },
 ]), createMember);
 router.get('/:id', getMember);
 router.get('/:id/documents/:kind', downloadMemberDocument);

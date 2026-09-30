@@ -6,10 +6,10 @@ import multer from 'multer';
 export const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 export const DOCUMENT_TYPES = [...IMAGE_TYPES, 'application/pdf'];
 
-function memoryUpload(maxBytes, allowed) {
+function memoryUpload(maxBytes, allowed, maxFiles = 2) {
   return multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: maxBytes, files: 2, fields: 80 },
+    limits: { fileSize: maxBytes, files: maxFiles, fields: 80 },
     fileFilter: (_req, file, callback) => {
       if (!allowed.includes(file.mimetype)) return callback(new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.fieldname));
       return callback(null, true);
@@ -17,7 +17,8 @@ function memoryUpload(maxBytes, allowed) {
   });
 }
 
-export const memberDocumentUpload = memoryUpload(5 * 1024 * 1024, DOCUMENT_TYPES);
+// Add Member: ID document, 2x2 photo and three specimen signatures.
+export const memberDocumentUpload = memoryUpload(5 * 1024 * 1024, DOCUMENT_TYPES, 5);
 export const ocrDocumentUpload = memoryUpload(10 * 1024 * 1024, DOCUMENT_TYPES);
 export const legalDocumentUpload = memoryUpload(10 * 1024 * 1024, DOCUMENT_TYPES);
 // Pictures are resized in the browser to about 100 KB; 5 MB leaves room for originals.

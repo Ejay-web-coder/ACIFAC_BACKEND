@@ -30,6 +30,7 @@ const memberSelect = `
          m.yearly_income, m.spouse_name, m.spouse_age, m.spouse_contact, m.children,
          m.emergency_contact, m.id_document_name, m.id_document_type, m.id_document_size,
          (m.id_document_path IS NOT NULL) AS has_id_document, (m.profile_photo IS NOT NULL) AS has_profile_photo,
+         COALESCE(cardinality(m.signature_paths), 0) AS signature_count,
          m.membership_date, m.share_capital, m.status, m.archived_at, m.archived_by, m.additional_info,
          archived_user.username AS archived_by_username, m.created_at, m.updated_at,
          TRIM(CONCAT_WS(' ', m.first_name, m.middle_name, m.last_name, m.suffix)) AS full_name
@@ -62,6 +63,8 @@ function numericOrNull(value) {
 const ADDITIONAL_TEXT_FIELDS = [
   'motherMaidenName', 'motherLastName', 'motherFirstName', 'motherMiddleName', 'membershipType', 'separationDate',
   'bodResolution', 'membershipFee', 'dateReceived', 'preMembershipSeminar', 'paymentOfMembershipFee', 'orNumber', 'initialPaidUpCapital',
+  // "For cooperative" certifications on the paper form: OR numbers and who certified each.
+  'seminarOrNumber', 'seminarCertifiedBy', 'feeCertifiedBy', 'capitalOrNumber', 'capitalCertifiedBy',
 ];
 
 // Details from the Add Member form without a column of their own (mother's
@@ -208,21 +211,24 @@ export async function downloadMemberDocument(req, res) {
   const id = req.params.id === undefined ? Number(req.user.member_id) : parseId(req.params.id, 'member ID');
   if (req.user.role !== 'ADMIN' && id !== Number(req.user.member_id)) throw notFound('Document not found.');
   const kind = req.params.kind;
-  if (!['id-document', 'photo', 'avatar'].includes(kind)) throw notFound('Document not found.');
+  // signature-1 to signature-3: the specimen signatures, in the order they were signed.
+  const signatureIndex = /^signature-[1-3]$/.test(kind) ? Number(kind.slice(-1)) : 0;
+  if (!signatureIndex && !['id-document', 'photo', 'avatar'].includes(kind)) throw notFound('Document not found.');
   // "avatar": the picture the member chose for their account, else their 2x2 photo.
   const result = await query(
-    `SELECT m.id_document_path, m.id_document_name, m.id_document_type, m.profile_photo,
+    `SELECT m.id_document_path, m.id_document_name, m.id_document_type, m.profile_photo, m.signature_paths,
             (SELECT u.profile_photo FROM users u WHERE u.member_id = m.id AND u.profile_photo IS NOT NULL ORDER BY u.id LIMIT 1) AS account_photo
      FROM members m WHERE m.id = $1`,
     [id]
   );
   const row = result.rows[0];
-  const reference = kind === 'id-document' ? row?.id_document_path : kind === 'avatar' ? (row?.account_photo || row?.profile_photo) : row?.profile_photo;
+  const reference = signatureIndex ? row?.signature_paths?.[signatureIndex - 1]
+    : kind === 'id-document' ? row?.id_document_path : kind === 'avatar' ? (row?.account_photo || row?.profile_photo) : row?.profile_photo;
   if (!reference) throw notFound('Document not found.');
   const sent = await sendStoredFile(res, {
     reference,
     mimeType: kind === 'id-document' ? row.id_document_type : photoMimeType(reference),
-    fileName: kind === 'id-document' ? row.id_document_name : 'profile-photo',
+    fileName: kind === 'id-document' ? row.id_document_name : signatureIndex ? kind : 'profile-photo',
   });
   if (!sent) throw notFound('The stored file could not be found.');
   return undefined;
@@ -490,7 +496,7 @@ export function parseShareCapital(body, errors) {
 
 // Inserts one validated member inside an open transaction and assigns the next
 // ACIFAC-YYYY-NNN number. The advisory lock serialises numbering across requests.
-export async function insertMemberRecord(client, req, { body, values, shareCapitalCents, idDocument = null, idDocumentRef = null, photoRef = null, source = 'registration' }) {
+export async function insertMemberRecord(client, req, { body, values, shareCapitalCents, idDocument = null, idDocumentRef = null, photoRef = null, signatureRefs = [], source = 'registration' }) {
   const duplicate = await findDuplicateMember(client, values, cleanString(body.date_of_birth, 10), cleanString(body.rsbsa_no, 100));
   if (duplicate) throw conflict(`This member appears to be already registered (${duplicate.member_number}). Check the email, RSBSA number, or name and birth date.`);
 
@@ -508,9 +514,9 @@ export async function insertMemberRecord(client, req, { body, values, shareCapit
                           id_type, id_number, rsbsa_no, livelihood, farm_area_ha, corn_area_ha, palay_area_ha,
                           yearly_income, spouse_name, spouse_age, spouse_contact, children, emergency_contact,
                           id_document_path, id_document_name, id_document_type, id_document_size, membership_date,
-                          share_capital, status, profile_photo, additional_info, updated_at)
+                          share_capital, status, profile_photo, additional_info, signature_paths, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-             $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34::numeric, $35, $36, $37::jsonb, NOW())
+             $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34::numeric, $35, $36, $37::jsonb, $38::text[], NOW())
      RETURNING id`,
     [memberNumber, values.firstName, optionalString(body.middle_name, 100), values.lastName, optionalString(body.suffix, 20), values.email,
       values.phone, values.address, optionalString(body.barangay, 150), optionalString(body.municipality, 150), optionalString(body.province, 150),
@@ -519,7 +525,7 @@ export async function insertMemberRecord(client, req, { body, values, shareCapit
       numericOrNull(body.corn_area_ha), numericOrNull(body.palay_area_ha), numericOrNull(body.yearly_income),
       optionalString(body.spouse_name, 200), numericOrNull(body.spouse_age), optionalString(body.spouse_contact, 30), optionalString(body.children, 2000),
       optionalString(body.emergency_contact, 255), idDocumentRef, idDocument ? safeOriginalName(idDocument.originalname) : null, idDocument?.mimetype ?? null, idDocument?.size ?? null,
-      values.membershipDate, centsToString(shareCapitalCents), values.status, photoRef, JSON.stringify(readAdditionalInfo(body.additional_info))]
+      values.membershipDate, centsToString(shareCapitalCents), values.status, photoRef, JSON.stringify(readAdditionalInfo(body.additional_info)), signatureRefs]
   );
   const id = insert.rows[0].id;
   if (shareCapitalCents > 0) {
@@ -547,25 +553,30 @@ export async function createMember(req, res) {
   const body = req.body || {};
   const idDocument = req.files?.idDocument?.[0] || null;
   const profilePhoto = req.files?.profilePhoto?.[0] || null;
+  const signatures = req.files?.signatures || [];
   const { errors, values } = validateMemberInput(body);
   const shareCapitalCents = parseShareCapital(body, errors);
   if (errors.length) throw badRequest(errors[0], errors);
   assertValidUpload(idDocument, DOCUMENT_TYPES, 'ID document');
   if (profilePhoto) assertValidUpload(profilePhoto, IMAGE_TYPES, 'profile photo');
+  signatures.forEach((signature) => assertValidUpload(signature, IMAGE_TYPES, 'signature'));
 
   // Upload first; if the database transaction fails the files are removed again.
   const folder = `members/${todayDateOnly().slice(0, 7)}`;
   const idDocumentRef = await uploadFile({ bucket: BUCKETS.memberDocuments, folder, file: idDocument });
   const photoRef = profilePhoto ? await uploadFile({ bucket: BUCKETS.memberPhotos, folder, file: profilePhoto }) : null;
+  const signatureRefs = [];
 
   try {
-    const { id: memberId } = await withTransaction((client) => insertMemberRecord(client, req, { body, values, shareCapitalCents, idDocument, idDocumentRef, photoRef }));
+    for (const signature of signatures) signatureRefs.push(await uploadFile({ bucket: BUCKETS.memberDocuments, folder, file: signature }));
+    const { id: memberId } = await withTransaction((client) => insertMemberRecord(client, req, { body, values, shareCapitalCents, idDocument, idDocumentRef, photoRef, signatureRefs }));
     const created = await query(`${memberSelect} WHERE m.id = $1`, [memberId]);
     void emailMember(memberId, welcomeMemberEmail({ memberName: created.rows[0].full_name, memberNumber: created.rows[0].member_number, membershipDate: created.rows[0].membership_date }));
     return res.status(201).json({ success: true, data: mapMember(created.rows[0]), message: 'Member created successfully.' });
   } catch (error) {
     await removeFile(idDocumentRef);
     if (photoRef) await removeFile(photoRef);
+    for (const reference of signatureRefs) await removeFile(reference);
     throw error;
   }
 }
