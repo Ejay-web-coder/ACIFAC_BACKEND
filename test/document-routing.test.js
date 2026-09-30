@@ -2,7 +2,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildAnalysisPrompt, isPostable, normalizeAuthenticity, normalizeDocumentType, normalizeExtractedData, publicFormDefinitions, UNRECOGNIZED,
+  buildAnalysisPrompt, buildIdPrompt, buildPhotoPrompt, isPostable, normalizeAuthenticity, normalizeDocumentType, normalizeExtractedData, normalizeIdReading,
+  normalizePhotoReading, photoExpected, publicFormDefinitions, requiresIdDocument, UNRECOGNIZED,
 } from '../src/services/documentRouting.js';
 
 test('document types: postable forms, legacy names and unknown values', () => {
@@ -39,9 +40,10 @@ test('extracted data is mapped onto the form keys and normalised', () => {
 
 test('authenticity assessment is sanitised', () => {
   assert.deepEqual(normalizeAuthenticity({ score: '130', verdict: 'Genuine', physicalDocument: true, signaturePresent: 'yes', issues: ['a', 7] }), {
-    score: 100, verdict: 'genuine', physicalDocument: true, filledIn: null, signaturePresent: null, issues: ['a', '7'],
+    score: 100, verdict: 'genuine', physicalDocument: true, filledIn: null, signaturePresent: null, photoRecognized: null, issues: ['a', '7'],
   });
-  assert.deepEqual(normalizeAuthenticity(null), { score: null, verdict: 'unknown', physicalDocument: null, filledIn: null, signaturePresent: null, issues: [] });
+  assert.deepEqual(normalizeAuthenticity(null), { score: null, verdict: 'unknown', physicalDocument: null, filledIn: null, signaturePresent: null, photoRecognized: null, issues: [] });
+  assert.equal(normalizeAuthenticity({ photoRecognized: false }).photoRecognized, false);
 });
 
 test('analysis prompt lists every form key and adapts to camera captures', () => {
@@ -50,4 +52,49 @@ test('analysis prompt lists every form key and adapts to camera captures', () =>
   assert.ok(prompt.includes('authenticity'));
   assert.ok(!prompt.includes('phone camera'));
   assert.ok(buildAnalysisPrompt('camera').includes('phone camera'));
+});
+
+test('the membership form follows the paper form and needs the applicant ID', () => {
+  const prompt = buildAnalysisPrompt('upload');
+  for (const key of ['child3Name', 'income2Amount', 'motherLastName', 'bodResolution', 'membershipFeeOrNo', 'education', 'idNumber']) assert.ok(prompt.includes(key), key);
+  assert.match(prompt, /system gives the membership number/);
+  assert.ok(requiresIdDocument('Membership Form'));
+  assert.equal(requiresIdDocument('Savings Form'), false);
+  assert.deepEqual(publicFormDefinitions().filter((form) => form.requiresIdDocument).map((form) => form.type), ['Membership Form']);
+
+  const data = normalizeExtractedData('Membership Form', { 'CP No.': '0917 123 4567', Birthday: '03/15/1990', child1Age: '7 ', income1Amount: '₱60,000' });
+  assert.equal(data.phone, '0917 123 4567');
+  assert.equal(data.dateOfBirth, '1990-03-15');
+  assert.equal(data.child1Age, '7');
+  assert.equal(data.income1Amount, '60000');
+  assert.equal(data.email, '');
+});
+
+test('the ID reading is sanitised and the prompt fits how the ID was submitted', () => {
+  assert.deepEqual(normalizeIdReading({
+    isId: true, idType: 'PhilSys National ID', idNumber: 1234, name: ' Rosa Magsaysay ', dateOfBirth: '03/15/1990', frontVisible: true, backVisible: 'yes',
+    signatureCount: '3', expired: null, issues: ['glare', 5],
+  }), {
+    isId: true, idType: 'PhilSys National ID', idNumber: '1234', name: 'Rosa Magsaysay', dateOfBirth: '1990-03-15', frontVisible: true, backVisible: null,
+    photocopy: null, physicalCard: null, screen: null, signatureCount: 3, expired: null, issues: ['glare', '5'],
+  });
+  assert.equal(normalizeIdReading({ signatureCount: 'three' }).signatureCount, null);
+  assert.equal(normalizeIdReading({ signatureCount: '' }).signatureCount, null);
+  assert.equal(normalizeIdReading({ signatureCount: -1 }).signatureCount, null);
+  assert.equal(normalizeIdReading({ dateOfBirth: 'unreadable' }).dateOfBirth, '');
+  assert.equal(normalizeIdReading(null).isId, null);
+
+  assert.match(buildIdPrompt('upload'), /back-to-back copy/);
+  assert.match(buildIdPrompt('upload'), /3 specimen signatures/);
+  assert.match(buildIdPrompt('camera'), /live camera/);
+  assert.doesNotMatch(buildIdPrompt('camera'), /back-to-back copy/);
+});
+
+test('the membership form 2x2 picture is checked on the form, or uploaded and checked', () => {
+  assert.ok(photoExpected('Membership Form'));
+  assert.equal(photoExpected('Loan Form'), false);
+  assert.match(buildAnalysisPrompt('upload'), /photoRecognized/);
+  assert.match(buildPhotoPrompt(), /faceVisible/);
+  assert.deepEqual(normalizePhotoReading({ portrait: true, faceVisible: 'yes', screen: false, issues: ['dark'] }), { portrait: true, faceVisible: null, screen: false, issues: ['dark'] });
+  assert.deepEqual(normalizePhotoReading(null), { portrait: null, faceVisible: null, screen: null, issues: [] });
 });

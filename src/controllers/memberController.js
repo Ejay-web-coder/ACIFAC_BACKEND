@@ -494,6 +494,18 @@ export function parseShareCapital(body, errors) {
   return shareCapitalCents;
 }
 
+// The next ACIFAC-YYYY-NNN membership number. The system always gives the
+// number; registration takes an advisory lock first so it is never reused.
+export async function nextMemberNumber(db) {
+  const year = todayDateOnly().slice(0, 4);
+  const numberResult = await db.query(
+    `SELECT COALESCE(MAX(NULLIF(SPLIT_PART(member_number, '-', 3), '')::int), 0) + 1 AS next_number
+     FROM members WHERE member_number ~ $1`,
+    [`^ACIFAC-${year}-[0-9]+$`]
+  );
+  return `ACIFAC-${year}-${String(numberResult.rows[0].next_number).padStart(3, '0')}`;
+}
+
 // Inserts one validated member inside an open transaction and assigns the next
 // ACIFAC-YYYY-NNN number. The advisory lock serialises numbering across requests.
 export async function insertMemberRecord(client, req, { body, values, shareCapitalCents, idDocument = null, idDocumentRef = null, photoRef = null, signatureRefs = [], source = 'registration' }) {
@@ -501,13 +513,7 @@ export async function insertMemberRecord(client, req, { body, values, shareCapit
   if (duplicate) throw conflict(`This member appears to be already registered (${duplicate.member_number}). Check the email, RSBSA number, or name and birth date.`);
 
   await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['acifac-member-number']);
-  const year = todayDateOnly().slice(0, 4);
-  const numberResult = await client.query(
-    `SELECT COALESCE(MAX(NULLIF(SPLIT_PART(member_number, '-', 3), '')::int), 0) + 1 AS next_number
-     FROM members WHERE member_number ~ $1`,
-    [`^ACIFAC-${year}-[0-9]+$`]
-  );
-  const memberNumber = `ACIFAC-${year}-${String(numberResult.rows[0].next_number).padStart(3, '0')}`;
+  const memberNumber = await nextMemberNumber(client);
   const insert = await client.query(
     `INSERT INTO members (member_number, first_name, middle_name, last_name, suffix, email, phone, address,
                           barangay, municipality, province, date_of_birth, gender, civil_status, education,
@@ -708,12 +714,12 @@ export async function replaceMemberDocuments(req, res) {
       });
       // A member with fewer than three signatures gets the new ones in order, without gaps.
       const signaturePaths = paths.filter(Boolean);
-      // An ID that came from an OCR scan is the scan's own file; the scan keeps it.
-      if (idDocumentRef && before.id_document_path) {
-        const scanned = await client.query('SELECT 1 FROM document_scans WHERE stored_file_path = $1 LIMIT 1', [before.id_document_path]);
-        if (!scanned.rowCount) replaced.push(before.id_document_path);
-      }
-      if (photoRef && before.profile_photo) replaced.push(before.profile_photo);
+      // An ID or 2x2 picture that came with an OCR scan is also the scan's file; the scan keeps it.
+      const scanFile = async (reference) => (await client.query(
+        'SELECT 1 FROM document_scans WHERE stored_file_path = $1 OR id_document_path = $1 OR photo_path = $1 LIMIT 1', [reference]
+      )).rowCount > 0;
+      if (idDocumentRef && before.id_document_path && !(await scanFile(before.id_document_path))) replaced.push(before.id_document_path);
+      if (photoRef && before.profile_photo && !(await scanFile(before.profile_photo))) replaced.push(before.profile_photo);
       await client.query(
         `UPDATE members SET id_document_path = COALESCE($2, id_document_path),
                             id_document_name = CASE WHEN $2::text IS NULL THEN id_document_name ELSE $3 END,

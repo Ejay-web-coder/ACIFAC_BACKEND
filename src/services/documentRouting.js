@@ -2,7 +2,7 @@ import { query, withTransaction } from '../config/db.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { badRequest, toHttpError } from '../utils/http.js';
 import { parseMoneyInput } from '../utils/money.js';
-import { insertMemberRecord, parseShareCapital, SAVINGS_METHODS, insertSavingsDeposit, validateMemberInput } from '../controllers/memberController.js';
+import { insertMemberRecord, nextMemberNumber, parseShareCapital, SAVINGS_METHODS, insertSavingsDeposit, validateMemberInput } from '../controllers/memberController.js';
 import { insertLoanRequest, memberApplicationSelect, prepareApplication } from '../controllers/loanController.js';
 import { insertRentalRequest } from '../controllers/machineryController.js';
 import { insertKadiwaSale } from '../controllers/kadiwaController.js';
@@ -27,18 +27,38 @@ const LOAN_INPUT_ROWS = [
 ];
 // Loan term used when the paper form (which has no term) is posted.
 const DEFAULT_LOAN_TERM = '12';
+// Rows of the children and source-of-income tables on the paper membership form.
+const CHILD_ROWS = [1, 2, 3];
+const INCOME_ROWS = [1, 2];
+// The paper membership form is the associate member form.
+const DEFAULT_MEMBERSHIP_TYPE = 'Associate';
+// Specimen signatures required on an uploaded back-to-back copy of the ID.
+export const REQUIRED_ID_SIGNATURES = 3;
 
 export const FORM_DEFINITIONS = {
   'Membership Form': {
-    module: 'members', moduleLabel: 'Membership Management', signatureExpected: true,
-    description: 'Membership application / registration form of a new cooperative member.',
+    module: 'members', moduleLabel: 'Membership Management', signatureExpected: true, requiresIdDocument: true, photoExpected: true,
+    description: 'ACIFAC associate membership form (one page): name, birthday, age, civil status, gender, CP no., educational attainment, ID type and number, RSBSA no., farm area, permanent address, family members (spouse, mother\'s maiden name, children), sources of income, membership acceptance / separation, the applicant signature, and the "For Cooperative" certification section.',
+    notes: 'Ignore the MEMBERSHIP NO. box at the top: the system gives the membership number. The form has no email; use "" for email unless one is written on it. phone is the CP #. address is only the house, street, sitio or purok written with the permanent address; barangay, municipality and province have their own keys. Mother\'s maiden name goes in motherLastName, motherFirstName and motherMiddleName. Children rows: child1Name/child1Age to child3Name/child3Age. Income rows: income1Source/income1Amount and income2Source/income2Amount (annual income). From the ACCEPTANCE row: membershipDate (its date), bodResolution and membershipType; from the SEPARATION row only separationDate. From FOR COOPERATIVE: membershipFee and dateReceived; the OR no. and certified-by name of the pre-membership education seminar (seminarOrNo, seminarCertifiedBy), the payment of membership fee (membershipFeeOrNo, feeCertifiedBy) and the initial paid-up capital (paidUpCapitalOrNo, capitalCertifiedBy); and shareCapital only when an initial paid-up capital amount is written.',
     fields: [
-      f('firstName', 'First Name', { required: true }), f('middleName', 'Middle Name'), f('lastName', 'Last Name', { required: true }), f('suffix', 'Suffix'),
-      f('email', 'Email', { required: true }), f('phone', 'Phone Number', { required: true }), f('address', 'Address', { required: true }),
-      f('barangay', 'Barangay'), f('municipality', 'Municipality'), f('province', 'Province'),
-      f('dateOfBirth', 'Date of Birth', { kind: 'date' }), f('gender', 'Gender'), f('civilStatus', 'Civil Status'),
-      f('rsbsaNo', 'RSBSA Number'), f('livelihood', 'Livelihood'), f('farmAreaHa', 'Farm Area (ha)', { kind: 'number' }),
-      f('membershipDate', 'Membership Date', { kind: 'date', required: true }), f('shareCapital', 'Initial Share Capital', { kind: 'money' }),
+      f('lastName', 'Last Name', { required: true }), f('firstName', 'First Name', { required: true }), f('middleName', 'Middle Name'), f('suffix', 'Suffix (Jr., Sr., III)'),
+      f('dateOfBirth', 'Birthday', { kind: 'date', required: true }), f('age', 'Age', { kind: 'integer' }), f('civilStatus', 'Civil Status'), f('gender', 'Gender'),
+      f('phone', 'CP No.', { required: true }), f('email', 'Email (not on the paper form)', { required: true, typedIn: true }),
+      f('education', 'Highest Educational Attainment'), f('idType', 'ID Type'), f('idNumber', 'ID No.'),
+      f('rsbsaNo', 'RSBSA No.'), f('farmAreaHa', 'Farm Area (ha)', { kind: 'number' }),
+      f('address', 'Permanent Address (house, street, sitio or purok)'),
+      f('barangay', 'Barangay', { required: true }), f('municipality', 'Municipality', { required: true }), f('province', 'Province', { required: true }),
+      f('spouseName', 'Spouse Name'), f('spouseAge', 'Spouse Age', { kind: 'integer' }), f('spouseContact', 'Spouse Contact No.'),
+      f('motherLastName', 'Mother\'s Maiden Name - Last Name'), f('motherFirstName', 'Mother\'s Maiden Name - First Name'), f('motherMiddleName', 'Mother\'s Maiden Name - Middle Name'),
+      ...CHILD_ROWS.flatMap((row) => [f(`child${row}Name`, `Child ${row} - Name`), f(`child${row}Age`, `Child ${row} - Age`, { kind: 'integer' })]),
+      ...INCOME_ROWS.flatMap((row) => [f(`income${row}Source`, `Source of Income ${row}`), f(`income${row}Amount`, `Source of Income ${row} - Annual Income`, { kind: 'money' })]),
+      f('membershipDate', 'Acceptance Date (today if blank)', { kind: 'date' }), f('bodResolution', 'Acceptance B.O.D. Resolution'),
+      f('membershipType', `Type of Membership (${DEFAULT_MEMBERSHIP_TYPE} if blank)`), f('separationDate', 'Separation Date', { kind: 'date' }),
+      f('membershipFee', 'Membership Fee', { kind: 'money' }), f('dateReceived', 'Date Received', { kind: 'date' }),
+      f('seminarOrNo', 'Pre-Membership Education Seminar - OR No.'), f('seminarCertifiedBy', 'Pre-Membership Education Seminar - Certified By'),
+      f('membershipFeeOrNo', 'Payment of Membership Fee - OR No.'), f('feeCertifiedBy', 'Payment of Membership Fee - Certified By'),
+      f('paidUpCapitalOrNo', 'Initial Paid-Up Capital - OR No.'), f('capitalCertifiedBy', 'Initial Paid-Up Capital - Certified By'),
+      f('shareCapital', 'Initial Paid-Up Capital (amount)', { kind: 'money' }),
     ],
   },
   'Loan Form': {
@@ -116,8 +136,17 @@ export function isPostable(documentType) {
 export function publicFormDefinitions() {
   return Object.entries(FORM_DEFINITIONS).map(([type, definition]) => ({
     type, module: definition.module, moduleLabel: definition.moduleLabel, description: definition.description,
+    requiresIdDocument: Boolean(definition.requiresIdDocument), photoExpected: Boolean(definition.photoExpected),
     fields: definition.fields.map(({ key, label, kind, required }) => ({ key, label, kind, required })),
   }));
+}
+
+export function requiresIdDocument(documentType) {
+  return Boolean(FORM_DEFINITIONS[documentType]?.requiresIdDocument);
+}
+
+export function photoExpected(documentType) {
+  return Boolean(FORM_DEFINITIONS[documentType]?.photoExpected);
 }
 
 export function buildAnalysisPrompt(captureSource) {
@@ -135,8 +164,58 @@ ${forms}
 A form may span several pages (one PDF or image per page); read every page. Pages may be photographed sideways or upside down; read them in any orientation.
 Extraction rules: use exactly the listed keys for the five forms. Copy values as written; never invent, complete or guess a value — use "" when a field is blank, missing or illegible. Dates as YYYY-MM-DD. Money and numbers as plain digits with optional 2 decimals (no currency sign, no commas).
 
-authenticity must be: { "score": number 0-100 (how likely this is a genuine, unaltered, actually filled-in cooperative form), "verdict": "genuine" | "suspicious" | "fake", "physicalDocument": boolean (true if this is a photo or scan of real paper; false for a photo of a screen, a screenshot, or a digitally generated/edited image), "filledIn": boolean (false if the form is blank or only a template/sample), "signaturePresent": boolean, "issues": [short strings] }.
+authenticity must be: { "score": number 0-100 (how likely this is a genuine, unaltered, actually filled-in cooperative form), "verdict": "genuine" | "suspicious" | "fake", "physicalDocument": boolean (true if this is a photo or scan of real paper; false for a photo of a screen, a screenshot, or a digitally generated/edited image), "filledIn": boolean (false if the form is blank or only a template/sample), "signaturePresent": boolean, "photoRecognized": boolean or null (Membership Form only: true when a 2x2 ID picture is attached in the photo box at the top right and the person's face is clearly recognizable; false when the box is empty or the face cannot be made out; null for other forms), "issues": [short strings] }.
 Look for: altered, overwritten or erased values; mismatched fonts or ink inside a field; pasted or digitally edited areas; totals that do not add up; SAMPLE/SPECIMEN/VOID marks; screen moiré or pixels; missing signatures; a form that is not an ACIFAC/cooperative form. Report every problem found in issues.${captureSource === 'camera' ? '\nThis document was photographed with a phone camera at the office, so normal perspective, shadows and paper texture are expected and are not signs of tampering.' : ''}`;
+}
+
+// The applicant's valid ID submitted with a scanned membership form: an
+// uploaded back-to-back copy with specimen signatures, or the card itself
+// captured with the live camera (front and back joined into one picture).
+export function buildIdPrompt(source) {
+  return `You check the valid ID that an applicant submits with an ACIFAC cooperative membership form in the Philippines. Return JSON only with exactly these fields:
+isId (boolean: the file shows a valid identification card, e.g. PhilSys National ID, driver's license, UMID, SSS, passport, voter's ID, postal ID, PRC, senior citizen or barangay ID),
+idType (string), idNumber (string, as printed), name (string, the full name printed on the ID), dateOfBirth (YYYY-MM-DD, or ""),
+frontVisible (boolean: the front of the ID is shown), backVisible (boolean: the back of the ID is shown),
+photocopy (boolean: a paper photocopy or printout of the ID), physicalCard (boolean: the ID card itself is photographed), screen (boolean: a photo of a screen, a screenshot, or a digitally made or edited image),
+signatureCount (integer: handwritten specimen signatures written on the page around the ID copy; do not count the signature printed on the ID card), expired (boolean, or null when there is no expiry date),
+issues (array of short strings: problems such as unreadable text, a cut-off side, signs of editing, or a name that differs between the two sides).
+Copy values exactly as printed; never guess. Use "" for anything unreadable.
+${source === 'camera'
+    ? 'This ID was captured with the live camera at the cooperative office: the front of the card, then the back, joined into one picture. Perspective, glare and the background are expected. There are no specimen signatures; report signatureCount 0.'
+    : `This should be a back-to-back copy: the front and back of the ID photocopied on one page, with the applicant's ${REQUIRED_ID_SIGNATURES} specimen signatures written on the page.`}`;
+}
+
+// The applicant's 2x2 picture, uploaded when the one on the form cannot be recognised.
+export function buildPhotoPrompt() {
+  return `You check the 2x2 ID picture that an applicant submits with an ACIFAC cooperative membership form in the Philippines. Return JSON only with exactly these fields:
+portrait (boolean: an ID-style picture of one person, head and shoulders), faceVisible (boolean: the face is clear and recognizable, not blurred, covered, cut off or too dark),
+screen (boolean: a photo of a screen, a screenshot, or a digitally made or edited image), issues (array of short strings).`;
+}
+
+export function normalizePhotoReading(raw) {
+  const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const bool = (input) => (typeof input === 'boolean' ? input : null);
+  return {
+    portrait: bool(value.portrait), faceVisible: bool(value.faceVisible), screen: bool(value.screen),
+    issues: Array.isArray(value.issues) ? value.issues.map((issue) => String(issue).slice(0, 300)).filter(Boolean).slice(0, 12) : [],
+  };
+}
+
+export function normalizeIdReading(raw) {
+  const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const bool = (input) => (typeof input === 'boolean' ? input : null);
+  const text = (input, max = 200) => (typeof input === 'string' || typeof input === 'number' ? String(input).trim().slice(0, max) : '');
+  const count = typeof value.signatureCount === 'number' || (typeof value.signatureCount === 'string' && value.signatureCount.trim()) ? Number(value.signatureCount) : NaN;
+  const dateOfBirth = normalizeDate(text(value.dateOfBirth, 40));
+  return {
+    isId: bool(value.isId), idType: text(value.idType, 50), idNumber: text(value.idNumber, 100), name: text(value.name),
+    dateOfBirth: isValidDateOnly(dateOfBirth) ? dateOfBirth : '',
+    frontVisible: bool(value.frontVisible), backVisible: bool(value.backVisible),
+    photocopy: bool(value.photocopy), physicalCard: bool(value.physicalCard), screen: bool(value.screen),
+    signatureCount: Number.isInteger(count) && count >= 0 ? Math.min(count, 20) : null,
+    expired: bool(value.expired),
+    issues: Array.isArray(value.issues) ? value.issues.map((issue) => String(issue).slice(0, 300)).filter(Boolean).slice(0, 12) : [],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +275,7 @@ export function normalizeAuthenticity(raw) {
     physicalDocument: bool(value.physicalDocument),
     filledIn: bool(value.filledIn),
     signaturePresent: bool(value.signaturePresent),
+    photoRecognized: bool(value.photoRecognized),
     issues: Array.isArray(value.issues) ? value.issues.map((issue) => String(issue).slice(0, 300)).filter(Boolean).slice(0, 12) : [],
   };
 }
@@ -267,9 +347,13 @@ const FINGERPRINT_KEYS = {
 const moneyCents = (value) => (value ? parseMoneyInput(value, { allowZero: true }) : 0);
 
 function checkFields(definition, data, add) {
-  const missing = definition.fields.filter((field) => field.required && !String(data[field.key] || '').trim()).map((field) => field.label.replace(/\s*\(.*\)$/, ''));
-  if (missing.length) add('required', 'Required information', 'fail', `Missing on the form: ${missing.join(', ')}.`);
-  else add('required', 'Required information', 'pass', 'All required fields were read from the form.');
+  const missing = definition.fields.filter((field) => field.required && !String(data[field.key] || '').trim());
+  const names = (fields) => fields.map((field) => field.label.replace(/\s*\(.*\)$/, '')).join(', ');
+  const onForm = missing.filter((field) => !field.typedIn);
+  const typedIn = missing.filter((field) => field.typedIn);
+  if (missing.length) {
+    add('required', 'Required information', 'fail', [onForm.length && `Missing on the form: ${names(onForm)}.`, typedIn.length && `Type in the ${names(typedIn)}; it is not on the paper form.`].filter(Boolean).join(' '));
+  } else add('required', 'Required information', 'pass', 'All required fields were read from the form.');
 
   const invalid = [];
   const today = todayDateOnly();
@@ -301,6 +385,84 @@ function checkAuthenticity(definition, authenticity, confidence, add) {
 
   if (confidence === null || confidence < 85) add('confidence', 'Reading confidence', 'warn', `AI reading confidence is ${confidence === null ? 'unknown' : `${confidence}%`}. Compare each field with the paper form.`);
   else add('confidence', 'Reading confidence', 'pass', `AI read the form with ${confidence}% confidence.`);
+}
+
+// Whole years between a YYYY-MM-DD birthday and today.
+function ageOn(dateOfBirth, today = todayDateOnly()) {
+  const [birthYear, birthMonth, birthDay] = dateOfBirth.split('-').map(Number);
+  const [year, month, day] = today.split('-').map(Number);
+  return year - birthYear - (month < birthMonth || (month === birthMonth && day < birthDay) ? 1 : 0);
+}
+
+// The applicant's valid ID: an uploaded back-to-back copy (front and back on
+// one page) with three specimen signatures, or the ID card captured with the
+// live camera. Then: does the ID belong to the applicant on the form?
+function checkIdDocument(scan, data, add) {
+  if (!scan.id_document_path) {
+    add('idDocument', 'Applicant\'s valid ID', 'fail', `Submit the applicant's valid ID: upload a back-to-back copy with ${REQUIRED_ID_SIGNATURES} specimen signatures, or capture the ID with the live camera.`);
+    return;
+  }
+  const reading = scan.id_document_check || {};
+  const camera = scan.id_document_source === 'camera';
+  const idName = reading.idType || 'ID';
+  if (reading.error) {
+    add('idDocument', 'Applicant\'s valid ID', 'warn', `AI could not read the ID (${reading.error}). Open it and check it yourself${camera ? '' : `: front and back on one page with ${REQUIRED_ID_SIGNATURES} specimen signatures`}, or submit it again.`);
+    return;
+  }
+
+  const problems = [];
+  const concerns = [];
+  if (reading.isId === false) problems.push('the file does not show an identification card');
+  else if (camera) {
+    if (reading.screen) problems.push('it is a picture of a screen, not the ID card');
+    else if (reading.photocopy) concerns.push('it looks like a photocopy rather than the ID card itself');
+    if (reading.frontVisible === false) problems.push('the front of the ID is not visible');
+    if (reading.backVisible === false) concerns.push('the back of the ID is not visible');
+  } else {
+    if (reading.frontVisible === false || reading.backVisible === false) problems.push('the copy must show both the front and the back of the ID');
+    if (reading.signatureCount === null) concerns.push('the specimen signatures could not be counted');
+    else if (reading.signatureCount < REQUIRED_ID_SIGNATURES) problems.push(`it has ${reading.signatureCount} specimen signature${reading.signatureCount === 1 ? '' : 's'}; ${REQUIRED_ID_SIGNATURES} are required`);
+    if (reading.screen) concerns.push('it looks like a screen picture or edited image rather than the signed paper copy');
+  }
+  if (reading.isId === null) concerns.push('AI could not confirm that it is an ID');
+  if (reading.expired === true) concerns.push('the ID is expired');
+  const issues = reading.issues?.length ? ` AI noted: ${reading.issues.join('; ')}.` : '';
+  const sentence = (list) => `${list.join('; ').replace(/^./, (letter) => letter.toUpperCase())}.`;
+  if (problems.length) add('idDocument', 'Applicant\'s valid ID', 'fail', `${sentence(problems)} ${camera ? 'Capture the ID card again' : `Upload a back-to-back copy with ${REQUIRED_ID_SIGNATURES} specimen signatures`}, or use the other option.${issues}`);
+  else if (concerns.length) add('idDocument', 'Applicant\'s valid ID', 'warn', `${sentence(concerns)} Compare the ID with the applicant.${issues}`);
+  else if (camera) add('idDocument', 'Applicant\'s valid ID', 'pass', `${idName} captured with the live camera; the front${reading.backVisible ? ' and back are' : ' is'} visible.${issues}`);
+  else add('idDocument', 'Applicant\'s valid ID', 'pass', `Back-to-back copy of the ${idName} with ${reading.signatureCount} specimen signatures.${issues}`);
+
+  const formName = [data.firstName, data.middleName, data.lastName, data.suffix].filter(Boolean).join(' ');
+  const mismatches = [];
+  if (!reading.name) mismatches.push(['warn', 'The name on the ID could not be read']);
+  else {
+    const similarity = nameSimilarity(reading.name, formName);
+    if (similarity < 0.5) mismatches.push(['fail', `The name on the ID ("${reading.name}") is not the applicant on the form (${formName})`]);
+    else if (similarity < 1) mismatches.push(['warn', `The name on the ID ("${reading.name}") only partly matches ${formName}`]);
+  }
+  if (reading.idNumber && data.idNumber && compact(reading.idNumber) !== compact(data.idNumber)) mismatches.push(['warn', `The ID No. on the form (${data.idNumber}) differs from the ID (${reading.idNumber})`]);
+  if (reading.dateOfBirth && isValidDateOnly(data.dateOfBirth) && reading.dateOfBirth !== data.dateOfBirth) mismatches.push(['warn', `The birthday on the ID (${reading.dateOfBirth}) differs from the form (${data.dateOfBirth})`]);
+  if (!mismatches.length) add('idMatch', 'ID belongs to the applicant', 'pass', `The ID is in the name of ${reading.name}${reading.idNumber ? `, ID No. ${reading.idNumber}` : ''}.`);
+  else add('idMatch', 'ID belongs to the applicant', mismatches.some(([status]) => status === 'fail') ? 'fail' : 'warn', `${mismatches.map(([, message]) => message).join('. ')}.`);
+}
+
+// The applicant's 2x2 picture: the one in the form's photo box when AI can
+// recognise the face in it, otherwise one the admin uploads.
+function checkPhoto(scan, authenticity, add) {
+  if (scan.photo_path) {
+    const reading = scan.photo_check || {};
+    const issues = reading.issues?.length ? ` AI noted: ${reading.issues.join('; ')}.` : '';
+    if (reading.error) add('photo', '2x2 picture', 'warn', `AI could not check the uploaded 2x2 picture (${reading.error}). Open it and check it yourself, or upload it again.`);
+    else if (reading.portrait === false || reading.faceVisible === false) add('photo', '2x2 picture', 'fail', `The uploaded picture does not show the applicant's face clearly.${issues} Upload a clear 2x2 picture.`);
+    else if (reading.screen) add('photo', '2x2 picture', 'warn', `The uploaded picture looks like a screen photo or an edited image.${issues}`);
+    else if (reading.portrait === null || reading.faceVisible === null) add('photo', '2x2 picture', 'warn', `AI could not confirm that the uploaded picture shows the applicant's face.${issues}`);
+    else add('photo', '2x2 picture', 'pass', `2x2 picture uploaded; the face is clear.${issues}`);
+    return;
+  }
+  if (authenticity.photoRecognized === true) add('photo', '2x2 picture', 'pass', 'The 2x2 picture on the form shows the applicant\'s face clearly.');
+  else if (authenticity.photoRecognized === false) add('photo', '2x2 picture', 'fail', 'The 2x2 picture on the form cannot be recognized. Upload the applicant\'s 2x2 picture.');
+  else add('photo', '2x2 picture', 'warn', 'AI could not tell whether the form has a clear 2x2 picture. Check the form, or upload the applicant\'s 2x2 picture.');
 }
 
 const pesoText = (cents) => `PHP ${(cents / 100).toLocaleString('en-PH', { minimumFractionDigits: 2 })}`;
@@ -355,7 +517,19 @@ async function checkRecords(db, documentType, data, add) {
     )).rows[0];
     if (duplicate) add('records', 'Not already registered', 'fail', `This applicant appears to be already registered as ${duplicate.member_number}.`);
     else add('records', 'Not already registered', 'pass', 'No existing member has the same email, RSBSA number, or name and birth date.');
-    return {};
+
+    const idNumber = compact(data.idNumber || '');
+    if (idNumber.length >= 5) {
+      const holder = (await db.query(`SELECT member_number FROM members WHERE regexp_replace(LOWER(COALESCE(id_number, '')), '[^a-z0-9]', '', 'g') = $1 LIMIT 1`, [idNumber])).rows[0];
+      if (holder) add('idRegistered', 'ID not used by another member', 'fail', `ID No. ${data.idNumber} is already registered to member ${holder.member_number}.`);
+    }
+    const age = String(data.age || '').trim();
+    if (isValidDateOnly(data.dateOfBirth) && /^\d+$/.test(age) && Math.abs(ageOn(data.dateOfBirth) - Number(age)) > 1) {
+      add('age', 'Age matches the birthday', 'warn', `The form says age ${age}, but the birthday ${data.dateOfBirth} makes the applicant ${ageOn(data.dateOfBirth)}.`);
+    }
+    if (!String(data.membershipDate || '').trim()) add('acceptance', 'Acceptance date', 'pass', `The form has no acceptance date yet; today (${todayDateOnly()}) will be the membership date.`);
+    // The system gives the membership number; shown so it can be written on the paper form.
+    return { memberNumber: await nextMemberNumber(db) };
   }
 
   if (documentType === 'Kadiwa Sales Form') {
@@ -417,6 +591,8 @@ export async function verifyDocument(req, scan, { documentType, extractedData, a
   checkAuthenticity(definition, authenticity, confidence, add);
   checkFields(definition, extractedData, add);
   const target = await checkRecords({ query }, documentType, extractedData, add);
+  if (definition.requiresIdDocument) checkIdDocument(scan, extractedData, add);
+  if (definition.photoExpected) checkPhoto(scan, authenticity, add);
 
   const twin = await findPostedTwin({ query }, scan.id, documentType, extractedData);
   if (twin) add('duplicate', 'Not already posted', 'fail', `The same form data was already posted from scan #${twin.id} (${twin.posted_module} ${twin.posted_record_id}).`);
@@ -478,6 +654,12 @@ function collateralOf(value) {
   return String(value).trim();
 }
 
+function membershipTypeOf(value) {
+  const text = String(value || '').trim();
+  if (!text) return DEFAULT_MEMBERSHIP_TYPE;
+  return ['Regular', 'Associate', 'Lifetime'].find((type) => text.toLowerCase().startsWith(type.toLowerCase().slice(0, 4))) || text;
+}
+
 function savingsMethodOf(value) {
   const text = String(value || '').trim().toLowerCase();
   if (!text) return 'Deposit';
@@ -488,19 +670,39 @@ function savingsMethodOf(value) {
 // the caller's transaction. Returns { module, recordId, label }.
 async function saveToModule(client, req, scan, documentType, data, target) {
   if (documentType === 'Membership Form') {
+    if (!scan.id_document_path) throw badRequest('The applicant\'s valid ID must be submitted before the membership form is saved.');
+    const children = CHILD_ROWS.map((row) => ({ name: String(data[`child${row}Name`] || '').trim(), age: String(data[`child${row}Age`] || '').trim() })).filter((child) => child.name || child.age);
+    const incomeSources = INCOME_ROWS.map((row) => ({ source: String(data[`income${row}Source`] || '').trim(), amount: String(data[`income${row}Amount`] || '').trim() })).filter((income) => income.source || income.amount);
+    const incomeCents = incomeSources.reduce((sum, income) => sum + (moneyCents(income.amount) || 0), 0);
     const body = {
       first_name: data.firstName, middle_name: data.middleName, last_name: data.lastName, suffix: data.suffix, email: data.email, phone: data.phone,
-      address: data.address, barangay: data.barangay, municipality: data.municipality, province: data.province, date_of_birth: data.dateOfBirth || undefined,
-      gender: data.gender, civil_status: data.civilStatus, rsbsa_no: data.rsbsaNo, livelihood: data.livelihood, farm_area_ha: data.farmAreaHa,
-      membership_date: data.membershipDate, share_capital: data.shareCapital, status: 'active',
+      address: [data.address, data.barangay, data.municipality, data.province].filter(Boolean).join(', '),
+      barangay: data.barangay, municipality: data.municipality, province: data.province, date_of_birth: data.dateOfBirth || undefined,
+      gender: data.gender, civil_status: data.civilStatus, education: data.education, id_type: data.idType, id_number: data.idNumber,
+      rsbsa_no: data.rsbsaNo, livelihood: incomeSources[0]?.source, farm_area_ha: data.farmAreaHa, yearly_income: incomeCents ? (incomeCents / 100).toFixed(2) : undefined,
+      spouse_name: data.spouseName, spouse_age: data.spouseAge, spouse_contact: data.spouseContact,
+      children: children.filter((child) => child.name).map((child) => `${child.name} (${child.age || 'Age not provided'})`).join('; '),
+      membership_date: data.membershipDate || todayDateOnly(), share_capital: data.shareCapital, status: 'active',
+      additional_info: {
+        motherMaidenName: [data.motherFirstName, data.motherMiddleName, data.motherLastName].filter(Boolean).join(' '),
+        motherLastName: data.motherLastName, motherFirstName: data.motherFirstName, motherMiddleName: data.motherMiddleName,
+        children, incomeSources, membershipType: membershipTypeOf(data.membershipType), separationDate: data.separationDate, bodResolution: data.bodResolution,
+        // The For Cooperative certifications, under the keys the Add Member form uses.
+        membershipFee: data.membershipFee, dateReceived: data.dateReceived, initialPaidUpCapital: data.shareCapital,
+        preMembershipSeminar: data.seminarOrNo || data.seminarCertifiedBy ? 'Yes' : 'No', seminarOrNumber: data.seminarOrNo, seminarCertifiedBy: data.seminarCertifiedBy,
+        paymentOfMembershipFee: data.membershipFeeOrNo || data.feeCertifiedBy ? 'Yes' : 'No', orNumber: data.membershipFeeOrNo, feeCertifiedBy: data.feeCertifiedBy,
+        capitalOrNumber: data.paidUpCapitalOrNo, capitalCertifiedBy: data.capitalCertifiedBy,
+      },
     };
     const { errors, values } = validateMemberInput(body);
     const shareCapitalCents = parseShareCapital(body, errors);
     if (errors.length) throw badRequest(errors[0], errors);
-    // The scanned membership form is kept as the member's supporting document.
+    // The applicant's ID submitted with the scan becomes the member's ID
+    // document; the scanned form itself stays in the OCR records.
+    // An uploaded 2x2 picture becomes the member's photo.
     const { id, memberNumber } = await insertMemberRecord(client, req, {
-      body, values, shareCapitalCents, source: 'ocr', idDocumentRef: scan.stored_file_path,
-      idDocument: { originalname: scan.original_file_name, mimetype: scan.mime_type, size: Number(scan.file_size) },
+      body, values, shareCapitalCents, source: 'ocr', idDocumentRef: scan.id_document_path, photoRef: scan.photo_path || null,
+      idDocument: { originalname: scan.id_document_name, mimetype: scan.id_document_type, size: Number(scan.id_document_size) },
     });
     return {
       module: 'members', recordId: memberNumber, databaseId: Number(id), label: `Member ${memberNumber} registered`,

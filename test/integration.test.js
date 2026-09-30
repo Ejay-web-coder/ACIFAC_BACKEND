@@ -18,6 +18,9 @@ let stubServer;
 let stubMode = 'ok';
 const DEFAULT_STUB_ANALYSIS = { documentType: 'Payment Receipt', confidence: 92, ocrText: 'Receipt 123', extractedData: { 'Member Name': 'Juan Dela Cruz', 'Payment Amount': '500.00' } };
 let stubAnalysis = DEFAULT_STUB_ANALYSIS;
+// What the stub AI answers when it is asked to read an applicant's ID or check their 2x2 picture.
+let stubIdReading = {};
+let stubPhotoReading = {};
 const geminiCalls = [];
 let pool;
 const sentEmails = [];
@@ -143,8 +146,10 @@ before(async () => {
         return;
       }
       if (stubMode === 'fail') { res.writeHead(500); res.end('{}'); return; }
+      const prompt = String(JSON.parse(Buffer.concat(chunks).toString() || '{}').messages?.[0]?.content || '');
+      const answer = prompt.includes('valid ID that an applicant submits') ? stubIdReading : prompt.includes('2x2 ID picture that an applicant submits') ? stubPhotoReading : stubAnalysis;
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(stubAnalysis) } }] }));
+      res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(answer) } }] }));
     });
   }).listen(0);
   process.env.OCR_AI_URL = `http://127.0.0.1:${stubServer.address().port}/v1/chat/completions`;
@@ -735,15 +740,124 @@ test('ocr: scanned forms are verified, posted to their module, and fakes are blo
   }, 'upload');
   assert.ok(badTotals.verification.checks.some((check) => check.id === 'totals' && check.status === 'fail'));
 
-  // A scanned membership form registers the applicant, with the scan kept as their document.
+  // A scanned membership form waits for the applicant's valid ID, and for a 2x2 picture when the one on
+  // the form cannot be recognized; the system gives the membership number.
   const membership = await scan({
-    documentType: 'Membership Form', confidence: 96, ocrText: 'ACIFAC MEMBERSHIP APPLICATION',
-    extractedData: { firstName: 'Rosa', lastName: 'Magsaysay', email: 'rosa.ocr@example.com', phone: '09181234567', address: 'Purok 3, Amnay', membershipDate: '2026-01-10', dateOfBirth: '03/15/1990' },
-    authenticity: genuine,
+    documentType: 'Membership Form', confidence: 96, ocrText: 'ACIFAC ASSOCIATE MEMBERSHIP FORM',
+    extractedData: {
+      lastName: 'Magsaysay', firstName: 'Rosa', email: 'rosa.ocr@example.com', phone: '09181234567', dateOfBirth: '03/15/1990', education: 'College',
+      address: 'Purok 3', barangay: 'Barahan', municipality: 'Sta. Cruz', province: 'Occidental Mindoro', motherLastName: 'Reyes', motherFirstName: 'Carmen',
+      child1Name: 'Ana Magsaysay', child1Age: '7', income1Source: 'Palay farming', income1Amount: '60,000', membershipFeeOrNo: 'OR-501',
+      seminarOrNo: 'OR-500', seminarCertifiedBy: 'Lorna Cruz',
+    },
+    authenticity: { ...genuine, photoRecognized: false },
   });
-  assert.equal(membership.posted?.module, 'members', JSON.stringify(membership.verification));
+  assert.equal(membership.requiresIdDocument, true);
+  assert.equal(membership.idDocument, null);
+  assert.equal(membership.posted, null);
+  assert.ok(membership.verification.checks.some((check) => check.id === 'idDocument' && check.status === 'fail'), JSON.stringify(membership.verification));
+  assert.ok(membership.verification.checks.some((check) => check.id === 'photo' && check.status === 'fail' && /cannot be recognized/.test(check.message)));
+  assert.equal(membership.photoExpected, true);
+  assert.equal(membership.photo, null);
+  assert.match(membership.verification.target.memberNumber, /^ACIFAC-\d{4}-\d{3}$/);
+  const withoutId = await admin.post(`/api/ocr/${membership.id}/post`, { documentType: 'Membership Form', extractedData: membership.extractedData, acknowledgeWarnings: true });
+  assert.equal(withoutId.status, 422);
+
+  const submitId = (scanId, source, reading, byte) => {
+    stubIdReading = reading;
+    const form = new FormData();
+    form.append('source', source);
+    form.append('idDocument', new Blob([Buffer.concat([PNG, Buffer.from([byte])])], { type: 'image/png' }), `id-${byte}.png`);
+    return admin.request('POST', `/api/ocr/${scanId}/id-document`, { form });
+  };
+  const idCopy = {
+    isId: true, idType: 'PhilSys National ID', idNumber: '1234-5678-9012', name: 'ROSA MAGSAYSAY', dateOfBirth: '1990-03-15',
+    frontVisible: true, backVisible: true, photocopy: true, physicalCard: false, screen: false, signatureCount: 3, expired: false, issues: [],
+  };
+  const liveCard = { ...idCopy, photocopy: false, physicalCard: true, signatureCount: 0 };
+
+  // A back-to-back copy needs three specimen signatures. The ID number comes from the ID when the form left it blank.
+  const twoSigned = await submitId(membership.id, 'upload', { ...idCopy, signatureCount: 2 }, 1);
+  assert.equal(twoSigned.status, 200, JSON.stringify(twoSigned.data));
+  assert.equal(twoSigned.data.data.posted, null);
+  assert.equal(twoSigned.data.data.idDocument.source, 'upload');
+  assert.ok(twoSigned.data.data.verification.checks.some((check) => check.id === 'idDocument' && check.status === 'fail' && /2 specimen signatures/.test(check.message)));
+  assert.equal(twoSigned.data.data.extractedData.idNumber, '1234-5678-9012');
+
+  // Someone else's ID is refused, and a live camera capture must be a picture.
+  const otherPerson = await submitId(membership.id, 'camera', { ...liveCard, name: 'Pedro Penduko' }, 2);
+  assert.equal(otherPerson.data.data.posted, null);
+  assert.ok(otherPerson.data.data.verification.checks.some((check) => check.id === 'idMatch' && check.status === 'fail'));
+  const pdfForm = new FormData();
+  pdfForm.append('source', 'camera');
+  pdfForm.append('idDocument', new Blob([Buffer.from('%PDF-1.4 id')], { type: 'application/pdf' }), 'id.pdf');
+  assert.equal((await admin.request('POST', `/api/ocr/${membership.id}/id-document`, { form: pdfForm })).status, 400);
+
+  // The applicant's ID card captured with the live camera passes; the form still waits for the 2x2 picture.
+  const captured = await submitId(membership.id, 'camera', liveCard, 3);
+  assert.equal(captured.status, 200, JSON.stringify(captured.data));
+  assert.equal(captured.data.data.posted, null);
+  assert.ok(captured.data.data.verification.checks.some((check) => check.id === 'idDocument' && check.status === 'pass'));
+  assert.match(captured.data.message, /2x2 picture/);
+
+  const uploadPhoto = (reading, byte) => {
+    stubPhotoReading = reading;
+    const form = new FormData();
+    form.append('photo', new Blob([Buffer.concat([PNG, Buffer.from([byte])])], { type: 'image/png' }), `photo-${byte}.png`);
+    return admin.request('POST', `/api/ocr/${membership.id}/photo`, { form });
+  };
+  // A picture without a clear face is refused; a clear 2x2 picture completes the form, which is then saved automatically.
+  const blurred = await uploadPhoto({ portrait: true, faceVisible: false, screen: false, issues: ['blurred'] }, 6);
+  assert.equal(blurred.status, 200, JSON.stringify(blurred.data));
+  assert.equal(blurred.data.data.posted, null);
+  assert.ok(blurred.data.data.verification.checks.some((check) => check.id === 'photo' && check.status === 'fail'));
+  const pictured = await uploadPhoto({ portrait: true, faceVisible: true, screen: false, issues: [] }, 7);
+  assert.equal(pictured.status, 200, JSON.stringify(pictured.data));
+  const saved = pictured.data.data;
+  assert.equal(saved.posted?.module, 'members', JSON.stringify(saved.verification));
+  assert.equal(saved.posted.recordId, membership.verification.target.memberNumber);
+  assert.equal(saved.idDocument.source, 'camera');
   const created = await admin.get(`/api/members?search=${encodeURIComponent('rosa.ocr@example.com')}`);
-  assert.ok(JSON.stringify(created.data).includes(membership.posted.recordId));
+  const rosa = created.data.data.find((row) => row.member_number === saved.posted.recordId);
+  assert.ok(rosa, JSON.stringify(created.data));
+  const { data: { data: detail } } = await admin.get(`/api/members/${rosa.id}`);
+  assert.equal(detail.id_number, '1234-5678-9012');
+  assert.equal(detail.id_type, 'PhilSys National ID');
+  assert.equal(detail.education, 'College');
+  assert.equal(detail.address, 'Purok 3, Barahan, Sta. Cruz, Occidental Mindoro');
+  assert.equal(Number(detail.yearly_income), 60000);
+  assert.equal(detail.livelihood, 'Palay farming');
+  assert.equal(detail.additional_info.membershipType, 'Associate');
+  assert.equal(detail.additional_info.motherMaidenName, 'Carmen Reyes');
+  assert.equal(detail.additional_info.orNumber, 'OR-501');
+  assert.equal(detail.additional_info.paymentOfMembershipFee, 'Yes');
+  assert.equal(detail.additional_info.seminarOrNumber, 'OR-500');
+  assert.equal(detail.additional_info.seminarCertifiedBy, 'Lorna Cruz');
+  assert.equal(detail.additional_info.preMembershipSeminar, 'Yes');
+  assert.deepEqual(detail.additional_info.children, [{ name: 'Ana Magsaysay', age: '7' }]);
+  // The submitted ID, not the scanned form, is the member's ID document.
+  assert.equal(detail.id_document_name, 'id-3.png');
+  const idFile = await admin.request('GET', `/api/members/${rosa.id}/documents/id-document`, { raw: true });
+  assert.deepEqual(Buffer.from(await idFile.arrayBuffer()), Buffer.concat([PNG, Buffer.from([3])]));
+  const scanId = await admin.request('GET', `/api/ocr/${membership.id}/id-document`, { raw: true });
+  assert.equal(scanId.status, 200);
+  // The uploaded 2x2 picture is the member's photo.
+  const photo = await admin.request('GET', `/api/members/${rosa.id}/documents/photo`, { raw: true });
+  assert.deepEqual(Buffer.from(await photo.arrayBuffer()), Buffer.concat([PNG, Buffer.from([7])]));
+
+  // Replacing the member's ID and photo later keeps the scan's copies.
+  const replaceForm = new FormData();
+  replaceForm.append('idDocument', new Blob([Buffer.concat([PNG, Buffer.from([9])])], { type: 'image/png' }), 'new-id.png');
+  replaceForm.append('profilePhoto', new Blob([Buffer.concat([PNG, Buffer.from([10])])], { type: 'image/png' }), 'new-photo.png');
+  const replacedDocs = await admin.request('POST', `/api/members/${rosa.id}/documents`, { form: replaceForm });
+  assert.equal(replacedDocs.status, 200, JSON.stringify(replacedDocs.data));
+  assert.equal((await admin.request('GET', `/api/ocr/${membership.id}/id-document`, { raw: true })).status, 200);
+  assert.equal((await admin.request('GET', `/api/ocr/${membership.id}/photo`, { raw: true })).status, 200);
+
+  // Once saved the ID and picture cannot change, and only membership forms take them.
+  assert.equal((await submitId(membership.id, 'upload', idCopy, 4)).status, 409);
+  assert.equal((await uploadPhoto({ portrait: true, faceVisible: true }, 8)).status, 409);
+  assert.equal((await submitId(fake.id, 'upload', idCopy, 5)).status, 400);
 
   stubAnalysis = DEFAULT_STUB_ANALYSIS;
 });
