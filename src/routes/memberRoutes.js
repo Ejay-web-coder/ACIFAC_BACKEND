@@ -12,6 +12,7 @@ import {
   listArchivedMembers,
   listMembers,
   listSavingsRecords,
+  replaceMemberDocuments,
   restoreMember,
   updateMember,
 } from '../controllers/memberController.js';
@@ -45,6 +46,13 @@ router.post('/', memberDocumentUpload.fields([
 ]), createMember);
 router.get('/:id', getMember);
 router.get('/:id/documents/:kind', downloadMemberDocument);
+router.post('/:id/documents', memberDocumentUpload.fields([
+  { name: 'idDocument', maxCount: 1 },
+  { name: 'profilePhoto', maxCount: 1 },
+  { name: 'signature1', maxCount: 1 },
+  { name: 'signature2', maxCount: 1 },
+  { name: 'signature3', maxCount: 1 },
+]), replaceMemberDocuments);
 router.post('/:id/share-contributions', addShareContribution);
 router.put('/:id', updateMember);
 router.patch('/:id/archive', archiveMember);

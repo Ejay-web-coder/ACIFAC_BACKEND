@@ -226,6 +226,28 @@ test('members: create, validate, duplicate, view document, update, archive, rest
   const noSignature = await admin.request('GET', `/api/members/${state.secondMemberId}/documents/signature-1`, { raw: true });
   assert.equal(noSignature.status, 404);
 
+  // Edit Member replaces single files; the rest are kept.
+  const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
+  const replaceForm = new FormData();
+  replaceForm.append('signature2', new Blob([JPEG], { type: 'image/jpeg' }), 'signature-2.jpg');
+  const replacedDocs = await admin.request('POST', `/api/members/${state.memberId}/documents`, { form: replaceForm });
+  assert.equal(replacedDocs.status, 200, JSON.stringify(replacedDocs.data));
+  assert.equal(replacedDocs.data.data.signature_count, 3);
+  const newSignature = await admin.request('GET', `/api/members/${state.memberId}/documents/signature-2`, { raw: true });
+  assert.deepEqual(Buffer.from(await newSignature.arrayBuffer()), JPEG);
+  const keptSignature = await admin.request('GET', `/api/members/${state.memberId}/documents/signature-3`, { raw: true });
+  assert.deepEqual(Buffer.from(await keptSignature.arrayBuffer()), PNG);
+  // A member without signatures gets them in order.
+  const firstForm = new FormData();
+  firstForm.append('signature3', new Blob([PNG], { type: 'image/png' }), 's.png');
+  firstForm.append('idDocument', new Blob([JPEG], { type: 'image/jpeg' }), 'new-id.jpg');
+  const firstSignature = await admin.request('POST', `/api/members/${state.secondMemberId}/documents`, { form: firstForm });
+  assert.equal(firstSignature.status, 200);
+  assert.equal(firstSignature.data.data.signature_count, 1);
+  assert.equal(firstSignature.data.data.id_document_name, 'new-id.jpg');
+  const empty = await admin.request('POST', `/api/members/${state.memberId}/documents`, { form: new FormData() });
+  assert.equal(empty.status, 400);
+
   const detail = await admin.get(`/api/members/${state.memberId}`);
   const updated = await admin.put(`/api/members/${state.memberId}`, { ...detail.data.data, phone: '09179999999', membership_date: detail.data.data.membership_date });
   assert.equal(updated.status, 200, JSON.stringify(updated.data));
@@ -287,6 +309,8 @@ test('accounts: create member login, setup link, forced password change', { skip
 });
 
 test('authorization: members cannot read other members or admin data', { skip }, async () => {
+  const memberUpload = await member.request('POST', `/api/members/${state.secondMemberId}/documents`, { form: new FormData() });
+  assert.equal(memberUpload.status, 403);
   for (const url of ['/api/members', '/api/members/statistics', '/api/members/archived', '/api/members/savings', `/api/members/${state.secondMemberId}`, `/api/members/${state.secondMemberId}/documents/id-document`, '/api/admin/loans', '/api/admin/accounts', '/api/kadiwa', '/api/ocr', '/api/machinery']) {
     const response = await member.get(url);
     assert.equal(response.status, 403, url);

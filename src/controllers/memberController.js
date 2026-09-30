@@ -667,6 +667,74 @@ export async function updateMember(req, res) {
   return res.status(200).json({ success: true, data: mapMember(updated), message: 'Member updated successfully.' });
 }
 
+// Edit Member: replaces the 2x2 photo, the valid ID and/or single specimen
+// signatures (signature1..signature3). Files not sent are kept. New files are
+// stored first; the old ones are deleted only after the database is updated.
+export async function replaceMemberDocuments(req, res) {
+  const id = parseId(req.params.id, 'member ID');
+  const idDocument = req.files?.idDocument?.[0] || null;
+  const profilePhoto = req.files?.profilePhoto?.[0] || null;
+  const signatures = [1, 2, 3].map((number) => req.files?.[`signature${number}`]?.[0] || null);
+  if (!idDocument && !profilePhoto && !signatures.some(Boolean)) throw badRequest('No files were provided.');
+  if (idDocument) assertValidUpload(idDocument, DOCUMENT_TYPES, 'ID document');
+  if (profilePhoto) assertValidUpload(profilePhoto, IMAGE_TYPES, 'profile photo');
+  signatures.forEach((signature) => { if (signature) assertValidUpload(signature, IMAGE_TYPES, 'signature'); });
+
+  const folder = `members/${todayDateOnly().slice(0, 7)}`;
+  const stored = [];
+  const store = async (bucket, file) => {
+    const reference = await uploadFile({ bucket, folder, file });
+    stored.push(reference);
+    return reference;
+  };
+
+  const replaced = [];
+  let updated;
+  try {
+    const idDocumentRef = idDocument ? await store(BUCKETS.memberDocuments, idDocument) : null;
+    const photoRef = profilePhoto ? await store(BUCKETS.memberPhotos, profilePhoto) : null;
+    const signatureRefs = [];
+    for (const signature of signatures) signatureRefs.push(signature ? await store(BUCKETS.memberDocuments, signature) : null);
+
+    updated = await withTransaction(async (client) => {
+      const before = (await client.query('SELECT id, member_number, status, id_document_path, profile_photo, signature_paths FROM members WHERE id = $1 FOR UPDATE', [id])).rows[0];
+      if (!before) throw notFound('Member not found.');
+      if (before.status === 'archived') throw badRequest('Restore this member before editing.');
+      const paths = [...(before.signature_paths || [])];
+      signatureRefs.forEach((reference, index) => {
+        if (!reference) return;
+        if (paths[index]) replaced.push(paths[index]);
+        paths[index] = reference;
+      });
+      // A member with fewer than three signatures gets the new ones in order, without gaps.
+      const signaturePaths = paths.filter(Boolean);
+      // An ID that came from an OCR scan is the scan's own file; the scan keeps it.
+      if (idDocumentRef && before.id_document_path) {
+        const scanned = await client.query('SELECT 1 FROM document_scans WHERE stored_file_path = $1 LIMIT 1', [before.id_document_path]);
+        if (!scanned.rowCount) replaced.push(before.id_document_path);
+      }
+      if (photoRef && before.profile_photo) replaced.push(before.profile_photo);
+      await client.query(
+        `UPDATE members SET id_document_path = COALESCE($2, id_document_path),
+                            id_document_name = CASE WHEN $2::text IS NULL THEN id_document_name ELSE $3 END,
+                            id_document_type = CASE WHEN $2::text IS NULL THEN id_document_type ELSE $4 END,
+                            id_document_size = CASE WHEN $2::text IS NULL THEN id_document_size ELSE $5::integer END,
+                            profile_photo = COALESCE($6, profile_photo), signature_paths = $7::text[], updated_at = NOW()
+         WHERE id = $1`,
+        [id, idDocumentRef, idDocument ? safeOriginalName(idDocument.originalname) : null, idDocument?.mimetype ?? null, idDocument?.size ?? null, photoRef, signaturePaths]
+      );
+      const changed = [idDocument && 'valid ID', profilePhoto && '2x2 photo', ...signatures.map((signature, index) => signature && `signature ${index + 1}`)].filter(Boolean);
+      await createAuditLog({ client, user: req.user, action: 'MEMBER_DOCUMENTS_UPDATED', module: 'Members', entityType: 'member', entityId: String(id), description: `Replaced ${changed.join(', ')} of member ${before.member_number}`, ...getRequestMeta(req) });
+      return (await client.query(`${memberSelect} WHERE m.id = $1`, [id])).rows[0];
+    });
+  } catch (error) {
+    for (const reference of stored) await removeFile(reference);
+    throw error;
+  }
+  for (const reference of replaced) await removeFile(reference).catch(() => {});
+  return res.status(200).json({ success: true, data: mapMember(updated), message: 'Member documents updated.' });
+}
+
 async function changeArchiveState(req, res, archive) {
   const id = parseId(req.params.id, 'member ID');
   const member = await withTransaction(async (client) => {
