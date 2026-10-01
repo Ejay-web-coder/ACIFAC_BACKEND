@@ -74,6 +74,41 @@ const admin = new Client();
 const member = new Client();
 const state = {};
 
+// A loan application as the form sends it: AI reads the borrower's and the
+// co-maker's IDs as they are picked, then the application is posted with both files.
+const BORROWER_ID = {
+  isId: true, idType: 'PhilSys National ID', idNumber: '1111-2222-3333', name: 'JUAN DELA CRUZ', dateOfBirth: '1980-05-20', address: 'Purok 1, Amnay, Sta. Cruz',
+  frontVisible: true, backVisible: true, photocopy: true, physicalCard: false, screen: false, signatureCount: 3, expired: false, issues: [],
+};
+const CO_MAKER_ID = { ...BORROWER_ID, idType: 'Driver\'s License', idNumber: 'D01-23-456789', name: 'PEDRO CRUZ', dateOfBirth: '1984-02-11', address: 'Purok 2, Amnay, Sta. Cruz' };
+const CO_MAKER = { coMakerName: 'Pedro Cruz', coMakerAddress: 'Purok 2, Amnay', coMakerContact: '09181112222', coMakerRelationship: 'Brother' };
+let idFiles = 0;
+const idFile = () => { idFiles += 1; return Buffer.concat([PNG, Buffer.from([0xee, idFiles % 256, Math.floor(idFiles / 256)])]); };
+
+async function readLoanId(client, holder, reading, file, source = 'upload') {
+  stubIdReading = reading;
+  const form = new FormData();
+  form.append('holder', holder);
+  form.append('source', source);
+  form.append('idDocument', new Blob([file], { type: 'image/png' }), `${holder}-id.png`);
+  return client.request('POST', '/api/loans/id-reading', { form });
+}
+
+async function applyWithIds(client, url, application, { borrower = BORROWER_ID, coMaker = CO_MAKER_ID, acknowledgeIdWarnings = false, swapFile = false } = {}) {
+  const form = new FormData();
+  form.append('application', JSON.stringify({ ...CO_MAKER, ...application }));
+  for (const [holder, reading] of [['borrower', borrower], ['coMaker', coMaker]]) {
+    if (!reading) continue;
+    const file = idFile();
+    const read = await readLoanId(client, holder, reading, file);
+    assert.equal(read.status, 201, JSON.stringify(read.data));
+    form.append(`${holder}IdReading`, String(read.data.readingId));
+    form.append(`${holder}Id`, new Blob([swapFile ? idFile() : file], { type: 'image/png' }), `${holder}-id.png`);
+  }
+  if (acknowledgeIdWarnings) form.append('acknowledgeIdWarnings', 'true');
+  return client.request('POST', url, { form });
+}
+
 // Emails are sent after the response; waits for one to arrive.
 async function waitForMail(predicate, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
@@ -147,7 +182,7 @@ before(async () => {
       }
       if (stubMode === 'fail') { res.writeHead(500); res.end('{}'); return; }
       const prompt = String(JSON.parse(Buffer.concat(chunks).toString() || '{}').messages?.[0]?.content || '');
-      const answer = prompt.includes('valid ID that an applicant submits') ? stubIdReading : prompt.includes('2x2 ID picture that an applicant submits') ? stubPhotoReading : stubAnalysis;
+      const answer = prompt.startsWith('You check the valid ID that') ? stubIdReading : prompt.includes('2x2 ID picture that an applicant submits') ? stubPhotoReading : stubAnalysis;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(answer) } }] }));
     });
@@ -361,12 +396,12 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   const quote = await member.post('/api/loans/quote', { farmArea: '2', amount: '50000', term: 12 });
   assert.deepEqual([quote.data.quote.maximumEligibleAmount, quote.data.quote.calculatedInterest, quote.data.quote.totalRepayment, quote.data.quote.monthlyPayment], ['100000.00', '1250.00', '51250.00', '4270.83']);
 
-  const tooMuch = await member.post('/api/members/me/loan-requests', { loanType: 'agricultural', amount: '150000', term: 12, purpose: 'Seeds', farmArea: '2' });
+  const tooMuch = await applyWithIds(member, '/api/members/me/loan-requests', { loanType: 'agricultural', amount: '150000', term: 12, purpose: 'Seeds', farmArea: '2' });
   assert.equal(tooMuch.status, 400);
-  const applied = await member.post('/api/members/me/loan-requests', { loanType: 'agricultural', amount: '50000', term: 12, purpose: 'Rice seeds and fertilizer', farmArea: '2', totalRepayment: '1' });
+  const applied = await applyWithIds(member, '/api/members/me/loan-requests', { loanType: 'agricultural', amount: '50000', term: 12, purpose: 'Rice seeds and fertilizer', farmArea: '2', totalRepayment: '1' });
   assert.equal(applied.status, 201, JSON.stringify(applied.data));
   assert.equal(applied.data.request.totalRepayment, '51250.00', 'client-sent totals are ignored');
-  const twice = await member.post('/api/members/me/loan-requests', { loanType: 'agricultural', amount: '1000', term: 12, purpose: 'x', farmArea: '2' });
+  const twice = await applyWithIds(member, '/api/members/me/loan-requests', { loanType: 'agricultural', amount: '1000', term: 12, purpose: 'x', farmArea: '2' });
   assert.equal(twice.status, 409);
 
   const adminNotes = await admin.get('/api/notifications');
@@ -430,8 +465,22 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   assert.equal(mine.data.data.loans[0].status, 'paid');
   assert.equal(mine.data.data.payments.length, 2);
 
-  const declined = await member.post('/api/members/me/loan-requests', { loanType: 'emergency', amount: '1000', term: 3, purpose: 'Repair', farmArea: '2' });
+  const declined = await applyWithIds(member, '/api/members/me/loan-requests', { loanType: 'emergency', amount: '1000', term: 3, purpose: 'Repair', farmArea: '2' });
   const decline = await admin.patch(`/api/admin/loan-requests/${declined.data.request.id}`, { status: 'declined', reason: 'Incomplete documents' });
+
+  // The paper-form layout sends the cash amount; the server adds the farm inputs to it.
+  const paper = { loanType: 'agricultural', term: 12, farmArea: '2', borrowerPhone: '09171234567', borrowerAddress: 'Purok 1, Amnay', cropsPlanted: 'Palay', certified: true };
+  const noCash = await applyWithIds(member, '/api/members/me/loan-requests', { ...paper, loanMode: 'cash', cashAmount: '' });
+  assert.equal(noCash.status, 400);
+  const combined = await applyWithIds(member, '/api/members/me/loan-requests', {
+    ...paper, loanMode: 'combination', cashAmount: '10000', amount: '1',
+    inKindItems: [{ item: 'Fertilizer', description: 'Urea', quantity: '10', unit: 'bags', unitPrice: '1500' }, { item: 'Seeds', quantity: '2.5', unit: 'bags', unitPrice: '1000.10' }],
+  });
+  assert.equal(combined.status, 201, JSON.stringify(combined.data));
+  assert.equal(combined.data.request.amount, '27500.25', 'cash 10,000 + fertilizer 15,000 + seeds 2,500.25');
+  assert.equal(combined.data.request.purpose, 'Agricultural loan for Palay (combination).');
+  assert.equal(combined.data.request.inKindItems.length, 2);
+  await admin.patch(`/api/admin/loan-requests/${combined.data.request.id}`, { status: 'declined', reason: 'test cleanup' });
   assert.equal(decline.status, 200);
   const memberNotes = await member.get('/api/notifications');
   assert.ok(memberNotes.data.data.some((n) => n.type === 'loan_declined' && /Incomplete documents/.test(n.message)));
@@ -637,6 +686,95 @@ test('kadiwa: sales decrement stock, reject overselling and race safely', { skip
   const finalStock = Number(final.data.inventory.find((item) => item.id === 'INV-001').stock);
   assert.equal(finalStock, remaining - Number(half));
   assert.ok(finalStock >= 0);
+});
+
+test('loans: applications typed into the app need the borrower and co-maker IDs with 3 signatures', { skip }, async () => {
+  const paper = { loanType: 'agricultural', loanMode: 'cash', cashAmount: '5000', term: 12, farmArea: '2', borrowerPhone: '09171234567', borrowerAddress: 'Purok 1, Amnay', cropsPlanted: 'Palay', certified: true };
+  const url = '/api/members/me/loan-requests';
+
+  // No IDs, no co-maker, or one ID missing: refused.
+  const json = await member.post(url, { ...paper, ...CO_MAKER });
+  assert.equal(json.status, 422, JSON.stringify(json.data));
+  assert.match(json.data.message, /Submit the borrower's valid ID/);
+  const noCoMaker = await applyWithIds(member, url, { ...paper, coMakerName: '', coMakerAddress: '', coMakerContact: '', coMakerRelationship: '' });
+  assert.equal(noCoMaker.status, 400);
+  assert.match(noCoMaker.data.message, /co-maker's valid ID is required/);
+  const borrowerOnly = await applyWithIds(member, url, paper, { coMaker: null });
+  assert.equal(borrowerOnly.status, 422);
+  assert.match(borrowerOnly.data.message, /Submit the co-maker's valid ID/);
+
+  // The reading must be for the file submitted, and for the person it is submitted as.
+  const swapped = await applyWithIds(member, url, paper, { swapFile: true });
+  assert.equal(swapped.status, 400);
+  assert.match(swapped.data.message, /not the one AI read/);
+  const read = await readLoanId(member, 'coMaker', CO_MAKER_ID, idFile());
+  const asBorrower = new FormData();
+  asBorrower.append('application', JSON.stringify({ ...paper, ...CO_MAKER }));
+  asBorrower.append('borrowerIdReading', String(read.data.readingId));
+  assert.equal((await member.request('POST', url, { form: asBorrower })).status, 400);
+  assert.equal((await readLoanId(member, 'spouse', BORROWER_ID, idFile())).status, 400);
+  const pdf = new FormData();
+  pdf.append('holder', 'borrower'); pdf.append('source', 'camera');
+  pdf.append('idDocument', new Blob([Buffer.from('%PDF-1.4 id')], { type: 'application/pdf' }), 'id.pdf');
+  assert.equal((await member.request('POST', '/api/loans/id-reading', { form: pdf })).status, 400);
+
+  // Two signatures, someone else's ID, or the borrower's own ID for the co-maker: refused.
+  const twoSigned = await applyWithIds(member, url, paper, { borrower: { ...BORROWER_ID, signatureCount: 2 } });
+  assert.equal(twoSigned.status, 422);
+  assert.match(twoSigned.data.message, /2 specimen signatures; 3 are required/);
+  const stranger = await applyWithIds(member, url, paper, { borrower: { ...BORROWER_ID, name: 'MARIA SANTOS' } });
+  assert.equal(stranger.status, 422);
+  assert.match(stranger.data.message, /not the borrower/);
+  const sameId = await applyWithIds(member, url, paper, { coMaker: BORROWER_ID });
+  assert.equal(sameId.status, 422);
+  assert.match(sameId.data.errors.join(' '), /borrower's name/);
+  const pending = await admin.get('/api/admin/loan-requests?status=pending&limit=100');
+  assert.equal(pending.data.requests.filter((r) => Number(r.memberDatabaseId) === state.memberId).length, 0, 'nothing was saved');
+
+  // The form previews the checks before submitting.
+  const borrowerRead = await readLoanId(member, 'borrower', BORROWER_ID, idFile());
+  const coMakerRead = await readLoanId(member, 'coMaker', { ...CO_MAKER_ID, address: 'Poblacion, Sablayan' }, idFile());
+  assert.equal(borrowerRead.data.reading.name, 'JUAN DELA CRUZ');
+  const preview = await member.post('/api/loans/id-checks', { borrowerIdReading: borrowerRead.data.readingId, coMakerIdReading: coMakerRead.data.readingId, ...CO_MAKER, borrowerAddress: 'Purok 1, Amnay', borrowerAge: '46' });
+  assert.equal(preview.status, 200, JSON.stringify(preview.data));
+  const previewed = Object.fromEntries(preview.data.checks.map((check) => [check.id, check.status]));
+  assert.deepEqual(previewed, { idDocument: 'pass', idMatch: 'pass', coMakerId: 'pass', coMakerMatch: 'warn' });
+  assert.equal((await admin.post('/api/loans/id-checks', { memberId: state.memberId, borrowerIdReading: borrowerRead.data.readingId })).status, 400, 'a reading belongs to whoever asked for it');
+
+  // A member's application with an ID warning is sent for approval with the warning; the approver sees both IDs.
+  const warned = await applyWithIds(member, url, paper, { coMaker: { ...CO_MAKER_ID, address: 'Poblacion, Sablayan' } });
+  assert.equal(warned.status, 201, JSON.stringify(warned.data));
+  const { idDocuments } = warned.data.request;
+  assert.deepEqual(Object.keys(idDocuments).sort(), ['borrower', 'coMaker']);
+  assert.equal(idDocuments.borrower.path, undefined, 'storage paths are not sent');
+  assert.equal(idDocuments.borrower.reading.signatureCount, 3);
+  assert.ok(idDocuments.coMaker.checks.some((check) => check.id === 'coMakerMatch' && check.status === 'warn'));
+  const requestId = warned.data.request.id;
+  const borrowerFile = await admin.request('GET', `/api/admin/loan-requests/${requestId}/id-documents/borrower`, { raw: true });
+  assert.equal(borrowerFile.status, 200);
+  assert.equal((await member.request('GET', `/api/admin/loan-requests/${requestId}/id-documents/borrower`, { raw: true })).status, 403);
+  assert.equal((await admin.request('GET', `/api/admin/loan-requests/${requestId}/id-documents/spouse`, { raw: true })).status, 404);
+
+  // Approval keeps the IDs with the loan.
+  const approved = await admin.patch(`/api/admin/loan-requests/${requestId}`, { status: 'approved' });
+  assert.equal(approved.status, 200, JSON.stringify(approved.data));
+  const loan = (await admin.get(`/api/admin/loans/${approved.data.loanId}`)).data.loan;
+  assert.deepEqual(Object.keys(loan.idDocuments).sort(), ['borrower', 'coMaker']);
+  const loanFile = await admin.request('GET', `/api/admin/loans/${approved.data.loanId}/id-documents/coMaker`, { raw: true });
+  assert.equal(loanFile.status, 200);
+
+  // An admin releasing a loan at once must confirm ID warnings.
+  const direct = { ...paper, memberId: state.memberId, cashAmount: '3000' };
+  const unconfirmed = await applyWithIds(admin, '/api/admin/loans', direct, { coMaker: { ...CO_MAKER_ID, address: 'Poblacion, Sablayan' } });
+  assert.equal(unconfirmed.status, 422);
+  assert.match(unconfirmed.data.message, /Confirm that you compared the flagged ID details/);
+  const released = await applyWithIds(admin, '/api/admin/loans', direct, { coMaker: { ...CO_MAKER_ID, address: 'Poblacion, Sablayan' }, acknowledgeIdWarnings: true });
+  assert.equal(released.status, 201, JSON.stringify(released.data));
+  assert.deepEqual(Object.keys(released.data.loan.idDocuments).sort(), ['borrower', 'coMaker']);
+  const audit = await pool.query(`SELECT new_values FROM audit_logs WHERE action = 'LOAN_CREATED' AND entity_id = $1`, [String(released.data.loan.databaseId)]);
+  assert.equal(audit.rows[0].new_values.ids.borrower.signatures, 3);
+  // These loans are not part of the analytics test that follows.
+  await pool.query('DELETE FROM loans WHERE id = ANY($1::int[])', [[approved.data.loanId, released.data.loan.databaseId]]);
 });
 
 test('ocr: upload, classify, duplicate, failure recorded and retried, review saved', { skip }, async () => {
@@ -894,9 +1032,71 @@ test('ocr: the paper Agri loan form becomes a pending loan application', { skip 
     return response.data.data;
   };
 
-  const posted = await scan(paperForm(), 91);
+  // A complete, genuine loan form waits for the borrower's and the co-maker's IDs.
+  const read = await scan(paperForm(), 91);
+  assert.equal(read.posted, null);
+  assert.deepEqual(read.idRequirements.map((requirement) => requirement.slot), ['holder', 'coMaker']);
+  assert.deepEqual(read.idDocuments, { holder: null, coMaker: null });
+  for (const id of ['idDocument', 'coMakerId']) assert.ok(read.verification.checks.some((check) => check.id === id && check.status === 'fail'), id);
+  assert.ok(read.verification.checks.some((check) => check.id === 'term'));
+  assert.ok(!read.verification.checks.some((check) => check.id === 'amounts' && check.status === 'fail'));
+  const withoutIds = await admin.post(`/api/ocr/${read.id}/post`, { documentType: 'Loan Form', extractedData: read.extractedData, acknowledgeWarnings: true });
+  assert.equal(withoutIds.status, 422);
+
+  const submitId = (path, source, reading, byte) => {
+    stubIdReading = reading;
+    const form = new FormData();
+    form.append('source', source);
+    form.append('idDocument', new Blob([Buffer.concat([PNG, Buffer.from([byte])])], { type: 'image/png' }), `loan-id-${byte}.png`);
+    return admin.request('POST', `/api/ocr/${read.id}/${path}`, { form });
+  };
+  const signedCopy = {
+    isId: true, idType: 'PhilSys National ID', idNumber: '1111-2222-3333', name: 'JUAN DELA CRUZ', dateOfBirth: '1980-05-20', address: 'Purok 1, Amnay, Sta. Cruz, Occidental Mindoro',
+    frontVisible: true, backVisible: true, photocopy: true, physicalCard: false, screen: false, signatureCount: 3, expired: false, issues: [],
+  };
+  const coMakerCopy = { ...signedCopy, idType: 'Driver\'s License', idNumber: 'D01-23-456789', name: 'PEDRO CRUZ', dateOfBirth: '1984-02-11', address: 'Purok 2, Amnay, Sta. Cruz' };
+
+  // The borrower's own ID cannot be the co-maker's ID.
+  const borrowersAsCoMaker = await submitId('co-maker-id', 'upload', signedCopy, 101);
+  assert.equal(borrowersAsCoMaker.status, 200, JSON.stringify(borrowersAsCoMaker.data));
+  assert.equal(borrowersAsCoMaker.data.data.idDocuments.coMaker.source, 'upload');
+  assert.ok(borrowersAsCoMaker.data.data.verification.checks.some((check) => check.id === 'coMakerMatch' && check.status === 'fail' && /borrower's name/.test(check.message)));
+
+  // Without 3 specimen signatures the borrower's ID is refused, even taken with the camera.
+  const twoSigned = await submitId('id-document', 'camera', { ...signedCopy, signatureCount: 2, photocopy: false, physicalCard: true }, 102);
+  assert.equal(twoSigned.status, 200, JSON.stringify(twoSigned.data));
+  assert.ok(twoSigned.data.data.verification.checks.some((check) => check.id === 'idDocument' && check.status === 'fail' && /2 specimen signatures/.test(check.message)));
+  // Someone else's ID is not the borrower's.
+  const stranger = await submitId('id-document', 'upload', { ...signedCopy, name: 'MARIA SANTOS', dateOfBirth: '1990-01-01' }, 103);
+  const strangerMatch = stranger.data.data.verification.checks.find((check) => check.id === 'idMatch');
+  assert.equal(strangerMatch.status, 'fail');
+  assert.match(strangerMatch.message, /not the borrower on the form/);
+
+  // The borrower's signed copy taken with the camera: name, birthday on record, age and address agree.
+  const borrower = await submitId('id-document', 'camera', signedCopy, 104);
+  assert.equal(borrower.data.data.posted, null);
+  assert.equal(borrower.data.data.idDocuments.holder.source, 'camera');
+  assert.equal(borrower.data.data.idDocuments.holder.reading.address, signedCopy.address);
+  const borrowerChecks = Object.fromEntries(borrower.data.data.verification.checks.map((check) => [check.id, check]));
+  assert.equal(borrowerChecks.idDocument.status, 'pass', JSON.stringify(borrowerChecks.idDocument));
+  assert.equal(borrowerChecks.idMatch.status, 'pass', JSON.stringify(borrowerChecks.idMatch));
+  assert.match(borrowerChecks.idMatch.message, /birthday and address match/);
+  assert.equal(borrowerChecks.coMakerMatch.status, 'fail', 'the co-maker ID on file is still the borrower\'s');
+
+  // A loan form takes no 2x2 picture.
+  const photoForm = new FormData();
+  photoForm.append('photo', new Blob([Buffer.concat([PNG, Buffer.from([105])])], { type: 'image/png' }), 'photo.png');
+  assert.equal((await admin.request('POST', `/api/ocr/${read.id}/photo`, { form: photoForm })).status, 400);
+
+  // The co-maker's own ID completes the form, which is then saved automatically.
+  const completed = await submitId('co-maker-id', 'upload', coMakerCopy, 106);
+  assert.equal(completed.status, 200, JSON.stringify(completed.data));
+  const posted = completed.data.data;
   assert.equal(posted.posted?.module, 'loans', JSON.stringify(posted.verification));
-  assert.ok(posted.verification.checks.some((check) => check.id === 'term'));
+  assert.ok(posted.verification.checks.some((check) => check.id === 'coMakerMatch' && check.status === 'pass'));
+  assert.equal((await admin.request('GET', `/api/ocr/${read.id}/co-maker-id`, { raw: true })).status, 200);
+  assert.equal((await admin.request('GET', `/api/ocr/${read.id}/id-document`, { raw: true })).status, 200);
+  assert.equal((await submitId('co-maker-id', 'upload', coMakerCopy, 107)).status, 409);
   const requests = await admin.get('/api/admin/loan-requests?status=pending&limit=100');
   const request = requests.data.requests.find((r) => String(r.id) === posted.posted.recordId);
   assert.equal(Number(request.amount), 30000, 'cash 10,000 + in-kind 20,000');
@@ -905,11 +1105,22 @@ test('ocr: the paper Agri loan form becomes a pending loan application', { skip 
   assert.equal(request.collateralType, 'Harvest');
   assert.equal(request.inKindItems.length, 2);
   assert.equal(request.coMakerName, 'Pedro Cruz');
+  assert.equal(request.idDocuments.borrower.scanId, read.id);
+  assert.equal(request.idDocuments.coMaker.reading.name, 'PEDRO CRUZ');
+  assert.equal((await admin.request('GET', `/api/admin/loan-requests/${request.id}/id-documents/coMaker`, { raw: true })).status, 200);
 
   const wrongTotals = await scan(paperForm({ formNo: 'LF-0099', fertilizerTotal: '14,000', grandTotal: '19000' }), 92);
   assert.equal(wrongTotals.posted, null);
   assert.ok(wrongTotals.verification.checks.some((check) => check.id === 'amounts' && check.status === 'fail'));
+
+  // The borrower cannot be their own co-maker, and only a loan form takes a co-maker's ID.
+  const selfCoMaker = await scan(paperForm({ formNo: 'LF-0100', coMakerName: 'Juan Dela Cruz' }), 93);
+  assert.ok(selfCoMaker.verification.checks.some((check) => check.id === 'coMaker' && check.status === 'fail'));
   stubAnalysis = DEFAULT_STUB_ANALYSIS;
+  const receipt = await scan({ ...DEFAULT_STUB_ANALYSIS }, 94);
+  const receiptId = new FormData();
+  receiptId.append('idDocument', new Blob([Buffer.concat([PNG, Buffer.from([108])])], { type: 'image/png' }), 'id.png');
+  assert.equal((await admin.request('POST', `/api/ocr/${receipt.id}/co-maker-id`, { form: receiptId })).status, 400);
 });
 
 test('ocr: retired or busy Gemini models fall back, and failed readings can be retried', { skip }, async () => {
@@ -966,7 +1177,7 @@ test('member emails: savings, share capital, loan application, scanned forms, op
   assert.equal((await waitForMail(/share capital contribution recorded/i, 1)).length >= 1, true);
 
   const applicationsBefore = mailsFor(/received your loan application/i).length;
-  const applied = await member.post('/api/members/me/loan-requests', { loanType: 'personal', loanMode: 'cash', purpose: 'Seeds', amount: '5000', term: '6', farmArea: '2', borrowerPhone: '09171234567', borrowerAddress: 'Purok 1, Amnay' });
+  const applied = await applyWithIds(member, '/api/members/me/loan-requests', { loanType: 'personal', loanMode: 'cash', purpose: 'Seeds', amount: '5000', term: '6', farmArea: '2', borrowerPhone: '09171234567', borrowerAddress: 'Purok 1, Amnay' });
   assert.equal(applied.status, 201, JSON.stringify(applied.data));
   const applicationMail = await waitForMail(/received your loan application/i, applicationsBefore + 1);
   assert.ok(applicationMail.some((mail) => mail.text.includes(`#${applied.data.request.id}`)));

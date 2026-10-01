@@ -5,10 +5,12 @@ import { AppError, badRequest, cleanString, conflict, currentUserId, getRequestM
 import { assertValidUpload, BUCKETS, downloadFile, removeFile, safeOriginalName, sendStoredFile, uploadFile } from '../services/storage.js';
 import { IMAGE_TYPES, DOCUMENT_TYPES as UPLOAD_TYPES } from '../middleware/upload.js';
 import {
-  buildAnalysisPrompt, buildIdPrompt, buildPhotoPrompt, DOCUMENT_TYPES, FORM_DEFINITIONS, isPostable, normalizeAuthenticity, normalizeDocumentType, normalizeExtractedData,
-  normalizeIdReading, normalizePhotoReading, photoExpected, postDocument, publicFormDefinitions, REQUIRED_ID_SIGNATURES, requiresIdDocument, UNRECOGNIZED, verifyDocument,
+  buildAnalysisPrompt, buildIdPrompt, buildPhotoPrompt, DOCUMENT_TYPES, FORM_DEFINITIONS, ID_SLOTS, idRequirement, idRequirements, isPostable, normalizeAuthenticity,
+  normalizeDocumentType, normalizeExtractedData, normalizeIdReading, normalizePhotoReading, photoExpected, postDocument, publicFormDefinitions, publicIdRequirements,
+  ID_READING_INSTRUCTION, REQUIRED_ID_SIGNATURES, requiresIdDocument, UNRECOGNIZED, verifyDocument,
 } from '../services/documentRouting.js';
 import { photoMimeType } from './profilePhotoController.js';
+import { aiFailureReason, askAi } from '../services/aiClient.js';
 import { emailMember } from '../services/memberEmails.js';
 import { todayDateOnly } from '../utils/dates.js';
 
@@ -20,6 +22,13 @@ const autoPostEnabled = () => String(process.env.OCR_AUTO_POST ?? 'true').toLowe
 
 const clean = (value) => cleanString(value, 200000);
 
+// A valid ID kept on the scan (slot: holder = applicant or borrower, coMaker).
+function mapIdDocument(row, slot) {
+  const columns = ID_SLOTS[slot];
+  if (!row[columns.path]) return null;
+  return { fileName: row[columns.name], mimeType: row[columns.type], size: Number(row[columns.size]), source: row[columns.source], reading: row[columns.check] || {} };
+}
+
 function mapScan(row) {
   return {
     id: Number(row.id), fileName: row.original_file_name, documentType: row.detected_document_type,
@@ -30,9 +39,10 @@ function mapScan(row) {
     postable: isPostable(row.detected_document_type), targetModule: FORM_DEFINITIONS[row.detected_document_type]?.moduleLabel || null,
     requiresIdDocument: requiresIdDocument(row.detected_document_type), photoExpected: photoExpected(row.detected_document_type),
     photo: row.photo_path ? { reading: row.photo_check || {} } : null,
-    idDocument: row.id_document_path ? {
-      fileName: row.id_document_name, mimeType: row.id_document_type, size: Number(row.id_document_size), source: row.id_document_source, reading: row.id_document_check || {},
-    } : null,
+    // The IDs the form needs, and those submitted. idDocument is the holder's, kept for older pages.
+    idRequirements: publicIdRequirements(row.detected_document_type),
+    idDocuments: Object.fromEntries(Object.keys(ID_SLOTS).map((slot) => [slot, mapIdDocument(row, slot)])),
+    idDocument: mapIdDocument(row, 'holder'),
     posted: row.posted_at ? { module: row.posted_module, recordId: row.posted_record_id, at: row.posted_at, automatically: row.posted_automatically } : null,
     createdAt: row.created_at, updatedAt: row.updated_at,
   };
@@ -49,11 +59,6 @@ function normalizeConfidence(value) {
     if (Number.isFinite(parsed)) return Math.max(0, Math.min(100, parsed));
   }
   return null;
-}
-
-function parseJson(text) {
-  if (!text) throw new Error('AI returned no analysis.');
-  return JSON.parse(text.replace(/^```json\s*|\s*```$/g, '').trim());
 }
 
 function parseModelResponse(json) {
@@ -74,87 +79,7 @@ const analyzeWithAi = async (file, captureSource) => parseModelResponse(await as
 const readPhotoWithAi = async (file) => normalizePhotoReading(await askAi(file, buildPhotoPrompt(),
   'Check this 2x2 ID picture: is it one person with a clear, recognizable face?'));
 
-// Why the AI could not answer, without the "press Retry" advice meant for scans.
-const aiFailureReason = (error) => (error instanceof Error ? error.message.replace(/\s*The document was saved.*$/, '') : 'AI analysis failed.').slice(0, 300);
-
-const readIdWithAi = async (file, source) => normalizeIdReading(await askAi(file, buildIdPrompt(source),
-  'Read this identification document: its type, number, name and birthday, which sides are shown, and the specimen signatures written around it.'));
-
-// Sends one file with its instructions to the AI and returns the JSON it answers.
-async function askAi(file, systemPrompt, instruction) {
-  const geminiKey = process.env.GEMINI_API_KEY;
-  if (geminiKey) return askGemini(file, geminiKey, systemPrompt, instruction);
-
-  const endpoint = process.env.OCR_AI_URL || 'https://api.openai.com/v1/chat/completions';
-  const apiKey = process.env.OCR_AI_API_KEY || process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error('The OCR/AI service is not configured. Set GEMINI_API_KEY or OCR_AI_API_KEY on the server.');
-
-  const base64 = file.buffer.toString('base64');
-  const dataUrl = `data:${file.mimetype};base64,${base64}`;
-  const content = [{ type: 'text', text: `${instruction} Return JSON only.` }];
-  if (file.mimetype.startsWith('image/')) content.push({ type: 'image_url', image_url: { url: dataUrl, detail: 'high' } });
-  else content.push({ type: 'text', text: `The uploaded file is a PDF named ${file.originalname}. Use the available document input capability to inspect it.` });
-
-  const response = await fetch(endpoint, {
-    signal: AbortSignal.timeout(45000),
-    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: process.env.OCR_AI_MODEL || 'gpt-4o-mini', temperature: 0, response_format: { type: 'json_object' },
-      messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content }],
-    }),
-  });
-  if (!response.ok) throw new Error(response.status === 429 || response.status >= 500 ? 'The AI service is busy right now. The document was saved; press Retry in a minute.' : `AI service returned ${response.status}.`);
-  const reply = (await response.json())?.choices?.[0]?.message?.content;
-  return parseJson(Array.isArray(reply) ? reply.map((part) => part.text || '').join('') : reply);
-}
-
-// Google retires Gemini models over time (gemini-2.5-flash now answers 404
-// "no longer available") and models are sometimes overloaded (503/429). The
-// configured model is tried first, then these, all within one time budget so
-// the request finishes before the 60-second serverless limit.
-const GEMINI_FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash'];
-const AI_TIME_BUDGET_MS = 45000;
-
-async function askGemini(file, apiKey, systemPrompt, instruction) {
-  const models = [...new Set([process.env.GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS].filter(Boolean))];
-  const deadline = Date.now() + AI_TIME_BUDGET_MS;
-  const body = JSON.stringify({
-    generationConfig: { temperature: 0, responseMimeType: 'application/json' },
-    systemInstruction: { parts: [{ text: systemPrompt }] },
-    contents: [{ parts: [
-      { text: instruction },
-      { inlineData: { mimeType: file.mimetype, data: file.buffer.toString('base64') } },
-    ] }],
-  });
-
-  let lastProblem = 'unavailable';
-  for (const model of models) {
-    const remaining = deadline - Date.now();
-    if (remaining < 3000) break;
-    let response;
-    try {
-      response = await fetch(`${process.env.GEMINI_API_BASE || 'https://generativelanguage.googleapis.com/v1beta'}/models/${encodeURIComponent(model)}:generateContent`, {
-        method: 'POST', signal: AbortSignal.timeout(remaining), headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body,
-      });
-    } catch (error) {
-      lastProblem = error?.name === 'TimeoutError' ? 'timeout' : 'network';
-      console.warn(`Gemini ${model} ${lastProblem}:`, error instanceof Error ? error.message : error);
-      continue;
-    }
-    if (response.ok) {
-      const payload = await response.json();
-      return parseJson(payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join(''));
-    }
-    const detail = (await response.json().catch(() => ({})))?.error?.message || '';
-    console.warn(`Gemini ${model} returned ${response.status}: ${String(detail).slice(0, 200)}`);
-    if (response.status === 401 || response.status === 403) throw new Error('The AI service rejected the API key. Check GEMINI_API_KEY on the server.');
-    if (response.status === 400) throw new Error('The AI service could not read this file. Try a clearer photo or a PDF.');
-    lastProblem = response.status === 404 ? 'retired' : response.status === 429 ? 'busy' : 'unavailable';
-  }
-  throw new Error(lastProblem === 'busy' || lastProblem === 'unavailable' || lastProblem === 'timeout'
-    ? 'The AI service (Google Gemini) is busy right now. The document was saved; press Retry in a minute.'
-    : 'The AI service could not be reached. The document was saved; press Retry in a minute.');
-}
+const readIdWithAi = async (file, source, documentType, slot) => normalizeIdReading(await askAi(file, buildIdPrompt(source, documentType, slot), ID_READING_INSTRUCTION));
 
 // Upload/capture -> validate -> store privately -> AI OCR, classification and
 // authenticity check -> save scan -> verify against the database -> post to the
@@ -232,14 +157,17 @@ async function saveVerification(id, verification) {
   return (await query('UPDATE document_scans SET verification = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [JSON.stringify(verification), id])).rows[0];
 }
 
-// What a scanned membership form still needs from the admin: the applicant's
-// ID, and a 2x2 picture when the one on the form could not be recognised.
+// What a scanned form still needs from the admin: the valid IDs (the
+// membership applicant's, or the loan borrower's and co-maker's), and a 2x2
+// picture when the one on a membership form could not be recognised.
 function missingRequirements(scan) {
-  const missing = [];
-  if (requiresIdDocument(scan.detected_document_type) && !scan.id_document_path) missing.push(`the applicant's valid ID with ${REQUIRED_ID_SIGNATURES} specimen signatures (or the ID captured with the live camera)`);
+  const missing = idRequirements(scan.detected_document_type).filter((requirement) => !scan[ID_SLOTS[requirement.slot].path])
+    .map((requirement) => `the ${requirement.person}'s valid ID with ${REQUIRED_ID_SIGNATURES} specimen signatures${requirement.cardCapture ? ' (or the ID captured with the live camera)' : ''}`);
   if (photoExpected(scan.detected_document_type) && !scan.photo_path && scan.authenticity?.photoRecognized !== true) missing.push('a 2x2 picture, because the one on the form cannot be recognized');
   return missing;
 }
+
+const listed = (items) => (items.length > 2 ? `${items.slice(0, -1).join(', ')}, and ${items.at(-1)}` : items.join(' and '));
 
 // Verifies a scan against the records and posts it when every check passes
 // with high confidence. Verification and posting are separate steps: if they
@@ -257,7 +185,7 @@ async function verifyAndAutoPost(req, scan, message) {
       return { scan: posted.scan, message: `Verified and saved automatically: ${posted.result.label}.` };
     }
     const missing = missingRequirements(current);
-    if (missing.length) return { scan: current, message: `Membership form read. Now submit ${missing.join(' and ')}.` };
+    if (missing.length) return { scan: current, message: `${current.detected_document_type.replace(/ Form$/, ' form')} read. Now submit ${listed(missing)}.` };
     if (isPostable(current.detected_document_type)) {
       return { scan: current, message: verification.status === 'failed' ? 'Verification found problems. Review the document before it can be posted.' : 'Document verified with warnings. Review and confirm before posting.' };
     }
@@ -435,78 +363,98 @@ export async function retryDocument(req, res) {
   return res.status(200).json({ success: true, data: mapScan(verified.scan), message: verified.message });
 }
 
-function assertTakesRequirements(scan) {
+// slot: the ID being submitted (holder or coMaker); photo: the 2x2 picture.
+function assertTakesRequirements(scan, { slot, photo = false }) {
   if (!scan) throw notFound('Document scan not found.');
-  if (scan.posted_at) throw conflict('This document was already saved; its ID and picture can no longer be changed.');
+  if (scan.posted_at) throw conflict('This document was already saved; its IDs and picture can no longer be changed.');
   if (scan.review_status === 'rejected') throw conflict('This document was rejected.');
-  if (!requiresIdDocument(scan.detected_document_type)) throw badRequest('Only a scanned membership form needs the applicant\'s ID and 2x2 picture.');
+  if (photo && !photoExpected(scan.detected_document_type)) throw badRequest('Only a scanned membership form takes a 2x2 picture.');
+  if (slot && !idRequirement(scan.detected_document_type, slot)) {
+    throw badRequest(slot === 'coMaker' ? 'Only a scanned loan form takes the co-maker\'s ID.' : 'Only a scanned membership or loan form takes a valid ID.');
+  }
 }
 
-// POST /api/ocr/:id/id-document (multipart: idDocument, source = upload | camera)
+// POST /api/ocr/:id/id-document and /api/ocr/:id/co-maker-id
+// (multipart: idDocument, source = upload | camera)
 // A scanned membership form is saved only with the applicant's valid ID: an
 // uploaded back-to-back copy with three specimen signatures, or the ID card
-// captured with the live camera. AI reads the ID, the form is verified again
-// with it, and saved automatically when every check passes.
-export async function attachIdDocument(req, res) {
-  const id = parseId(req.params.id, 'document ID');
-  const file = req.file;
-  assertValidUpload(file, UPLOAD_TYPES, 'ID');
-  const source = req.body?.source === 'camera' ? 'camera' : 'upload';
-  if (source === 'camera' && !file.mimetype.startsWith('image/')) throw badRequest('A live camera capture must be a picture.');
-  assertTakesRequirements((await query('SELECT * FROM document_scans WHERE id = $1', [id])).rows[0]);
+// captured with the live camera. A scanned loan form is saved only with the
+// borrower's ID (id-document) and the co-maker's ID (co-maker-id), each a
+// back-to-back copy with their three specimen signatures, uploaded or taken
+// with the camera. AI reads the ID, the form is verified again with it, and
+// saved automatically when every check passes.
+function attachIdTo(slot) {
+  const columns = ID_SLOTS[slot];
+  return async (req, res) => {
+    const id = parseId(req.params.id, 'document ID');
+    const file = req.file;
+    assertValidUpload(file, UPLOAD_TYPES, 'ID');
+    const source = req.body?.source === 'camera' ? 'camera' : 'upload';
+    if (source === 'camera' && !file.mimetype.startsWith('image/')) throw badRequest('A camera capture must be a picture.');
+    const row = (await query('SELECT * FROM document_scans WHERE id = $1', [id])).rows[0];
+    assertTakesRequirements(row, { slot });
+    const documentType = row.detected_document_type;
+    const { person, cardCapture } = idRequirement(documentType, slot);
 
-  // An unreadable ID is still kept; verification then asks the admin to check it.
-  let reading;
-  try {
-    reading = await readIdWithAi(file, source);
-  } catch (error) {
-    console.error('OCR ID reading error:', error instanceof Error ? error.message : error);
-    reading = { ...normalizeIdReading(null), error: aiFailureReason(error) };
-  }
+    // An unreadable ID is still kept; verification then asks the admin to check it.
+    let reading;
+    try {
+      reading = await readIdWithAi(file, source, documentType, slot);
+    } catch (error) {
+      console.error('OCR ID reading error:', error instanceof Error ? error.message : error);
+      reading = { ...normalizeIdReading(null), error: aiFailureReason(error) };
+    }
 
-  const storedRef = await uploadFile({ bucket: BUCKETS.memberDocuments, folder: `members/${todayDateOnly().slice(0, 7)}`, file });
-  let previousRef = null;
-  let scan;
-  try {
-    scan = await withTransaction(async (client) => {
-      const before = (await client.query('SELECT * FROM document_scans WHERE id = $1 FOR UPDATE', [id])).rows[0];
-      assertTakesRequirements(before);
-      previousRef = before.id_document_path;
-      // The ID type and number are taken from the ID when the form left them blank.
-      const extractedData = { ...(before.extracted_data || {}) };
-      if (!String(extractedData.idType || '').trim() && reading.idType) extractedData.idType = reading.idType;
-      if (!String(extractedData.idNumber || '').trim() && reading.idNumber) extractedData.idNumber = reading.idNumber;
-      const updated = (await client.query(
-        `UPDATE document_scans SET id_document_path = $1, id_document_name = $2, id_document_type = $3, id_document_size = $4, id_document_source = $5,
-                id_document_check = $6, extracted_data = $7, updated_at = NOW()
-         WHERE id = $8 RETURNING *`,
-        [storedRef, safeOriginalName(file.originalname), file.mimetype, file.size, source, JSON.stringify(reading), JSON.stringify(extractedData), id]
-      )).rows[0];
-      await createAuditLog({
-        client,
-        user: req.user,
-        action: 'OCR_ID_ATTACHED',
-        module: 'OCR',
-        entityType: 'document_scan',
-        entityId: String(id),
-        description: `${previousRef ? 'Replaced' : 'Submitted'} the applicant's ID (${source === 'camera' ? 'live camera' : 'back-to-back copy'}) for ${before.original_file_name}`,
-        newValues: { file_name: safeOriginalName(file.originalname), source, id_type: reading.idType, signature_count: reading.signatureCount },
-        ...getRequestMeta(req),
+    const folder = FORM_DEFINITIONS[documentType].module === 'loans' ? 'loans' : 'members';
+    const storedRef = await uploadFile({ bucket: BUCKETS.memberDocuments, folder: `${folder}/${todayDateOnly().slice(0, 7)}`, file });
+    let previousRef = null;
+    let scan;
+    try {
+      scan = await withTransaction(async (client) => {
+        const before = (await client.query('SELECT * FROM document_scans WHERE id = $1 FOR UPDATE', [id])).rows[0];
+        assertTakesRequirements(before, { slot });
+        previousRef = before[columns.path];
+        // A membership form's ID type and number are taken from the ID when the form left them blank.
+        const extractedData = { ...(before.extracted_data || {}) };
+        const formKeys = FORM_DEFINITIONS[documentType].fields.map((field) => field.key);
+        if (slot === 'holder' && formKeys.includes('idType') && !String(extractedData.idType || '').trim() && reading.idType) extractedData.idType = reading.idType;
+        if (slot === 'holder' && formKeys.includes('idNumber') && !String(extractedData.idNumber || '').trim() && reading.idNumber) extractedData.idNumber = reading.idNumber;
+        const updated = (await client.query(
+          `UPDATE document_scans SET ${columns.path} = $1, ${columns.name} = $2, ${columns.type} = $3, ${columns.size} = $4, ${columns.source} = $5,
+                  ${columns.check} = $6, extracted_data = $7, updated_at = NOW()
+           WHERE id = $8 RETURNING *`,
+          [storedRef, safeOriginalName(file.originalname), file.mimetype, file.size, source, JSON.stringify(reading), JSON.stringify(extractedData), id]
+        )).rows[0];
+        const how = cardCapture && source === 'camera' ? 'live camera' : source === 'camera' ? 'back-to-back copy taken with the camera' : 'back-to-back copy';
+        await createAuditLog({
+          client,
+          user: req.user,
+          action: 'OCR_ID_ATTACHED',
+          module: 'OCR',
+          entityType: 'document_scan',
+          entityId: String(id),
+          description: `${previousRef ? 'Replaced' : 'Submitted'} the ${person}'s ID (${how}) for ${before.original_file_name}`,
+          newValues: { holder: person, file_name: safeOriginalName(file.originalname), source, id_type: reading.idType, signature_count: reading.signatureCount },
+          ...getRequestMeta(req),
+        });
+        return updated;
       });
-      return updated;
-    });
-  } catch (error) {
-    await removeFile(storedRef);
-    throw error;
-  }
-  if (previousRef) await removeFile(previousRef);
+    } catch (error) {
+      await removeFile(storedRef);
+      throw error;
+    }
+    if (previousRef) await removeFile(previousRef);
 
-  const verified = await verifyAndAutoPost(req, scan, 'ID submitted.');
-  return res.status(200).json({
-    success: true, data: mapScan(verified.scan),
-    message: reading.error ? `The ID was saved, but AI could not read it (${reading.error}). Check it yourself or submit it again.` : verified.message,
-  });
+    const verified = await verifyAndAutoPost(req, scan, 'ID submitted.');
+    return res.status(200).json({
+      success: true, data: mapScan(verified.scan),
+      message: reading.error ? `The ID was saved, but AI could not read it (${reading.error}). Check it yourself or submit it again.` : verified.message,
+    });
+  };
 }
+
+export const attachIdDocument = attachIdTo('holder');
+export const attachCoMakerId = attachIdTo('coMaker');
 
 // POST /api/ocr/:id/photo (multipart: photo)
 // The applicant's 2x2 picture, asked for when AI cannot recognise the one in
@@ -516,7 +464,7 @@ export async function attachPhoto(req, res) {
   const id = parseId(req.params.id, 'document ID');
   const file = req.file;
   assertValidUpload(file, IMAGE_TYPES, '2x2 picture');
-  assertTakesRequirements((await query('SELECT * FROM document_scans WHERE id = $1', [id])).rows[0]);
+  assertTakesRequirements((await query('SELECT * FROM document_scans WHERE id = $1', [id])).rows[0], { photo: true });
 
   let reading;
   try {
@@ -532,7 +480,7 @@ export async function attachPhoto(req, res) {
   try {
     scan = await withTransaction(async (client) => {
       const before = (await client.query('SELECT * FROM document_scans WHERE id = $1 FOR UPDATE', [id])).rows[0];
-      assertTakesRequirements(before);
+      assertTakesRequirements(before, { photo: true });
       previousRef = before.photo_path;
       const updated = (await client.query(
         'UPDATE document_scans SET photo_path = $1, photo_check = $2, updated_at = NOW() WHERE id = $3 RETURNING *',
@@ -573,14 +521,20 @@ export async function downloadPhoto(req, res) {
   return undefined;
 }
 
-export async function downloadIdDocument(req, res) {
-  const id = parseId(req.params.id, 'document ID');
-  const row = (await query('SELECT id_document_path, id_document_type, id_document_name FROM document_scans WHERE id = $1', [id])).rows[0];
-  if (!row?.id_document_path) throw notFound('No ID was submitted with this document.');
-  const sent = await sendStoredFile(res, { reference: row.id_document_path, mimeType: row.id_document_type, fileName: row.id_document_name });
-  if (!sent) throw notFound('The stored file is no longer available.');
-  return undefined;
+function downloadIdFrom(slot) {
+  const columns = ID_SLOTS[slot];
+  return async (req, res) => {
+    const id = parseId(req.params.id, 'document ID');
+    const row = (await query(`SELECT ${columns.path} AS path, ${columns.type} AS type, ${columns.name} AS name FROM document_scans WHERE id = $1`, [id])).rows[0];
+    if (!row?.path) throw notFound(slot === 'coMaker' ? 'No co-maker ID was submitted with this document.' : 'No ID was submitted with this document.');
+    const sent = await sendStoredFile(res, { reference: row.path, mimeType: row.type, fileName: row.name });
+    if (!sent) throw notFound('The stored file is no longer available.');
+    return undefined;
+  };
 }
+
+export const downloadIdDocument = downloadIdFrom('holder');
+export const downloadCoMakerId = downloadIdFrom('coMaker');
 
 export function listFormDefinitions(req, res) {
   return res.status(200).json({

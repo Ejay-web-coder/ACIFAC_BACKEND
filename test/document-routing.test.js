@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildAnalysisPrompt, buildIdPrompt, buildPhotoPrompt, isPostable, normalizeAuthenticity, normalizeDocumentType, normalizeExtractedData, normalizeIdReading,
-  normalizePhotoReading, photoExpected, publicFormDefinitions, requiresIdDocument, UNRECOGNIZED,
+  normalizePhotoReading, photoExpected, publicFormDefinitions, publicIdRequirements, requiresIdDocument, UNRECOGNIZED,
 } from '../src/services/documentRouting.js';
 
 test('document types: postable forms, legacy names and unknown values', () => {
@@ -60,7 +60,7 @@ test('the membership form follows the paper form and needs the applicant ID', ()
   assert.match(prompt, /system gives the membership number/);
   assert.ok(requiresIdDocument('Membership Form'));
   assert.equal(requiresIdDocument('Savings Form'), false);
-  assert.deepEqual(publicFormDefinitions().filter((form) => form.requiresIdDocument).map((form) => form.type), ['Membership Form']);
+  assert.deepEqual(publicFormDefinitions().filter((form) => form.requiresIdDocument).map((form) => form.type), ['Membership Form', 'Loan Form']);
 
   const data = normalizeExtractedData('Membership Form', { 'CP No.': '0917 123 4567', Birthday: '03/15/1990', child1Age: '7 ', income1Amount: '₱60,000' });
   assert.equal(data.phone, '0917 123 4567');
@@ -75,7 +75,7 @@ test('the ID reading is sanitised and the prompt fits how the ID was submitted',
     isId: true, idType: 'PhilSys National ID', idNumber: 1234, name: ' Rosa Magsaysay ', dateOfBirth: '03/15/1990', frontVisible: true, backVisible: 'yes',
     signatureCount: '3', expired: null, issues: ['glare', 5],
   }), {
-    isId: true, idType: 'PhilSys National ID', idNumber: '1234', name: 'Rosa Magsaysay', dateOfBirth: '1990-03-15', frontVisible: true, backVisible: null,
+    isId: true, idType: 'PhilSys National ID', idNumber: '1234', name: 'Rosa Magsaysay', dateOfBirth: '1990-03-15', address: '', frontVisible: true, backVisible: null,
     photocopy: null, physicalCard: null, screen: null, signatureCount: 3, expired: null, issues: ['glare', '5'],
   });
   assert.equal(normalizeIdReading({ signatureCount: 'three' }).signatureCount, null);
@@ -88,6 +88,30 @@ test('the ID reading is sanitised and the prompt fits how the ID was submitted',
   assert.match(buildIdPrompt('upload'), /3 specimen signatures/);
   assert.match(buildIdPrompt('camera'), /live camera/);
   assert.doesNotMatch(buildIdPrompt('camera'), /back-to-back copy/);
+  assert.equal(normalizeIdReading({ address: ' Purok 1, Amnay ' }).address, 'Purok 1, Amnay');
+});
+
+test('a scanned loan form needs the borrower and co-maker IDs, each with 3 specimen signatures', () => {
+  assert.ok(requiresIdDocument('Loan Form'));
+  assert.deepEqual(publicIdRequirements('Loan Form'), [
+    { slot: 'holder', person: 'borrower', label: 'Borrower\'s valid ID', cardCapture: false },
+    { slot: 'coMaker', person: 'co-maker', label: 'Co-maker\'s valid ID', cardCapture: false },
+  ]);
+  assert.deepEqual(publicIdRequirements('Membership Form').map((requirement) => requirement.cardCapture), [true]);
+  assert.deepEqual(publicIdRequirements('Savings Form'), []);
+  const loanForm = publicFormDefinitions().find((form) => form.type === 'Loan Form');
+  assert.equal(loanForm.fields.find((field) => field.key === 'coMakerName').required, true);
+
+  const borrower = buildIdPrompt('upload', 'Loan Form', 'holder');
+  assert.match(borrower, /the borrower submits with an ACIFAC cooperative loan application form/);
+  assert.match(borrower, /borrower's 3 specimen signatures/);
+  assert.match(borrower, /address/);
+  // A loan ID taken with the camera is still the signed copy, never the bare card.
+  const coMaker = buildIdPrompt('camera', 'Loan Form', 'coMaker');
+  assert.match(coMaker, /the co-maker submits/);
+  assert.match(coMaker, /co-maker's 3 specimen signatures/);
+  assert.match(coMaker, /phone camera/);
+  assert.doesNotMatch(coMaker, /signatureCount 0/);
 });
 
 test('the membership form 2x2 picture is checked on the form, or uploaded and checked', () => {

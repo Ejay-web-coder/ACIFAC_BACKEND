@@ -16,10 +16,10 @@ import {
   restoreMember,
   updateMember,
 } from '../controllers/memberController.js';
-import { createMemberLoanRequest } from '../controllers/loanController.js';
+import { createMemberLoanRequestWithIds } from '../controllers/loanIdController.js';
 import { getMyActivity } from '../controllers/memberActivityController.js';
 import { requireAdmin, requireAuth, requireMember } from '../middleware/auth.js';
-import { memberDocumentUpload } from '../middleware/upload.js';
+import { loanApplicationUpload, memberDocumentUpload } from '../middleware/upload.js';
 
 const router = express.Router();
 
@@ -27,7 +27,8 @@ router.use(requireAuth);
 
 // Member self-service: always scoped to the signed-in member's own record.
 router.get('/me', requireMember, getMyMemberData);
-router.post('/me/loan-requests', requireMember, createMemberLoanRequest);
+// An application comes with the borrower's and the co-maker's valid IDs.
+router.post('/me/loan-requests', requireMember, loanApplicationUpload, createMemberLoanRequestWithIds);
 router.get('/me/documents/:kind', requireMember, downloadMemberDocument);
 router.get('/me/activity', requireMember, getMyActivity);
 

@@ -32,12 +32,22 @@ const CHILD_ROWS = [1, 2, 3];
 const INCOME_ROWS = [1, 2];
 // The paper membership form is the associate member form.
 const DEFAULT_MEMBERSHIP_TYPE = 'Associate';
-// Specimen signatures required on an uploaded back-to-back copy of the ID.
+// Specimen signatures required on a back-to-back copy of a valid ID.
 export const REQUIRED_ID_SIGNATURES = 3;
+
+// Where each valid ID submitted with a scanned form is kept on document_scans:
+// holder = the membership applicant or the loan borrower; coMaker = the loan co-maker.
+export const ID_SLOTS = {
+  holder: { path: 'id_document_path', name: 'id_document_name', type: 'id_document_type', size: 'id_document_size', source: 'id_document_source', check: 'id_document_check' },
+  coMaker: { path: 'co_maker_id_path', name: 'co_maker_id_name', type: 'co_maker_id_type', size: 'co_maker_id_size', source: 'co_maker_id_source', check: 'co_maker_id_check' },
+};
 
 export const FORM_DEFINITIONS = {
   'Membership Form': {
-    module: 'members', moduleLabel: 'Membership Management', signatureExpected: true, requiresIdDocument: true, photoExpected: true,
+    module: 'members', moduleLabel: 'Membership Management', formName: 'membership form', signatureExpected: true, photoExpected: true,
+    // The applicant's ID: a back-to-back copy with the specimen signatures, or
+    // the ID card itself captured with the live camera (cardCapture).
+    idDocuments: [{ slot: 'holder', person: 'applicant', cardCapture: true, checkId: 'idDocument', matchId: 'idMatch' }],
     description: 'ACIFAC associate membership form (one page): name, birthday, age, civil status, gender, CP no., educational attainment, ID type and number, RSBSA no., farm area, permanent address, family members (spouse, mother\'s maiden name, children), sources of income, membership acceptance / separation, the applicant signature, and the "For Cooperative" certification section.',
     notes: 'Ignore the MEMBERSHIP NO. box at the top: the system gives the membership number. The form has no email; use "" for email unless one is written on it. phone is the CP #. address is only the house, street, sitio or purok written with the permanent address; barangay, municipality and province have their own keys. Mother\'s maiden name goes in motherLastName, motherFirstName and motherMiddleName. Children rows: child1Name/child1Age to child3Name/child3Age. Income rows: income1Source/income1Amount and income2Source/income2Amount (annual income). From the ACCEPTANCE row: membershipDate (its date), bodResolution and membershipType; from the SEPARATION row only separationDate. From FOR COOPERATIVE: membershipFee and dateReceived; the OR no. and certified-by name of the pre-membership education seminar (seminarOrNo, seminarCertifiedBy), the payment of membership fee (membershipFeeOrNo, feeCertifiedBy) and the initial paid-up capital (paidUpCapitalOrNo, capitalCertifiedBy); and shareCapital only when an initial paid-up capital amount is written.',
     fields: [
@@ -62,7 +72,12 @@ export const FORM_DEFINITIONS = {
     ],
   },
   'Loan Form': {
-    module: 'loans', moduleLabel: 'Loans & Payments (pending approval)', signatureExpected: true,
+    module: 'loans', moduleLabel: 'Loans & Payments (pending approval)', formName: 'loan application form', signatureExpected: true,
+    // The borrower's and the co-maker's IDs, each a back-to-back copy with their specimen signatures.
+    idDocuments: [
+      { slot: 'holder', person: 'borrower', checkId: 'idDocument', matchId: 'idMatch' },
+      { slot: 'coMaker', person: 'co-maker', checkId: 'coMakerId', matchId: 'coMakerMatch' },
+    ],
     description: 'ACIFAC "Loan Application Form (Agri)" for an agricultural loan, usually two pages: borrower details, farm details, loan mode with the in-kind farm inputs table, cash amount, co-maker, and collateral with the borrower signature.',
     notes: 'For the in-kind table use the keys <row>Description, <row>Quantity, <row>Unit, <row>UnitPrice and <row>Total for the rows fertilizer, pesticides, herbicides, insecticides, seeds and plantChemicals (Plant Chemicals for Spray); leave a row empty when it is not filled. loanMode is the ticked box: cash, in-kind or combination. sex is Male or Female. irrigationType is rainfed, irrigated or other. collateralType is the ticked box: Land Title / Property, Harvest, or Savings Deposit / Share Capital. Ignore the office-use approval section (APPROVED / DISAPPROVED / FOR EVALUATION and approved amounts).',
     fields: [
@@ -81,7 +96,7 @@ export const FORM_DEFINITIONS = {
         f(`${key}Total`, `${label} - Total Amount`, { kind: 'money' }),
       ]),
       f('grandTotal', 'In-Kind Grand Total', { kind: 'money' }), f('cashAmount', 'Cash Amount Requested (Php)', { kind: 'money' }),
-      f('coMakerName', 'Co-Maker Name'), f('coMakerAddress', 'Co-Maker Address'), f('coMakerContact', 'Co-Maker Contact No.'),
+      f('coMakerName', 'Co-Maker Name', { required: true }), f('coMakerAddress', 'Co-Maker Address'), f('coMakerContact', 'Co-Maker Contact No.'),
       f('coMakerRelationship', 'Relationship to Borrower'),
       f('collateralType', 'Collateral Offered'), f('collateralDetails', 'Description / Details of Collateral'),
       f('term', 'Loan Term (months) - not on the paper form; 12 if blank', { kind: 'integer' }),
@@ -133,16 +148,33 @@ export function isPostable(documentType) {
   return Boolean(FORM_DEFINITIONS[documentType]);
 }
 
+// "Borrower's valid ID", "Co-maker's valid ID", "Applicant's valid ID".
+export const idLabel = (person) => `${person.charAt(0).toUpperCase()}${person.slice(1)}'s valid ID`;
+
+// The valid IDs a scanned form must come with, in the order they are asked for.
+export function idRequirements(documentType) {
+  return FORM_DEFINITIONS[documentType]?.idDocuments || [];
+}
+
+export function idRequirement(documentType, slot) {
+  return idRequirements(documentType).find((requirement) => requirement.slot === slot) || null;
+}
+
+// What the admin page needs to ask for each ID.
+export function publicIdRequirements(documentType) {
+  return idRequirements(documentType).map(({ slot, person, cardCapture }) => ({ slot, person, label: idLabel(person), cardCapture: Boolean(cardCapture) }));
+}
+
 export function publicFormDefinitions() {
   return Object.entries(FORM_DEFINITIONS).map(([type, definition]) => ({
     type, module: definition.module, moduleLabel: definition.moduleLabel, description: definition.description,
-    requiresIdDocument: Boolean(definition.requiresIdDocument), photoExpected: Boolean(definition.photoExpected),
+    requiresIdDocument: requiresIdDocument(type), idDocuments: publicIdRequirements(type), photoExpected: Boolean(definition.photoExpected),
     fields: definition.fields.map(({ key, label, kind, required }) => ({ key, label, kind, required })),
   }));
 }
 
 export function requiresIdDocument(documentType) {
-  return Boolean(FORM_DEFINITIONS[documentType]?.requiresIdDocument);
+  return idRequirements(documentType).length > 0;
 }
 
 export function photoExpected(documentType) {
@@ -168,21 +200,29 @@ authenticity must be: { "score": number 0-100 (how likely this is a genuine, una
 Look for: altered, overwritten or erased values; mismatched fonts or ink inside a field; pasted or digitally edited areas; totals that do not add up; SAMPLE/SPECIMEN/VOID marks; screen moiré or pixels; missing signatures; a form that is not an ACIFAC/cooperative form. Report every problem found in issues.${captureSource === 'camera' ? '\nThis document was photographed with a phone camera at the office, so normal perspective, shadows and paper texture are expected and are not signs of tampering.' : ''}`;
 }
 
-// The applicant's valid ID submitted with a scanned membership form: an
-// uploaded back-to-back copy with specimen signatures, or the card itself
-// captured with the live camera (front and back joined into one picture).
-export function buildIdPrompt(source) {
-  return `You check the valid ID that an applicant submits with an ACIFAC cooperative membership form in the Philippines. Return JSON only with exactly these fields:
+export const ID_READING_INSTRUCTION = 'Read this identification document: its type, number, name, birthday and address, which sides are shown, and the specimen signatures written around it.';
+
+// A valid ID submitted with a scanned form: a back-to-back copy with the
+// person's specimen signatures (uploaded, or for a loan form also photographed
+// with the camera), or, for a membership applicant, the card itself captured
+// with the live camera (front and back joined into one picture).
+export function buildIdPrompt(source, documentType = 'Membership Form', slot = 'holder') {
+  const { person, cardCapture } = idRequirement(documentType, slot) || { person: 'applicant', cardCapture: true };
+  const formName = FORM_DEFINITIONS[documentType]?.formName || 'cooperative form';
+  const copy = source === 'camera'
+    ? 'the front and back of the ID on one page, photographed with a phone camera at the cooperative office (perspective and shadows are expected)'
+    : 'the front and back of the ID photocopied on one page';
+  return `You check the valid ID that ${person === 'applicant' ? 'an applicant' : `the ${person}`} submits with an ACIFAC cooperative ${formName} in the Philippines. Return JSON only with exactly these fields:
 isId (boolean: the file shows a valid identification card, e.g. PhilSys National ID, driver's license, UMID, SSS, passport, voter's ID, postal ID, PRC, senior citizen or barangay ID),
-idType (string), idNumber (string, as printed), name (string, the full name printed on the ID), dateOfBirth (YYYY-MM-DD, or ""),
+idType (string), idNumber (string, as printed), name (string, the full name printed on the ID), dateOfBirth (YYYY-MM-DD, or ""), address (string, the address printed on the ID, or ""),
 frontVisible (boolean: the front of the ID is shown), backVisible (boolean: the back of the ID is shown),
 photocopy (boolean: a paper photocopy or printout of the ID), physicalCard (boolean: the ID card itself is photographed), screen (boolean: a photo of a screen, a screenshot, or a digitally made or edited image),
 signatureCount (integer: handwritten specimen signatures written on the page around the ID copy; do not count the signature printed on the ID card), expired (boolean, or null when there is no expiry date),
 issues (array of short strings: problems such as unreadable text, a cut-off side, signs of editing, or a name that differs between the two sides).
 Copy values exactly as printed; never guess. Use "" for anything unreadable.
-${source === 'camera'
+${cardCapture && source === 'camera'
     ? 'This ID was captured with the live camera at the cooperative office: the front of the card, then the back, joined into one picture. Perspective, glare and the background are expected. There are no specimen signatures; report signatureCount 0.'
-    : `This should be a back-to-back copy: the front and back of the ID photocopied on one page, with the applicant's ${REQUIRED_ID_SIGNATURES} specimen signatures written on the page.`}`;
+    : `This should be a back-to-back copy: ${copy}, with the ${person}'s ${REQUIRED_ID_SIGNATURES} specimen signatures written on the page.`}`;
 }
 
 // The applicant's 2x2 picture, uploaded when the one on the form cannot be recognised.
@@ -209,7 +249,7 @@ export function normalizeIdReading(raw) {
   const dateOfBirth = normalizeDate(text(value.dateOfBirth, 40));
   return {
     isId: bool(value.isId), idType: text(value.idType, 50), idNumber: text(value.idNumber, 100), name: text(value.name),
-    dateOfBirth: isValidDateOnly(dateOfBirth) ? dateOfBirth : '',
+    dateOfBirth: isValidDateOnly(dateOfBirth) ? dateOfBirth : '', address: text(value.address, 300),
     frontVisible: bool(value.frontVisible), backVisible: bool(value.backVisible),
     photocopy: bool(value.photocopy), physicalCard: bool(value.physicalCard), screen: bool(value.screen),
     signatureCount: Number.isInteger(count) && count >= 0 ? Math.min(count, 20) : null,
@@ -294,7 +334,26 @@ function nameSimilarity(a, b) {
   return shared / Math.min(left.size, right.size);
 }
 
-const memberLookupSelect = `SELECT id, member_number, status, TRIM(CONCAT_WS(' ', first_name, middle_name, last_name, suffix)) AS full_name FROM members`;
+// Every word of the shorter name is in the other, and a Jr. or Sr. matches too.
+const GENERATION_WORDS = new Set(['jr', 'sr', 'ii', 'iii', 'iv']);
+function samePerson(a, b) {
+  const generation = (name) => nameTokens(name).filter((token) => GENERATION_WORDS.has(token)).sort().join(' ');
+  return nameSimilarity(a, b) === 1 && generation(a) === generation(b);
+}
+
+// Place words in an address, without the words every address has.
+const ADDRESS_FILLER = new Set(['brgy', 'bgy', 'barangay', 'sitio', 'purok', 'prk', 'street', 'blk', 'block', 'lot', 'zone', 'city', 'municipality',
+  'mun', 'province', 'prov', 'philippines', 'phils', 'occidental', 'occ', 'oriental', 'mindoro', 'the', 'and']);
+const addressWords = (address) => new Set(String(address || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').split(/[^a-z0-9]+/)
+  .filter((word) => word.length >= 3 && !/^\d+$/.test(word) && !ADDRESS_FILLER.has(word)));
+function addressesOverlap(a, b) {
+  const left = addressWords(a);
+  const right = addressWords(b);
+  if (!left.size || !right.size) return true;
+  return [...left].some((word) => right.has(word));
+}
+
+const memberLookupSelect = `SELECT id, member_number, status, date_of_birth, address, id_number, TRIM(CONCAT_WS(' ', first_name, middle_name, last_name, suffix)) AS full_name FROM members`;
 
 async function findMember(db, data, { requireActive }) {
   const number = String(data.memberNumber || '').trim();
@@ -394,19 +453,45 @@ function ageOn(dateOfBirth, today = todayDateOnly()) {
   return year - birthYear - (month < birthMonth || (month === birthMonth && day < birthDay) ? 1 : 0);
 }
 
-// The applicant's valid ID: an uploaded back-to-back copy (front and back on
-// one page) with three specimen signatures, or the ID card captured with the
-// live camera. Then: does the ID belong to the applicant on the form?
-function checkIdDocument(scan, data, add) {
-  if (!scan.id_document_path) {
-    add('idDocument', 'Applicant\'s valid ID', 'fail', `Submit the applicant's valid ID: upload a back-to-back copy with ${REQUIRED_ID_SIGNATURES} specimen signatures, or capture the ID with the live camera.`);
+// Who a submitted ID must belong to, from the form (and, for a borrower, the
+// member record): names to compare, and details that should agree with the ID.
+// holderReading: AI's reading of the borrower's ID, which the co-maker's must not be.
+function expectedIdHolder(documentType, requirement, data, member, holderReading) {
+  if (documentType === 'Membership Form') {
+    const name = [data.firstName, data.middleName, data.lastName, data.suffix].filter(Boolean).join(' ');
+    return { names: [['the applicant on the form', name]], dateOfBirth: [data.dateOfBirth, 'the form'], formIdNumber: data.idNumber };
+  }
+  const borrowerNames = [data.memberName, member?.full_name].filter(Boolean);
+  if (requirement.slot === 'coMaker') {
+    return {
+      names: [['the co-maker on the form', data.coMakerName]], address: data.coMakerAddress,
+      notBorrower: { names: borrowerNames, idNumber: holderReading?.idNumber || '' },
+    };
+  }
+  const names = [['the borrower on the form', data.memberName]];
+  if (member && compact(member.full_name) !== compact(data.memberName || '')) names.push([`the member on record (${member.member_number})`, member.full_name]);
+  return { names, dateOfBirth: [member?.date_of_birth || '', 'the member record'], age: data.age, address: data.address || member?.address, recordIdNumber: member?.id_number };
+}
+
+// A valid ID submitted with a scanned form: a back-to-back copy (front and back
+// of the ID on one page) with three specimen signatures, or, for a membership
+// applicant, the ID card captured with the live camera. Then: does the ID
+// belong to that person on the form?
+// submitted: { reading, source } of the ID, or null when it was not submitted.
+function checkIdDocument(submitted, requirement, expected, add) {
+  const label = idLabel(requirement.person);
+  const whose = `${requirement.person}'s`;
+  if (!submitted) {
+    add(requirement.checkId, label, 'fail', requirement.cardCapture
+      ? `Submit the ${whose} valid ID: upload a back-to-back copy with ${REQUIRED_ID_SIGNATURES} specimen signatures, or capture the ID with the live camera.`
+      : `Submit the ${whose} valid ID: a back-to-back copy (front and back of the ID on one page) with ${REQUIRED_ID_SIGNATURES} specimen signatures, uploaded or taken with the camera.`);
     return;
   }
-  const reading = scan.id_document_check || {};
-  const camera = scan.id_document_source === 'camera';
+  const reading = submitted.reading || {};
+  const camera = Boolean(requirement.cardCapture) && submitted.source === 'camera';
   const idName = reading.idType || 'ID';
   if (reading.error) {
-    add('idDocument', 'Applicant\'s valid ID', 'warn', `AI could not read the ID (${reading.error}). Open it and check it yourself${camera ? '' : `: front and back on one page with ${REQUIRED_ID_SIGNATURES} specimen signatures`}, or submit it again.`);
+    add(requirement.checkId, label, 'warn', `AI could not read the ID (${reading.error}). Open it and check it yourself${camera ? '' : `: front and back on one page with ${REQUIRED_ID_SIGNATURES} specimen signatures`}, or submit it again.`);
     return;
   }
 
@@ -428,23 +513,66 @@ function checkIdDocument(scan, data, add) {
   if (reading.expired === true) concerns.push('the ID is expired');
   const issues = reading.issues?.length ? ` AI noted: ${reading.issues.join('; ')}.` : '';
   const sentence = (list) => `${list.join('; ').replace(/^./, (letter) => letter.toUpperCase())}.`;
-  if (problems.length) add('idDocument', 'Applicant\'s valid ID', 'fail', `${sentence(problems)} ${camera ? 'Capture the ID card again' : `Upload a back-to-back copy with ${REQUIRED_ID_SIGNATURES} specimen signatures`}, or use the other option.${issues}`);
-  else if (concerns.length) add('idDocument', 'Applicant\'s valid ID', 'warn', `${sentence(concerns)} Compare the ID with the applicant.${issues}`);
-  else if (camera) add('idDocument', 'Applicant\'s valid ID', 'pass', `${idName} captured with the live camera; the front${reading.backVisible ? ' and back are' : ' is'} visible.${issues}`);
-  else add('idDocument', 'Applicant\'s valid ID', 'pass', `Back-to-back copy of the ${idName} with ${reading.signatureCount} specimen signatures.${issues}`);
+  const again = requirement.cardCapture
+    ? `${camera ? 'Capture the ID card again' : `Upload a back-to-back copy with ${REQUIRED_ID_SIGNATURES} specimen signatures`}, or use the other option.`
+    : `Submit a back-to-back copy with the ${whose} ${REQUIRED_ID_SIGNATURES} specimen signatures.`;
+  if (problems.length) add(requirement.checkId, label, 'fail', `${sentence(problems)} ${again}${issues}`);
+  else if (concerns.length) add(requirement.checkId, label, 'warn', `${sentence(concerns)} Compare the ID with the ${requirement.person}.${issues}`);
+  else if (camera) add(requirement.checkId, label, 'pass', `${idName} captured with the live camera; the front${reading.backVisible ? ' and back are' : ' is'} visible.${issues}`);
+  else add(requirement.checkId, label, 'pass', `Back-to-back copy of the ${idName} with ${reading.signatureCount} specimen signatures.${issues}`);
+  checkIdMatch(requirement, reading, expected, add);
+}
 
-  const formName = [data.firstName, data.middleName, data.lastName, data.suffix].filter(Boolean).join(' ');
+// The verification checks about each ID: the ID itself, and whether it is the person's.
+export const ID_CHECK_IDS = Object.fromEntries(Object.values(FORM_DEFINITIONS).flatMap((definition) => definition.idDocuments || [])
+  .map((requirement) => [requirement.slot, [requirement.checkId, requirement.matchId]]));
+
+// The borrower's and co-maker's IDs of a loan application typed into the app,
+// checked like those of a scanned loan form. ids: { holder, coMaker }, each
+// { reading, source } or null; data: memberName, address, age, coMakerName and
+// coMakerAddress as on the loan form; member: the borrower's member record.
+export function checkLoanIds(ids, data, member) {
+  const checks = [];
+  const add = (id, label, status, message) => checks.push({ id, label, status, message });
+  if (data.coMakerName && member && samePerson(data.coMakerName, member.full_name)) add('coMaker', 'Co-maker', 'fail', `The co-maker (${data.coMakerName}) is the borrower; the co-maker must be another person.`);
+  for (const requirement of idRequirements('Loan Form')) {
+    checkIdDocument(ids[requirement.slot] || null, requirement, expectedIdHolder('Loan Form', requirement, data, member, ids.holder?.reading), add);
+  }
+  return checks;
+}
+
+// AI's reading of the ID against the person on the form: the name, and the
+// birthday, age, ID No. and address where the form or the record has them.
+function checkIdMatch(requirement, reading, expected, add) {
   const mismatches = [];
   if (!reading.name) mismatches.push(['warn', 'The name on the ID could not be read']);
-  else {
-    const similarity = nameSimilarity(reading.name, formName);
-    if (similarity < 0.5) mismatches.push(['fail', `The name on the ID ("${reading.name}") is not the applicant on the form (${formName})`]);
-    else if (similarity < 1) mismatches.push(['warn', `The name on the ID ("${reading.name}") only partly matches ${formName}`]);
+  for (const [who, name] of expected.names) {
+    if (!reading.name) break;
+    if (!String(name || '').trim()) { mismatches.push(['warn', `There is no name for ${who} to compare with the ID`]); continue; }
+    const similarity = nameSimilarity(reading.name, name);
+    if (similarity < 0.5) mismatches.push(['fail', `The name on the ID ("${reading.name}") is not ${who} (${name})`]);
+    else if (similarity < 1) mismatches.push(['warn', `The name on the ID ("${reading.name}") only partly matches ${who} (${name})`]);
   }
-  if (reading.idNumber && data.idNumber && compact(reading.idNumber) !== compact(data.idNumber)) mismatches.push(['warn', `The ID No. on the form (${data.idNumber}) differs from the ID (${reading.idNumber})`]);
-  if (reading.dateOfBirth && isValidDateOnly(data.dateOfBirth) && reading.dateOfBirth !== data.dateOfBirth) mismatches.push(['warn', `The birthday on the ID (${reading.dateOfBirth}) differs from the form (${data.dateOfBirth})`]);
-  if (!mismatches.length) add('idMatch', 'ID belongs to the applicant', 'pass', `The ID is in the name of ${reading.name}${reading.idNumber ? `, ID No. ${reading.idNumber}` : ''}.`);
-  else add('idMatch', 'ID belongs to the applicant', mismatches.some(([status]) => status === 'fail') ? 'fail' : 'warn', `${mismatches.map(([, message]) => message).join('. ')}.`);
+  if (expected.notBorrower) {
+    const borrower = expected.notBorrower.names.find((name) => reading.name && samePerson(reading.name, name));
+    if (borrower) mismatches.push(['fail', `This ID is in the borrower's name (${borrower}); the co-maker must be another person`]);
+    else if (reading.idNumber && expected.notBorrower.idNumber && compact(reading.idNumber) === compact(expected.notBorrower.idNumber)) mismatches.push(['fail', `This ID has the same ID No. as the borrower's ID (${reading.idNumber})`]);
+  }
+  if (reading.idNumber && expected.formIdNumber && compact(reading.idNumber) !== compact(expected.formIdNumber)) mismatches.push(['warn', `The ID No. on the form (${expected.formIdNumber}) differs from the ID (${reading.idNumber})`]);
+  const [dateOfBirth, dateSource] = expected.dateOfBirth || [];
+  if (reading.dateOfBirth && isValidDateOnly(dateOfBirth) && reading.dateOfBirth !== dateOfBirth) mismatches.push(['warn', `The birthday on the ID (${reading.dateOfBirth}) differs from ${dateSource} (${dateOfBirth})`]);
+  const age = String(expected.age || '').trim();
+  if (reading.dateOfBirth && /^\d+$/.test(age) && Math.abs(ageOn(reading.dateOfBirth) - Number(age)) > 1) mismatches.push(['warn', `The form says age ${age}, but the birthday on the ID (${reading.dateOfBirth}) makes the ${requirement.person} ${ageOn(reading.dateOfBirth)}`]);
+  if (reading.address && expected.address && !addressesOverlap(reading.address, expected.address)) mismatches.push(['warn', `The address on the ID (${reading.address}) does not match the address on the form (${expected.address})`]);
+
+  const label = `ID belongs to the ${requirement.person}`;
+  if (mismatches.length) {
+    add(requirement.matchId, label, mismatches.some(([status]) => status === 'fail') ? 'fail' : 'warn', `${mismatches.map(([, message]) => message).join('. ')}.`);
+    return;
+  }
+  const onFile = reading.idNumber && expected.recordIdNumber && compact(reading.idNumber) === compact(expected.recordIdNumber) ? ' (the ID on file)' : '';
+  const agreed = [isValidDateOnly(dateOfBirth) && reading.dateOfBirth && 'birthday', reading.address && expected.address && 'address'].filter(Boolean);
+  add(requirement.matchId, label, 'pass', `The ID is in the name of ${reading.name}${reading.idNumber ? `, ID No. ${reading.idNumber}${onFile}` : ''}${agreed.length ? `; the ${agreed.join(' and ')} ${agreed.length > 1 ? 'match' : 'matches'}` : ''}.`);
 }
 
 // The applicant's 2x2 picture: the one in the form's photo box when AI can
@@ -505,7 +633,8 @@ function checkLoanAmounts(data, add) {
   if (!String(data.term || '').trim()) add('term', 'Loan term', 'pass', `The paper form has no loan term; the standard ${DEFAULT_LOAN_TERM} months will be used. Change it above if the member agreed another term.`);
 }
 
-async function checkRecords(db, documentType, data, add) {
+// `found` receives the member the form is for, for the ID checks that follow.
+async function checkRecords(db, documentType, data, add, found = {}) {
   if (documentType === 'Membership Form') {
     const duplicate = (await db.query(
       `SELECT member_number FROM members
@@ -549,7 +678,13 @@ async function checkRecords(db, documentType, data, add) {
   const requireActive = documentType !== 'Savings Form';
   const { member, check } = await findMember(db, data, { requireActive });
   add('member', 'Member on record', check[0], check[1]);
+  found.member = member || null;
   const target = { memberId: member?.id ? Number(member.id) : null };
+
+  if (documentType === 'Loan Form' && data.coMakerName) {
+    const borrower = [data.memberName, member?.full_name].find((name) => name && samePerson(data.coMakerName, name));
+    if (borrower) add('coMaker', 'Co-maker', 'fail', `The co-maker on the form (${data.coMakerName}) is the borrower (${borrower}); the co-maker must be another person.`);
+  }
 
   if (documentType === 'Machinery Form') {
     const { machine, partial, error } = await findMachine(db, data.machinery);
@@ -590,8 +725,12 @@ export async function verifyDocument(req, scan, { documentType, extractedData, a
 
   checkAuthenticity(definition, authenticity, confidence, add);
   checkFields(definition, extractedData, add);
-  const target = await checkRecords({ query }, documentType, extractedData, add);
-  if (definition.requiresIdDocument) checkIdDocument(scan, extractedData, add);
+  const found = {};
+  const target = await checkRecords({ query }, documentType, extractedData, add, found);
+  const submitted = (slot) => (scan[ID_SLOTS[slot].path] ? { reading: scan[ID_SLOTS[slot].check] || {}, source: scan[ID_SLOTS[slot].source] } : null);
+  for (const requirement of idRequirements(documentType)) {
+    checkIdDocument(submitted(requirement.slot), requirement, expectedIdHolder(documentType, requirement, extractedData, found.member, submitted('holder')?.reading), add);
+  }
   if (definition.photoExpected) checkPhoto(scan, authenticity, add);
 
   const twin = await findPostedTwin({ query }, scan.id, documentType, extractedData);
@@ -669,8 +808,10 @@ function savingsMethodOf(value) {
 // Writes the document's record through the module's own insert function, in
 // the caller's transaction. Returns { module, recordId, label }.
 async function saveToModule(client, req, scan, documentType, data, target) {
+  const missingId = idRequirements(documentType).find((requirement) => !scan[ID_SLOTS[requirement.slot].path]);
+  if (missingId) throw badRequest(`The ${missingId.person}'s valid ID must be submitted before the ${FORM_DEFINITIONS[documentType].formName} is saved.`);
+
   if (documentType === 'Membership Form') {
-    if (!scan.id_document_path) throw badRequest('The applicant\'s valid ID must be submitted before the membership form is saved.');
     const children = CHILD_ROWS.map((row) => ({ name: String(data[`child${row}Name`] || '').trim(), age: String(data[`child${row}Age`] || '').trim() })).filter((child) => child.name || child.age);
     const incomeSources = INCOME_ROWS.map((row) => ({ source: String(data[`income${row}Source`] || '').trim(), amount: String(data[`income${row}Amount`] || '').trim() })).filter((income) => income.source || income.amount);
     const incomeCents = incomeSources.reduce((sum, income) => sum + (moneyCents(income.amount) || 0), 0);
@@ -728,7 +869,13 @@ async function saveToModule(client, req, scan, documentType, data, target) {
       coMakerName: data.coMakerName, coMakerAddress: data.coMakerAddress, coMakerContact: data.coMakerContact, coMakerRelationship: data.coMakerRelationship,
       collateralType: collateralOf(data.collateralType), collateralDetails: data.collateralDetails,
     }, member);
-    const request = await insertLoanRequest(client, req, { member, application, income: '0', submittedBy: 'admin' });
+    const checks = scan.verification?.checks || [];
+    const idDocument = (slot) => (scan[ID_SLOTS[slot].path] ? {
+      path: scan[ID_SLOTS[slot].path], fileName: scan[ID_SLOTS[slot].name], mimeType: scan[ID_SLOTS[slot].type], size: Number(scan[ID_SLOTS[slot].size]),
+      source: scan[ID_SLOTS[slot].source], reading: scan[ID_SLOTS[slot].check] || {}, checks: checks.filter((check) => ID_CHECK_IDS[slot].includes(check.id)), scanId: Number(scan.id),
+    } : null);
+    const idDocuments = { borrower: idDocument('holder'), coMaker: idDocument('coMaker') };
+    const request = await insertLoanRequest(client, req, { member, application, income: '0', submittedBy: 'admin', idDocuments });
     return {
       module: 'loans', recordId: String(request.id), label: `Loan application #${request.id} submitted for approval`,
       memberId: Number(member.id), email: (recipient) => loanApplicationReceivedEmail({ memberName: recipient.full_name, requestId: request.id, amount: request.amount, loanType: request.loanType, term: request.term, fromPaperForm: true }),
