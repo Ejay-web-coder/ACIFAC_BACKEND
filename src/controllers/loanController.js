@@ -18,6 +18,8 @@ const MONEY_PATTERN = /^\d+(\.\d{1,2})?$/;
 // The borrower's and co-maker's IDs kept with an application or loan, without the storage paths.
 const idDocumentsColumn = (alias) => `COALESCE((SELECT jsonb_object_agg(d.key, d.value - 'path') FROM jsonb_each(${alias}.id_documents) d WHERE jsonb_typeof(d.value) = 'object'), '{}'::jsonb) AS "idDocuments"`;
 export const ID_HOLDERS = ['borrower', 'coMaker'];
+// The borrower's signature on the application form, without the storage path.
+const signatureColumn = (alias) => `(${alias}.borrower_signature - 'path') AS "borrowerSignature"`;
 const AREA_PATTERN = /^\d+(\.\d{1,2})?$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_PATTERN = /^[+0-9()\s.-]{7,30}$/;
@@ -41,7 +43,7 @@ const loanSelect = `
          l.co_maker_address AS "coMakerAddress", l.co_maker_contact AS "coMakerContact",
          l.co_maker_relationship AS "coMakerRelationship", l.collateral_type AS "collateralType",
          l.collateral_details AS "collateralDetails", l.in_kind_items AS "inKindItems", l.loan_request_id AS "loanRequestId",
-         ${idDocumentsColumn('l')}
+         ${idDocumentsColumn('l')}, ${signatureColumn('l')}
   FROM loans l
   LEFT JOIN members m ON m.id = l.member_id
   LEFT JOIN LATERAL (SELECT SUM(p.amount) AS total_paid, COUNT(*) AS payment_count FROM loan_payments p WHERE p.loan_id = l.id) pay ON TRUE
@@ -70,7 +72,7 @@ const requestSelect = `
          r.co_maker_name AS "coMakerName", r.co_maker_address AS "coMakerAddress", r.co_maker_contact AS "coMakerContact",
          r.co_maker_relationship AS "coMakerRelationship", r.collateral_type AS "collateralType", r.collateral_details AS "collateralDetails",
          r.in_kind_items AS "inKindItems", r.crops_planted AS "cropsPlanted", r.crop_season AS "cropSeason", r.irrigation_type AS "irrigationType",
-         r.borrower_phone AS "borrowerPhone", r.borrower_email AS "borrowerEmail", ${idDocumentsColumn('r')}
+         r.borrower_phone AS "borrowerPhone", r.borrower_email AS "borrowerEmail", ${idDocumentsColumn('r')}, ${signatureColumn('r')}
   FROM loan_requests r LEFT JOIN members m ON m.id = r.member_id`;
 
 const memberApplicationSelect = `SELECT id, member_number, first_name, middle_name, last_name, suffix, email, phone,
@@ -198,16 +200,16 @@ async function insertLoan(client, loan) {
     `INSERT INTO loans (loan_number, loan_request_id, member_id, member_number, member_name, loan_type, amount, balance, interest_rate, term,
        date_approved, due_date, next_payment_date, monthly_payment, farm_area, maximum_eligible_amount, purpose, loan_mode,
        calculated_interest, total_repayment, in_kind_items, co_maker_name, co_maker_address, co_maker_contact,
-       co_maker_relationship, collateral_type, collateral_details, id_documents)
+       co_maker_relationship, collateral_type, collateral_details, id_documents, borrower_signature)
      VALUES ('L-TMP-' || left(md5(random()::text), 20), $1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, $9,
        ${SQL_TODAY}, ${SQL_TODAY} + make_interval(months => $9::int), ${SQL_TODAY} + INTERVAL '1 month', $10::numeric, $11::numeric, $12::numeric,
-       $13, $14, $15::numeric, $7::numeric, $16::jsonb, $17, $18, $19, $20, $21, $22, $23::jsonb)
+       $13, $14, $15::numeric, $7::numeric, $16::jsonb, $17, $18, $19, $20, $21, $22, $23::jsonb, $24::jsonb)
      RETURNING id`,
     [loan.loanRequestId ?? null, loan.memberId, loan.memberNumber, loan.memberName, loan.loanType, loan.amount, loan.totalRepayment,
       loan.interestRate, loan.term, loan.monthlyPayment, loan.farmArea ?? null, loan.maximumEligibleAmount ?? null, loan.purpose ?? null,
       loan.loanMode ?? null, loan.calculatedInterest, JSON.stringify(loan.inKindItems || []), loan.coMaker?.name ?? null,
       loan.coMaker?.address ?? null, loan.coMaker?.contact ?? null, loan.coMaker?.relationship ?? null, loan.collateralType ?? null,
-      loan.collateralDetails ?? null, JSON.stringify(loan.idDocuments || {})]
+      loan.collateralDetails ?? null, JSON.stringify(loan.idDocuments || {}), loan.borrowerSignature ? JSON.stringify(loan.borrowerSignature) : null]
   );
   const loanId = inserted.rows[0].id;
   // Loan numbers follow the loan's own id so they are gap-free per loan: L-YYYY-###.
@@ -337,8 +339,9 @@ export async function listLoanRequests(req, res) {
 }
 
 // takeIds(member, application): the borrower's and co-maker's IDs, checked
-// (see loanIdController), as kept in id_documents.
-export async function createLoan(req, res, _next, { takeIds } = {}) {
+// (see loanIdController), as kept in id_documents; borrowerSignature: the
+// stored signature from the form's Borrower Signature line.
+export async function createLoan(req, res, _next, { takeIds, borrowerSignature = null } = {}) {
   const memberDatabaseId = parseId(req.body?.memberId, 'member');
   const loanId = await withTransaction(async (client) => {
     const member = (await client.query(`${memberApplicationSelect} FOR UPDATE`, [memberDatabaseId])).rows[0];
@@ -351,7 +354,7 @@ export async function createLoan(req, res, _next, { takeIds } = {}) {
       term: application.term, monthlyPayment: application.financials.monthly_payment, farmArea: application.farmArea,
       maximumEligibleAmount: application.financials.maximum_eligible_amount, purpose: application.purpose, loanMode: application.loanMode,
       calculatedInterest: application.financials.calculated_interest, inKindItems: application.inKindItems, coMaker: application.coMaker,
-      collateralType: application.collateralType, collateralDetails: application.collateralDetails, idDocuments,
+      collateralType: application.collateralType, collateralDetails: application.collateralDetails, idDocuments, borrowerSignature,
     });
     await createAuditLog({
       client,
@@ -361,7 +364,7 @@ export async function createLoan(req, res, _next, { takeIds } = {}) {
       entityType: 'loan',
       entityId: String(id),
       description: `Created loan for ${member.full_name}`,
-      newValues: { member_id: member.id, amount: application.requestedAmount, term: application.term, farm_area: application.farmArea, total_repayment: application.financials.total_repayment, certified: application.certified, ids: idSummary(idDocuments) },
+      newValues: { member_id: member.id, amount: application.requestedAmount, term: application.term, farm_area: application.farmArea, total_repayment: application.financials.total_repayment, certified: application.certified, signed: Boolean(borrowerSignature), ids: idSummary(idDocuments) },
       ...getRequestMeta(req),
     });
     await notifyMember(client, member.id, { type: 'loan_approved', title: 'Loan approved', message: `A loan of PHP ${Number(application.requestedAmount).toLocaleString('en-PH', { minimumFractionDigits: 2 })} was approved for you.`, severity: 'success', link: '/loan-status', entityType: 'loan', entityId: id, dedupeKey: `loan-created-${id}` });
@@ -400,6 +403,7 @@ export async function reviewLoanRequest(req, res) {
         purpose: requestRow.purpose, loanMode: requestRow.loan_mode, calculatedInterest: requestRow.calculated_interest ?? financials.calculated_interest,
         inKindItems: requestRow.in_kind_items, coMaker: { name: requestRow.co_maker_name, address: requestRow.co_maker_address, contact: requestRow.co_maker_contact, relationship: requestRow.co_maker_relationship },
         collateralType: requestRow.collateral_type, collateralDetails: requestRow.collateral_details, idDocuments: requestRow.id_documents,
+        borrowerSignature: requestRow.borrower_signature,
       });
     }
     await client.query(`UPDATE loan_requests SET status = $1, reviewed_at = NOW(), reviewed_by = $2, review_notes = $3, updated_at = NOW() WHERE id = $4`, [status, currentUserId(req), reviewNotes, requestRow.id]);
@@ -509,7 +513,7 @@ export async function recordPayment(req, res) {
 // Inserts a pending loan application inside the caller's transaction. Used by
 // the member self-service form and by OCR-posted loan forms, so both land in the
 // same admin approval queue.
-export async function insertLoanRequest(client, req, { member, application, income, submittedBy = 'member', idDocuments = {} }) {
+export async function insertLoanRequest(client, req, { member, application, income, submittedBy = 'member', idDocuments = {}, borrowerSignature = null }) {
   const pending = await client.query(`SELECT 1 FROM loan_requests WHERE member_id = $1 AND loan_type = $2 AND status = 'pending'`, [member.id, application.loanType]);
   if (pending.rows[0]) throw conflict(submittedBy === 'member' ? 'You already have a pending application for this loan type.' : 'This member already has a pending application for this loan type.');
 
@@ -518,9 +522,9 @@ export async function insertLoanRequest(client, req, { member, application, inco
       borrower_email, borrower_phone, borrower_address, borrower_age, borrower_gender, borrower_civil_status, borrower_occupation,
       years_farming, farm_location, barangay, municipality, province, farm_area, crops_planted, crop_season, irrigation_type,
       irrigation_other, loan_mode, maximum_eligible_amount, interest_rate, calculated_interest, total_repayment, in_kind_items,
-      co_maker_name, co_maker_address, co_maker_contact, co_maker_relationship, collateral_type, collateral_details, id_documents)
+      co_maker_name, co_maker_address, co_maker_contact, co_maker_relationship, collateral_type, collateral_details, id_documents, borrower_signature)
      VALUES ($1, $2, $3, $4, $5::numeric, $6, $7, $8::numeric, $9, $10, $11, $12, $13, $14, $15, $16::numeric, $17, $18, $19, $20,
-       $21::numeric, $22, $23, $24, $25, $26, $27::numeric, $28::numeric, $29::numeric, $30::numeric, $31::jsonb, $32, $33, $34, $35, $36, $37, $38::jsonb)
+       $21::numeric, $22, $23, $24, $25, $26, $27::numeric, $28::numeric, $29::numeric, $30::numeric, $31::jsonb, $32, $33, $34, $35, $36, $37, $38::jsonb, $39::jsonb)
      RETURNING id`,
     [member.id, member.member_number, member.full_name, application.loanType, application.requestedAmount, application.term,
       application.purpose, income, application.borrowerEmail || null, application.borrowerPhone, application.borrowerAddress,
@@ -530,10 +534,11 @@ export async function insertLoanRequest(client, req, { member, application, inco
       application.loanMode, application.financials.maximum_eligible_amount, LOAN_POLICY.interestRate,
       application.financials.calculated_interest, application.financials.total_repayment, JSON.stringify(application.inKindItems),
       application.coMaker.name, application.coMaker.address, application.coMaker.contact, application.coMaker.relationship,
-      application.collateralType, application.collateralDetails, JSON.stringify(Object.fromEntries(Object.entries(idDocuments).filter(([, value]) => value)))]
+      application.collateralType, application.collateralDetails, JSON.stringify(Object.fromEntries(Object.entries(idDocuments).filter(([, value]) => value))),
+      borrowerSignature ? JSON.stringify(borrowerSignature) : null]
   );
   const id = inserted.rows[0].id;
-  await createAuditLog({ client, user: req.user, action: 'LOAN_APPLICATION_SUBMITTED', module: 'Loans', entityType: 'loan_request', entityId: String(id), description: `Loan application submitted by ${member.full_name}`, newValues: { amount: application.requestedAmount, term: application.term, loan_type: application.loanType, certified: application.certified, ids: idSummary(idDocuments) }, ...getRequestMeta(req) });
+  await createAuditLog({ client, user: req.user, action: 'LOAN_APPLICATION_SUBMITTED', module: 'Loans', entityType: 'loan_request', entityId: String(id), description: `Loan application submitted by ${member.full_name}`, newValues: { amount: application.requestedAmount, term: application.term, loan_type: application.loanType, certified: application.certified, signed: Boolean(borrowerSignature), ids: idSummary(idDocuments) }, ...getRequestMeta(req) });
   await notifyAdmins(client, {
     type: 'loan_submitted',
     title: 'Loan application received',
@@ -547,7 +552,7 @@ export async function insertLoanRequest(client, req, { member, application, inco
   return (await client.query(`${requestSelect} WHERE r.id = $1`, [id])).rows[0];
 }
 
-export async function createMemberLoanRequest(req, res, _next, { takeIds } = {}) {
+export async function createMemberLoanRequest(req, res, _next, { takeIds, borrowerSignature = null } = {}) {
   const memberId = Number(req.user?.member_id);
   const request = await withTransaction(async (client) => {
     const member = (await client.query(memberApplicationSelect, [memberId])).rows[0];
@@ -555,7 +560,7 @@ export async function createMemberLoanRequest(req, res, _next, { takeIds } = {})
     const application = await prepareApplication(client, req.body || {}, member);
     const income = req.body?.monthlyIncome === '' || req.body?.monthlyIncome === undefined || req.body?.monthlyIncome === null ? '0' : readDecimal(req.body.monthlyIncome, 'Monthly income');
     const idDocuments = takeIds ? await takeIds(member, application) : {};
-    return insertLoanRequest(client, req, { member, application, income, idDocuments });
+    return insertLoanRequest(client, req, { member, application, income, idDocuments, borrowerSignature });
   });
 
   void keepAlive((async () => {
@@ -593,5 +598,20 @@ function downloadIdFrom(table) {
 
 export const downloadLoanRequestId = downloadIdFrom('loan_requests');
 export const downloadLoanId = downloadIdFrom('loans');
+
+// GET /api/admin/loan-requests/:id/borrower-signature and /api/admin/loans/:id/borrower-signature
+function downloadSignatureFrom(table) {
+  return async (req, res) => {
+    const id = parseId(req.params.id, table === 'loans' ? 'loan ID' : 'loan request ID');
+    const signature = (await query(`SELECT borrower_signature FROM ${table} WHERE id = $1`, [id])).rows[0]?.borrower_signature;
+    if (!signature?.path) throw notFound('The borrower did not sign this application in the app.');
+    const sent = await sendStoredFile(res, { reference: signature.path, mimeType: signature.mimeType, fileName: signature.fileName });
+    if (!sent) throw notFound('The stored file is no longer available.');
+    return undefined;
+  };
+}
+
+export const downloadLoanRequestSignature = downloadSignatureFrom('loan_requests');
+export const downloadLoanSignature = downloadSignatureFrom('loans');
 
 export { loanSelect, memberApplicationSelect, paymentSelect, requestSelect };

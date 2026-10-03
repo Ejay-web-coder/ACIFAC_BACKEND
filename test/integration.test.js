@@ -75,7 +75,8 @@ const member = new Client();
 const state = {};
 
 // A loan application as the form sends it: AI reads the borrower's and the
-// co-maker's IDs as they are picked, then the application is posted with both files.
+// co-maker's IDs as they are picked, then the application is posted with both
+// files and the borrower's signature.
 const BORROWER_ID = {
   isId: true, idType: 'PhilSys National ID', idNumber: '1111-2222-3333', name: 'JUAN DELA CRUZ', dateOfBirth: '1980-05-20', address: 'Purok 1, Amnay, Sta. Cruz',
   frontVisible: true, backVisible: true, photocopy: true, physicalCard: false, screen: false, signatureCount: 3, expired: false, issues: [],
@@ -94,7 +95,7 @@ async function readLoanId(client, holder, reading, file, source = 'upload') {
   return client.request('POST', '/api/loans/id-reading', { form });
 }
 
-async function applyWithIds(client, url, application, { borrower = BORROWER_ID, coMaker = CO_MAKER_ID, acknowledgeIdWarnings = false, swapFile = false } = {}) {
+async function applyWithIds(client, url, application, { borrower = BORROWER_ID, coMaker = CO_MAKER_ID, acknowledgeIdWarnings = false, swapFile = false, signed = true } = {}) {
   const form = new FormData();
   form.append('application', JSON.stringify({ ...CO_MAKER, ...application }));
   for (const [holder, reading] of [['borrower', borrower], ['coMaker', coMaker]]) {
@@ -105,6 +106,7 @@ async function applyWithIds(client, url, application, { borrower = BORROWER_ID, 
     form.append(`${holder}IdReading`, String(read.data.readingId));
     form.append(`${holder}Id`, new Blob([swapFile ? idFile() : file], { type: 'image/png' }), `${holder}-id.png`);
   }
+  if (signed) form.append('borrowerSignature', new Blob([PNG], { type: 'image/png' }), 'borrower-signature.png');
   if (acknowledgeIdWarnings) form.append('acknowledgeIdWarnings', 'true');
   return client.request('POST', url, { form });
 }
@@ -728,6 +730,14 @@ test('loans: applications typed into the app need the borrower and co-maker IDs 
   const sameId = await applyWithIds(member, url, paper, { coMaker: BORROWER_ID });
   assert.equal(sameId.status, 422);
   assert.match(sameId.data.errors.join(' '), /borrower's name/);
+  // The borrower signs on the form's Borrower Signature line, with a picture.
+  const unsigned = await applyWithIds(member, url, paper, { signed: false });
+  assert.equal(unsigned.status, 422);
+  assert.match(unsigned.data.message, /has to sign the application/);
+  const pdfSigned = new FormData();
+  pdfSigned.append('application', JSON.stringify({ ...paper, ...CO_MAKER }));
+  pdfSigned.append('borrowerSignature', new Blob([Buffer.from('%PDF-1.4 signature')], { type: 'application/pdf' }), 'signature.pdf');
+  assert.equal((await member.request('POST', url, { form: pdfSigned })).status, 400);
   const pending = await admin.get('/api/admin/loan-requests?status=pending&limit=100');
   assert.equal(pending.data.requests.filter((r) => Number(r.memberDatabaseId) === state.memberId).length, 0, 'nothing was saved');
 
@@ -754,6 +764,12 @@ test('loans: applications typed into the app need the borrower and co-maker IDs 
   assert.equal(borrowerFile.status, 200);
   assert.equal((await member.request('GET', `/api/admin/loan-requests/${requestId}/id-documents/borrower`, { raw: true })).status, 403);
   assert.equal((await admin.request('GET', `/api/admin/loan-requests/${requestId}/id-documents/spouse`, { raw: true })).status, 404);
+  const { borrowerSignature } = warned.data.request;
+  assert.equal(borrowerSignature.mimeType, 'image/png');
+  assert.equal(borrowerSignature.path, undefined, 'storage paths are not sent');
+  assert.match(borrowerSignature.signedOn, /^\d{4}-\d{2}-\d{2}$/);
+  assert.equal((await admin.request('GET', `/api/admin/loan-requests/${requestId}/borrower-signature`, { raw: true })).status, 200);
+  assert.equal((await member.request('GET', `/api/admin/loan-requests/${requestId}/borrower-signature`, { raw: true })).status, 403);
 
   // Approval keeps the IDs with the loan.
   const approved = await admin.patch(`/api/admin/loan-requests/${requestId}`, { status: 'approved' });
@@ -762,6 +778,8 @@ test('loans: applications typed into the app need the borrower and co-maker IDs 
   assert.deepEqual(Object.keys(loan.idDocuments).sort(), ['borrower', 'coMaker']);
   const loanFile = await admin.request('GET', `/api/admin/loans/${approved.data.loanId}/id-documents/coMaker`, { raw: true });
   assert.equal(loanFile.status, 200);
+  assert.equal(loan.borrowerSignature.signedOn, borrowerSignature.signedOn, 'the signature goes with the loan');
+  assert.equal((await admin.request('GET', `/api/admin/loans/${approved.data.loanId}/borrower-signature`, { raw: true })).status, 200);
 
   // An admin releasing a loan at once must confirm ID warnings.
   const direct = { ...paper, memberId: state.memberId, cashAmount: '3000' };
@@ -773,6 +791,8 @@ test('loans: applications typed into the app need the borrower and co-maker IDs 
   assert.deepEqual(Object.keys(released.data.loan.idDocuments).sort(), ['borrower', 'coMaker']);
   const audit = await pool.query(`SELECT new_values FROM audit_logs WHERE action = 'LOAN_CREATED' AND entity_id = $1`, [String(released.data.loan.databaseId)]);
   assert.equal(audit.rows[0].new_values.ids.borrower.signatures, 3);
+  assert.equal(audit.rows[0].new_values.signed, true);
+  assert.ok(released.data.loan.borrowerSignature, 'a loan released at once keeps the signature');
   // These loans are not part of the analytics test that follows.
   await pool.query('DELETE FROM loans WHERE id = ANY($1::int[])', [[approved.data.loanId, released.data.loan.databaseId]]);
 });

@@ -19,8 +19,8 @@ function memoryUpload(maxBytes, allowed, maxFiles = 2) {
 
 // Add Member: ID document, 2x2 photo and three specimen signatures.
 export const memberDocumentUpload = memoryUpload(5 * 1024 * 1024, DOCUMENT_TYPES, 5);
-// A loan application: the borrower's and the co-maker's valid IDs.
-export const loanApplicationUpload = memberDocumentUpload.fields([{ name: 'borrowerId', maxCount: 1 }, { name: 'coMakerId', maxCount: 1 }]);
+// A loan application: the borrower's and the co-maker's valid IDs and the borrower's signature.
+export const loanApplicationUpload = memberDocumentUpload.fields([{ name: 'borrowerId', maxCount: 1 }, { name: 'coMakerId', maxCount: 1 }, { name: 'borrowerSignature', maxCount: 1 }]);
 export const ocrDocumentUpload = memoryUpload(10 * 1024 * 1024, DOCUMENT_TYPES);
 export const legalDocumentUpload = memoryUpload(10 * 1024 * 1024, DOCUMENT_TYPES);
 // Pictures are resized in the browser to about 100 KB; 5 MB leaves room for originals.

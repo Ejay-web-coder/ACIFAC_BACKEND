@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { query } from '../config/db.js';
 import { AppError, badRequest, cleanString, currentUserId, parseId } from '../utils/http.js';
 import { assertValidUpload, BUCKETS, removeFile, safeOriginalName, uploadFile } from '../services/storage.js';
-import { DOCUMENT_TYPES as UPLOAD_TYPES } from '../middleware/upload.js';
+import { DOCUMENT_TYPES as UPLOAD_TYPES, IMAGE_TYPES } from '../middleware/upload.js';
 import { aiFailureReason, askAi } from '../services/aiClient.js';
 import { buildIdPrompt, checkLoanIds, ID_CHECK_IDS, ID_READING_INSTRUCTION, normalizeIdReading } from '../services/documentRouting.js';
 import { createLoan, createMemberLoanRequest, memberApplicationSelect } from './loanController.js';
@@ -96,11 +96,13 @@ export async function previewLoanIdChecks(req, res) {
   return res.json({ success: true, checks });
 }
 
-// Wraps a loan handler so the application must come with both IDs.
-// Multipart: "application" (the form as JSON), borrowerId and coMakerId (the
-// ID files AI read), borrowerIdReading and coMakerIdReading (their readings),
-// acknowledgeIdWarnings. An admin releasing the loan at once must confirm any
-// ID warning; a member's application keeps the warnings for the approver.
+// Wraps a loan handler so the application must come with both IDs and the
+// borrower's signature. Multipart: "application" (the form as JSON), borrowerId
+// and coMakerId (the ID files AI read), borrowerIdReading and coMakerIdReading
+// (their readings), borrowerSignature (a picture of the signature on the form's
+// Borrower Signature line), acknowledgeIdWarnings. An admin releasing the loan at
+// once must confirm any ID warning; a member's application keeps the warnings
+// for the approver.
 function withApplicationIds(handler, { releasesLoan }) {
   return async (req, res, next) => {
     if (typeof req.body?.application === 'string') {
@@ -124,18 +126,24 @@ function withApplicationIds(handler, { releasesLoan }) {
       if (sha256(file.buffer) !== rows[key].file_sha256) throw badRequest(`The ${holder.person}'s ID file is not the one AI read: pick it again in the form.`);
       files[key] = file;
     }
+    const signature = req.files?.borrowerSignature?.[0] || null;
+    if (signature) assertValidUpload(signature, IMAGE_TYPES, 'borrower signature');
 
     const stored = {};
     try {
-      for (const [key, file] of Object.entries(files)) {
-        stored[key] = await uploadFile({ bucket: BUCKETS.memberDocuments, folder: `loans/${todayDateOnly().slice(0, 7)}`, file });
-      }
+      const folder = `loans/${todayDateOnly().slice(0, 7)}`;
+      for (const [key, file] of Object.entries(files)) stored[key] = await uploadFile({ bucket: BUCKETS.memberDocuments, folder, file });
+      if (signature) stored.signature = await uploadFile({ bucket: BUCKETS.memberDocuments, folder, file: signature });
+      const borrowerSignature = signature ? {
+        path: stored.signature, fileName: safeOriginalName(signature.originalname), mimeType: signature.mimetype, size: signature.size, signedOn: todayDateOnly(),
+      } : null;
       const takeIds = async (member, application) => {
         if (!application.coMaker.name) throw badRequest('Fill in the co-maker\'s name, address, contact number and relationship: the co-maker\'s valid ID is required.');
         const submitted = { holder: files.borrower ? asSubmitted(rows.borrower) : null, coMaker: files.coMaker ? asSubmitted(rows.coMaker) : null };
         const checks = checkLoanIds(submitted, formDetails(member, { ...application, coMakerName: application.coMaker.name, coMakerAddress: application.coMaker.address }), member);
         const failed = checks.filter((check) => check.status === 'fail').map((check) => check.message);
         if (failed.length) throw new AppError(422, failed[0], failed);
+        if (!borrowerSignature) throw new AppError(422, 'The borrower has to sign the application on the Borrower Signature line.');
         const warnings = checks.filter((check) => check.status === 'warn').map((check) => check.message);
         if (releasesLoan && warnings.length && !acknowledged) {
           throw new AppError(422, `Confirm that you compared the flagged ID details with the borrower and co-maker: ${warnings[0]}`, warnings);
@@ -145,7 +153,7 @@ function withApplicationIds(handler, { releasesLoan }) {
           source: rows[key].source, reading: rows[key].reading, checks: checks.filter((check) => ID_CHECK_IDS[holder.slot].includes(check.id)),
         }]));
       };
-      return await handler(req, res, next, { takeIds });
+      return await handler(req, res, next, { takeIds, borrowerSignature });
     } catch (error) {
       await Promise.all(Object.values(stored).map((reference) => removeFile(reference)));
       throw error;
