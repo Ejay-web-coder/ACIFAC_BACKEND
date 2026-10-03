@@ -95,6 +95,14 @@ export function savingsDepositEmail({ memberName, amount, date, reference, total
   );
 }
 
+export function savingsWithdrawalEmail({ memberName, amount, date, reference, total }) {
+  return message(
+    'ACIFAC savings withdrawal recorded',
+    `Hello ${memberName},\n\nA savings withdrawal of ${formatAmount(amount)} was recorded on ${date}${reference ? ` (reference ${reference})` : ''}.\nYour total savings are now ${formatAmount(total)}.`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>A savings withdrawal of <strong>${formatAmount(amount)}</strong> was recorded on ${escapeHtml(date)}${reference ? ` (reference ${escapeHtml(reference)})` : ''}.</p><p>Your total savings are now <strong>${formatAmount(total)}</strong>.</p>`
+  );
+}
+
 export function shareContributionEmail({ memberName, amount, date, total, maximum }) {
   return message(
     'ACIFAC share capital contribution recorded',

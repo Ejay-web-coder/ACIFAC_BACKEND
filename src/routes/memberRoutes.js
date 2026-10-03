@@ -4,13 +4,16 @@ import {
   archiveMember,
   createMember,
   createSavingsRecord,
+  createSavingsWithdrawal,
   importMembers,
   downloadMemberDocument,
   getMember,
+  getMemberSavings,
   getMemberStatistics,
   getMyMemberData,
   listArchivedMembers,
   listMembers,
+  listSavingsMembers,
   listSavingsRecords,
   replaceMemberDocuments,
   restoreMember,
@@ -39,6 +42,8 @@ router.get('/statistics', getMemberStatistics);
 router.get('/archived', listArchivedMembers);
 router.get('/savings', listSavingsRecords);
 router.post('/savings', createSavingsRecord);
+router.post('/savings/withdrawals', createSavingsWithdrawal);
+router.get('/savings/members', listSavingsMembers);
 router.post('/import', importMembers);
 router.post('/', memberDocumentUpload.fields([
   { name: 'idDocument', maxCount: 1 },
@@ -46,6 +51,7 @@ router.post('/', memberDocumentUpload.fields([
   { name: 'signatures', maxCount: 3 },
 ]), createMember);
 router.get('/:id', getMember);
+router.get('/:id/savings', getMemberSavings);
 router.get('/:id/documents/:kind', downloadMemberDocument);
 router.post('/:id/documents', memberDocumentUpload.fields([
   { name: 'idDocument', maxCount: 1 },

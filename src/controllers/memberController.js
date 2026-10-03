@@ -7,7 +7,8 @@ import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import { assertValidUpload, BUCKETS, removeFile, safeOriginalName, sendStoredFile, uploadFile } from '../services/storage.js';
 import { notifyMember } from '../services/notificationService.js';
 import { emailMember } from '../services/memberEmails.js';
-import { savingsDepositEmail, shareContributionEmail, welcomeMemberEmail } from '../services/emailTemplates.js';
+import { savingsDepositEmail, savingsWithdrawalEmail, shareContributionEmail, welcomeMemberEmail } from '../services/emailTemplates.js';
+import { savingsTypeLabel, signedSavings } from '../services/savingsLedger.js';
 import { DOCUMENT_TYPES, IMAGE_TYPES } from '../middleware/upload.js';
 import { loanSelect, paymentSelect, requestSelect } from './loanController.js';
 import { refreshLoanStatusesInBackground } from '../services/loanService.js';
@@ -18,7 +19,7 @@ const EDITABLE_STATUSES = ['active', 'inactive', 'suspended'];
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_PATTERN = /^[+0-9()\s.-]{7,30}$/;
 // Share capital is recorded as share contributions and capped per member.
-// Savings deposits are a separate ledger (savings_transactions).
+// Savings deposits and withdrawals are a separate ledger (savings_transactions).
 export const SHARE_CAPITAL_LIMIT = '20000';
 export const CONTRIBUTION_METHODS = ['Cash', 'Deposit', 'GCash', 'Bank Transfer', 'Check', 'Initial', 'Legacy', 'Other'];
 
@@ -344,78 +345,212 @@ export async function addShareContribution(req, res) {
 
 export const SAVINGS_METHODS = ['Cash', 'Deposit', 'GCash', 'Bank Transfer', 'Check', 'Other'];
 
+const savingsMemberName = `TRIM(CONCAT_WS(' ', m.first_name, m.middle_name, m.last_name, m.suffix))`;
+const savingsBalanceOf = (db, memberId) => db.query(`SELECT COALESCE(SUM(${signedSavings('st')}), 0) AS total FROM savings_transactions st WHERE st.member_id = $1`, [memberId]);
+
+// The member's savings: deposits and withdrawals, newest first, each with the
+// balance after it, and the balance now (deposits minus withdrawals).
 async function getSavingsDetails(db, memberId) {
   const runner = db?.query ? db.query.bind(db) : query;
   const result = await runner(
-    `SELECT st.id, st.amount, st.transaction_type AS "type", st.transaction_date AS "date", st.payment_method AS "paymentMethod",
-            st.reference_number AS "reference", st.notes, st.created_at AS "createdAt"
-     FROM savings_transactions st WHERE st.member_id = $1 ORDER BY st.transaction_date DESC, st.id DESC LIMIT 200`,
+    `SELECT * FROM (
+       SELECT st.id, st.amount, ${savingsTypeLabel('st')} AS "type", st.transaction_date AS "date", st.payment_method AS "paymentMethod",
+              st.reference_number AS "reference", st.notes, st.created_at AS "createdAt",
+              SUM(${signedSavings('st')}) OVER (ORDER BY st.transaction_date, st.id) AS "balance"
+       FROM savings_transactions st WHERE st.member_id = $1
+     ) t ORDER BY t."date" DESC, t.id DESC LIMIT 200`,
     [memberId]
   );
-  const total = await runner(`SELECT COALESCE(SUM(amount), 0) AS total FROM savings_transactions WHERE member_id = $1`, [memberId]);
-  return { transactions: result.rows.map((row) => ({ ...row, amount: Number(row.amount) })), total: Number(total.rows[0].total) };
+  const total = await runner(`SELECT COALESCE(SUM(${signedSavings('st')}), 0) AS total FROM savings_transactions st WHERE st.member_id = $1`, [memberId]);
+  return { transactions: result.rows.map((row) => ({ ...row, amount: Number(row.amount), balance: Number(row.balance) })), total: Number(total.rows[0].total) };
 }
 
-// Inserts one savings deposit inside the caller's transaction. Shared by the
-// savings form and by OCR-posted savings forms.
-export async function insertSavingsDeposit(client, req, { memberId, amountCents, date, paymentMethod, reference, notes }) {
+// The most a withdrawal dated `date` can take out: the balance on that date,
+// and every later balance, must stay at zero or more. Withdrawals are placed
+// after the other entries of their day.
+async function savingsAvailableOn(db, memberId, date) {
+  const result = await db.query(
+    `WITH running AS (
+       SELECT st.transaction_date, SUM(${signedSavings('st')}) OVER (ORDER BY st.transaction_date, st.id) AS balance
+       FROM savings_transactions st WHERE st.member_id = $1
+     )
+     SELECT LEAST(
+       (SELECT COALESCE(SUM(${signedSavings('st')}), 0) FROM savings_transactions st WHERE st.member_id = $1 AND st.transaction_date <= $2),
+       (SELECT MIN(balance) FROM running WHERE transaction_date > $2)
+     ) AS available`,
+    [memberId, date]
+  );
+  return result.rows[0].available;
+}
+
+const SAVINGS_KINDS = {
+  deposit: { action: 'SAVINGS_DEPOSIT_CREATED', label: 'deposit', title: 'Savings deposit recorded', notification: 'savings_recorded' },
+  withdrawal: { action: 'SAVINGS_WITHDRAWAL_CREATED', label: 'withdrawal', title: 'Savings withdrawal recorded', notification: 'savings_withdrawn' },
+};
+const pesos = (value) => `PHP ${Number(value).toLocaleString('en-PH', { minimumFractionDigits: 2 })}`;
+
+// Inserts one savings deposit or withdrawal inside the caller's transaction.
+// Locking the member row keeps two entries for the same member from reading
+// the same balance.
+async function insertSavingsTransaction(client, req, { kind, memberId, amountCents, date, paymentMethod, reference, notes }) {
+  const details = SAVINGS_KINDS[kind];
   const member = (await client.query('SELECT id, member_number, status FROM members WHERE id = $1 FOR UPDATE', [memberId])).rows[0];
   if (!member) throw notFound('Member not found.');
-  if (member.status === 'archived') throw badRequest('Savings cannot be recorded for an archived member.');
+  if (kind === 'deposit' && member.status === 'archived') throw badRequest('Savings cannot be recorded for an archived member.');
   if (reference) {
     const duplicate = await client.query('SELECT 1 FROM savings_transactions WHERE member_id = $1 AND LOWER(reference_number) = LOWER($2)', [memberId, reference]);
     if (duplicate.rows[0]) throw conflict('A savings record with this reference number already exists for this member.');
   }
-  const before = (await client.query('SELECT COALESCE(SUM(amount), 0) AS total FROM savings_transactions WHERE member_id = $1', [memberId])).rows[0].total;
+  const before = (await savingsBalanceOf(client, memberId)).rows[0].total;
+  if (kind === 'withdrawal') {
+    if (amountCents > toCents(before)) throw badRequest(`The withdrawal is more than the member's savings balance of ${pesos(before)}.`);
+    const available = await savingsAvailableOn(client, memberId, date);
+    if (amountCents > toCents(available)) throw badRequest(`On ${date} the member's savings balance was only ${pesos(available)}. Use a later date or a smaller amount.`);
+  }
   const inserted = (await client.query(
     `INSERT INTO savings_transactions (member_id, transaction_type, amount, transaction_date, payment_method, reference_number, notes, recorded_by)
-     VALUES ($1, 'deposit', $2::numeric, $3, $4, $5, $6, $7)
+     VALUES ($1, $2, $3::numeric, $4, $5, $6, $7, $8)
      RETURNING id, member_id AS "memberId", amount, transaction_date AS date, payment_method AS "paymentMethod", reference_number AS reference, notes, created_at AS "createdAt"`,
-    [memberId, centsToString(amountCents), date, paymentMethod, reference, notes, currentUserId(req)]
+    [memberId, kind, centsToString(amountCents), date, paymentMethod, reference, notes, currentUserId(req)]
   )).rows[0];
-  const newTotal = centsToString(toCents(before) + amountCents);
+  const newTotal = centsToString(toCents(before) + (kind === 'withdrawal' ? -amountCents : amountCents));
   await createAuditLog({
     client,
     user: req.user,
-    action: 'SAVINGS_DEPOSIT_CREATED',
+    action: details.action,
     module: 'Savings',
     entityType: 'savings_transaction',
     entityId: String(inserted.id),
-    description: `Recorded savings deposit for member ${member.member_number || memberId}`,
+    description: `Recorded savings ${details.label} for member ${member.member_number || memberId}`,
     oldValues: { total_savings: before },
     newValues: { member_id: memberId, amount: centsToString(amountCents), total_savings: newTotal, date, payment_method: paymentMethod, reference_number: reference },
     ...getRequestMeta(req),
   });
   await notifyMember(client, memberId, {
-    type: 'savings_recorded',
-    title: 'Savings deposit recorded',
-    message: `A savings deposit of PHP ${Number(centsToString(amountCents)).toLocaleString('en-PH', { minimumFractionDigits: 2 })} was recorded. Your total savings are PHP ${Number(newTotal).toLocaleString('en-PH', { minimumFractionDigits: 2 })}.`,
+    type: details.notification,
+    title: details.title,
+    message: `A savings ${details.label} of ${pesos(centsToString(amountCents))} was recorded. Your total savings are ${pesos(newTotal)}.`,
     severity: 'success',
     link: '/member-profile',
     entityType: 'savings_transaction',
     entityId: inserted.id,
     dedupeKey: `savings-${inserted.id}`,
   });
-  return { record: { ...inserted, amount: Number(inserted.amount), type: 'Deposit', status: 'Completed' }, total: Number(newTotal) };
+  return { record: { ...inserted, amount: Number(inserted.amount), type: kind === 'withdrawal' ? 'Withdrawal' : 'Deposit', status: 'Completed' }, total: Number(newTotal) };
+}
+
+// Shared by the savings form and by OCR-posted savings forms.
+export const insertSavingsDeposit = (client, req, input) => insertSavingsTransaction(client, req, { ...input, kind: 'deposit' });
+
+function readSavingsInput(body, defaultMethod) {
+  const memberId = parseId(body?.memberId, 'member');
+  const amountCents = parseMoneyInput(body?.amount);
+  const date = cleanString(body?.date ?? body?.transactionDate, 10);
+  const paymentMethod = cleanString(body?.paymentMethod || defaultMethod, 50);
+  const reference = optionalString(body?.reference ?? body?.referenceNumber, 100);
+  const notes = cleanString(body?.notes, 1000);
+  if (amountCents === null) throw badRequest('Amount must be greater than zero with at most two decimals.');
+  if (!isValidDateOnly(date)) throw badRequest('A valid date (YYYY-MM-DD) is required.');
+  if (date > todayDateOnly()) throw badRequest('Savings date cannot be in the future.');
+  if (!SAVINGS_METHODS.includes(paymentMethod)) throw badRequest(`Payment method must be one of: ${SAVINGS_METHODS.join(', ')}.`);
+  return { memberId, amountCents, date, paymentMethod, reference, notes };
 }
 
 // POST /api/members/savings  { memberId, amount, date, paymentMethod?, reference?, notes? }
 // Savings deposits are a separate ledger from share capital (no PHP 20,000 cap).
 export async function createSavingsRecord(req, res) {
-  const memberId = parseId(req.body?.memberId, 'member');
-  const amountCents = parseMoneyInput(req.body?.amount);
-  const date = cleanString(req.body?.date ?? req.body?.transactionDate, 10);
-  const paymentMethod = cleanString(req.body?.paymentMethod || 'Deposit', 50);
-  const reference = optionalString(req.body?.reference ?? req.body?.referenceNumber, 100);
-  const notes = cleanString(req.body?.notes, 1000);
-  if (amountCents === null) throw badRequest('Amount must be greater than zero with at most two decimals.');
-  if (!isValidDateOnly(date)) throw badRequest('A valid date (YYYY-MM-DD) is required.');
-  if (date > todayDateOnly()) throw badRequest('Savings date cannot be in the future.');
-  if (!SAVINGS_METHODS.includes(paymentMethod)) throw badRequest(`Payment method must be one of: ${SAVINGS_METHODS.join(', ')}.`);
-
-  const result = await withTransaction((client) => insertSavingsDeposit(client, req, { memberId, amountCents, date, paymentMethod, reference, notes }));
-  void emailMember(memberId, (recipient) => savingsDepositEmail({ memberName: recipient.full_name, amount: result.record.amount, date, reference, total: result.total }));
+  const input = readSavingsInput(req.body, 'Deposit');
+  const result = await withTransaction((client) => insertSavingsDeposit(client, req, input));
+  void emailMember(input.memberId, (recipient) => savingsDepositEmail({ memberName: recipient.full_name, amount: result.record.amount, date: input.date, reference: input.reference, total: result.total }));
   return res.status(201).json({ success: true, data: result.record, memberTotal: result.total, message: 'Savings recorded.' });
+}
+
+// POST /api/members/savings/withdrawals  { memberId, amount, date, paymentMethod?, reference?, notes? }
+// Takes money out of the member's savings; never more than the balance.
+export async function createSavingsWithdrawal(req, res) {
+  const input = readSavingsInput(req.body, 'Cash');
+  const result = await withTransaction((client) => insertSavingsTransaction(client, req, { ...input, kind: 'withdrawal' }));
+  void emailMember(input.memberId, (recipient) => savingsWithdrawalEmail({ memberName: recipient.full_name, amount: result.record.amount, date: input.date, reference: input.reference, total: result.total }));
+  return res.status(201).json({ success: true, data: result.record, memberTotal: result.total, message: 'Withdrawal recorded.' });
+}
+
+// GET /api/members/savings/members?search=&page=&limit=
+// Every member with savings entries (archived members left out), by name, with
+// the balance, the deposits and withdrawals, and the last entry's date.
+// search matches the name or the member ID.
+export async function listSavingsMembers(req, res) {
+  const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 25, maxLimit: 100 });
+  const params = [];
+  const conditions = [`m.status <> 'archived'`];
+  const search = cleanString(req.query.search, 100);
+  if (search) {
+    params.push(`%${search}%`);
+    const p = `$${params.length}`;
+    conditions.push(`(${savingsMemberName} ILIKE ${p} OR CONCAT_WS(' ', m.first_name, m.last_name) ILIKE ${p} OR CONCAT_WS(', ', m.last_name, m.first_name) ILIKE ${p} OR m.member_number ILIKE ${p})`);
+  }
+  const from = `FROM members m JOIN (
+      SELECT st.member_id, SUM(${signedSavings('st')}) AS balance,
+             COALESCE(SUM(st.amount) FILTER (WHERE st.transaction_type = 'deposit'), 0) AS deposits,
+             COALESCE(SUM(st.amount) FILTER (WHERE st.transaction_type = 'withdrawal'), 0) AS withdrawals,
+             COUNT(*)::int AS entries, MAX(st.transaction_date) AS last_date
+      FROM savings_transactions st GROUP BY st.member_id
+    ) s ON s.member_id = m.id
+    WHERE ${conditions.join(' AND ')}`;
+  const [rows, count] = await Promise.all([
+    query(
+      `SELECT m.id, m.member_number AS "memberNumber", ${savingsMemberName} AS "memberName", s.balance, s.deposits, s.withdrawals,
+              s.entries AS "transactions", s.last_date AS "lastTransactionDate"
+       ${from} ORDER BY LOWER(m.last_name), LOWER(m.first_name), m.id LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
+    ),
+    query(`SELECT COUNT(*)::int AS total ${from}`, params),
+  ]);
+  const members = rows.rows.map((row) => ({
+    id: Number(row.id), memberNumber: row.memberNumber || '—', memberName: row.memberName || 'Unknown Member',
+    balance: Number(row.balance), deposits: Number(row.deposits), withdrawals: Number(row.withdrawals),
+    transactions: row.transactions, lastTransactionDate: row.lastTransactionDate,
+  }));
+  return res.status(200).json({ success: true, data: members, pagination: paginationMeta(page, limit, count.rows[0].total) });
+}
+
+// GET /api/members/:id/savings?page=&limit=
+// One member's savings history, newest first, with the balance after each entry.
+export async function getMemberSavings(req, res) {
+  const memberId = parseId(req.params.id, 'member ID');
+  const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 25, maxLimit: 100 });
+  const member = (await query(`SELECT m.id, m.member_number, ${savingsMemberName} AS name, m.status FROM members m WHERE m.id = $1`, [memberId])).rows[0];
+  if (!member) throw notFound('Member not found.');
+  const [rows, totals] = await Promise.all([
+    query(
+      `SELECT * FROM (
+         SELECT st.id, ${savingsTypeLabel('st')} AS "type", st.amount, st.transaction_date AS "date", st.payment_method AS "paymentMethod",
+                st.reference_number AS "reference", st.notes, st.created_at AS "createdAt", u.username AS "recordedBy",
+                SUM(${signedSavings('st')}) OVER (ORDER BY st.transaction_date, st.id) AS "balance"
+         FROM savings_transactions st LEFT JOIN users u ON u.id = st.recorded_by
+         WHERE st.member_id = $1
+       ) t ORDER BY t."date" DESC, t.id DESC LIMIT $2 OFFSET $3`,
+      [memberId, limit, offset]
+    ),
+    query(
+      `SELECT COUNT(*)::int AS entries, COALESCE(SUM(${signedSavings('st')}), 0) AS balance,
+              COALESCE(SUM(st.amount) FILTER (WHERE st.transaction_type = 'deposit'), 0) AS deposits,
+              COALESCE(SUM(st.amount) FILTER (WHERE st.transaction_type = 'withdrawal'), 0) AS withdrawals
+       FROM savings_transactions st WHERE st.member_id = $1`,
+      [memberId]
+    ),
+  ]);
+  const t = totals.rows[0];
+  return res.status(200).json({
+    success: true,
+    member: { id: Number(member.id), memberNumber: member.member_number || '—', memberName: member.name, status: member.status },
+    summary: { balance: Number(t.balance), deposits: Number(t.deposits), withdrawals: Number(t.withdrawals), transactions: t.entries },
+    data: rows.rows.map((row) => ({
+      id: Number(row.id), type: row.type, amount: Number(row.amount), balance: Number(row.balance), date: row.date,
+      paymentMethod: row.paymentMethod || 'Not specified', reference: row.reference || `SAV-${row.id}`, notes: row.notes || '',
+      recordedBy: row.recordedBy || null, createdAt: row.createdAt,
+    })),
+    pagination: paginationMeta(page, limit, t.entries),
+  });
 }
 
 export async function listSavingsRecords(req, res) {
@@ -435,18 +570,22 @@ export async function listSavingsRecords(req, res) {
   }
   const where = `WHERE ${conditions.join(' AND ')}`;
   const from = `FROM savings_transactions st INNER JOIN members m ON m.id = st.member_id`;
+  const deposit = `st.transaction_type = 'deposit'`;
   const [rows, totals] = await Promise.all([
     query(
-      `SELECT st.id, st.member_id AS "memberId", TRIM(CONCAT_WS(' ', m.first_name, m.middle_name, m.last_name, m.suffix)) AS "memberName",
-              m.member_number AS "memberNumber", st.amount, st.transaction_date AS "date", st.payment_method AS "paymentMethod",
+      `SELECT st.id, st.member_id AS "memberId", ${savingsMemberName} AS "memberName",
+              m.member_number AS "memberNumber", ${savingsTypeLabel('st')} AS "type", st.amount, st.transaction_date AS "date", st.payment_method AS "paymentMethod",
               st.reference_number AS "reference", st.notes, st.created_at AS "createdAt"
        ${from} ${where} ORDER BY st.transaction_date DESC, st.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
       [...params, limit, offset]
     ),
+    // totalAmount is the savings balance (deposits minus withdrawals); today and
+    // thisMonth are the deposits made then.
     query(
-      `SELECT COUNT(*)::int AS total, COALESCE(SUM(st.amount), 0) AS amount, COUNT(DISTINCT st.member_id)::int AS members,
-              COALESCE(SUM(st.amount) FILTER (WHERE st.transaction_date = ${SQL_TODAY}), 0) AS today,
-              COALESCE(SUM(st.amount) FILTER (WHERE DATE_TRUNC('month', st.transaction_date) = DATE_TRUNC('month', ${SQL_TODAY})), 0) AS month
+      `SELECT COUNT(*)::int AS total, COALESCE(SUM(${signedSavings('st')}), 0) AS amount, COUNT(DISTINCT st.member_id)::int AS members,
+              COALESCE(SUM(st.amount) FILTER (WHERE ${deposit} AND st.transaction_date = ${SQL_TODAY}), 0) AS today,
+              COALESCE(SUM(st.amount) FILTER (WHERE ${deposit} AND DATE_TRUNC('month', st.transaction_date) = DATE_TRUNC('month', ${SQL_TODAY})), 0) AS month,
+              COALESCE(SUM(st.amount) FILTER (WHERE st.transaction_type = 'withdrawal'), 0) AS withdrawals
        ${from} ${where}`,
       params
     ),
@@ -458,7 +597,7 @@ export async function listSavingsRecords(req, res) {
     memberNumber: row.memberNumber || '—',
     date: row.date,
     amount: Number(row.amount),
-    type: 'Deposit',
+    type: row.type,
     paymentMethod: row.paymentMethod || 'Not specified',
     reference: row.reference || `SAV-${row.id}`,
     notes: row.notes || '',
@@ -469,7 +608,7 @@ export async function listSavingsRecords(req, res) {
   return res.status(200).json({
     success: true,
     data: records,
-    summary: { totalAmount: Number(t.amount), totalRecords: t.total, members: t.members, today: Number(t.today), thisMonth: Number(t.month) },
+    summary: { totalAmount: Number(t.amount), totalRecords: t.total, members: t.members, today: Number(t.today), thisMonth: Number(t.month), withdrawals: Number(t.withdrawals) },
     pagination: paginationMeta(page, limit, t.total),
   });
 }

@@ -36,6 +36,7 @@ const ACTIONS = {
   MEMBER_RESTORED: ['profile', 'Membership restored'],
   // Savings & share capital
   SAVINGS_DEPOSIT_CREATED: ['savings', 'Savings deposit recorded'],
+  SAVINGS_WITHDRAWAL_CREATED: ['savings', 'Savings withdrawal recorded'],
   SHARE_CONTRIBUTION_CREATED: ['savings', 'Share capital contribution recorded'],
   // Loans & payments
   LOAN_APPLICATION_SUBMITTED: ['loans', 'Loan application submitted'],

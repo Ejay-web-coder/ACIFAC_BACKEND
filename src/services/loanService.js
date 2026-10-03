@@ -5,6 +5,7 @@ import { loanReminderEmail } from './emailTemplates.js';
 import { flushSmsOutbox, loanReminderSms, queueSmsForUsers } from './smsService.js';
 import { SQL_TODAY } from '../config/env.js';
 import { centsToString, toCents } from '../utils/money.js';
+import { paymentHours } from './officeHours.js';
 
 // ACIFAC agricultural loan policy (unchanged from the existing system):
 //   * maximum loan = farm area (ha) x PHP 50,000
@@ -42,6 +43,9 @@ export async function calculateLoanFinancials(db, { farmArea, amount, term, inte
 }
 
 // Creates the installment schedule for a loan (no-op if it already exists).
+// Installments fall due monthly from the approval date; a due date on a day
+// the office does not receive payments (a weekend) moves to the next day it
+// does. The loan's due date is its last installment's.
 export async function createInstallments(client, loanId) {
   await client.query(
     `WITH base AS (
@@ -56,9 +60,20 @@ export async function createInstallments(client, loanId) {
        FROM base b CROSS JOIN LATERAL generate_series(1, b.term) AS n
      )
      INSERT INTO loan_installments (loan_id, installment_number, due_date, amount_due, principal_due, interest_due)
-     SELECT id, n, (date_approved + make_interval(months => n))::date, amount_due, GREATEST(amount_due - interest_due, 0), LEAST(interest_due, amount_due)
+     SELECT id, n, due.day, amount_due, GREATEST(amount_due - interest_due, 0), LEAST(interest_due, amount_due)
      FROM parts
+     CROSS JOIN LATERAL (
+       SELECT ((date_approved + make_interval(months => n))::date + k) AS day
+       FROM generate_series(0, 6) AS k
+       WHERE EXTRACT(ISODOW FROM (date_approved + make_interval(months => n))::date + k)::int = ANY($2::int[])
+       ORDER BY k LIMIT 1
+     ) due
      ON CONFLICT (loan_id, installment_number) DO NOTHING`,
+    [loanId, paymentHours().days]
+  );
+  await client.query(
+    `UPDATE loans SET due_date = last.due_date FROM (SELECT MAX(due_date) AS due_date FROM loan_installments WHERE loan_id = $1) last
+     WHERE loans.id = $1 AND last.due_date IS NOT NULL AND loans.due_date IS DISTINCT FROM last.due_date`,
     [loanId]
   );
 }

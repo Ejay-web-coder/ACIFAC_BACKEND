@@ -3,6 +3,7 @@ import { SQL_TODAY, TIME_ZONE } from '../config/env.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { badRequest } from '../utils/http.js';
 import { refreshLoanStatusesInBackground } from '../services/loanService.js';
+import { signedSavings } from '../services/savingsLedger.js';
 import { refreshRentalStatusesInBackground } from './machineryController.js';
 
 const toNumber = (value) => Number(value || 0);
@@ -81,8 +82,8 @@ export async function getAnalytics(req, res) {
         (SELECT COUNT(*)::int FROM members WHERE membership_date BETWEEN $1::date AND $2::date AND status <> 'archived') AS "newMembers",
         (SELECT COALESCE(SUM(sc.amount), 0) FROM share_contributions sc WHERE sc.contribution_date BETWEEN $1::date AND $2::date) AS "shareCapital",
         (SELECT COALESCE(SUM(sc.amount), 0) FROM share_contributions sc) AS "totalShareCapital",
-        (SELECT COALESCE(SUM(st.amount), 0) FROM savings_transactions st) AS "totalSavings",
-        (SELECT COALESCE(SUM(st.amount), 0) FROM savings_transactions st WHERE st.transaction_date BETWEEN $1::date AND $2::date) AS "savingsDeposits",
+        (SELECT COALESCE(SUM(${signedSavings('st')}), 0) FROM savings_transactions st) AS "totalSavings",
+        (SELECT COALESCE(SUM(st.amount), 0) FROM savings_transactions st WHERE st.transaction_type = 'deposit' AND st.transaction_date BETWEEN $1::date AND $2::date) AS "savingsDeposits",
         (SELECT COALESCE(SUM(lp.amount), 0) FROM loan_payments lp WHERE lp.payment_date BETWEEN $1::date AND $2::date) AS "loanPayments",
         (SELECT COALESCE(SUM(lp.amount), 0) FROM loan_payments lp) AS "totalLoanPayments",
         (SELECT COALESCE(SUM(lp.interest_paid), 0) FROM loan_payments lp WHERE lp.payment_date BETWEEN $1::date AND $2::date) AS "interestCollected",
@@ -152,7 +153,7 @@ export async function getAnalytics(req, res) {
       ), share_totals AS (
         SELECT member_id, COALESCE(SUM(amount), 0) AS total FROM share_contributions GROUP BY member_id
       ), savings_totals AS (
-        SELECT member_id, COALESCE(SUM(amount), 0) AS total FROM savings_transactions GROUP BY member_id
+        SELECT st.member_id, COALESCE(SUM(${signedSavings('st')}), 0) AS total FROM savings_transactions st GROUP BY st.member_id
       ), history AS (
         SELECT l.member_id, json_agg(json_build_object(
                  'id', l.id, 'loanNumber', l.loan_number, 'amount', l.amount, 'balance', l.balance, 'status', l.status,

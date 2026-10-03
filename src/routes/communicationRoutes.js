@@ -5,7 +5,7 @@ import {
 } from '../controllers/communicationController.js';
 import { requireAdmin, requireAuth } from '../middleware/auth.js';
 import { legalDocumentUpload } from '../middleware/upload.js';
-import { eventStream } from '../services/events.js';
+import { changesSince, eventStream } from '../services/events.js';
 
 export const notificationRoutes = express.Router()
   .use(requireAuth)
@@ -26,4 +26,4 @@ export const legalDocumentRoutes = express.Router()
   .get('/:id/file', downloadLegalDocument)
   .delete('/:id', deleteLegalDocument);
 
-export const eventRoutes = express.Router().get('/', requireAuth, eventStream);
+export const eventRoutes = express.Router().get('/', requireAuth, eventStream).get('/changes', requireAuth, changesSince);

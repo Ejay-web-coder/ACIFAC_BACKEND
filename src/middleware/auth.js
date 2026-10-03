@@ -11,7 +11,7 @@ const PASSWORD_CHANGE_ALLOWED_GET = new Set(['/api/notifications']);
 // Every request the person makes counts as activity, except the live-update
 // stream (which stays open and reconnects by itself) and requests the browser
 // marks with "X-Session-Activity: passive" (background refreshes and checks).
-const PASSIVE_PATHS = new Set(['/api/events']);
+const PASSIVE_PATHS = new Set(['/api/events', '/api/events/changes']);
 // last_activity_at is written at most this often per session.
 const ACTIVITY_WRITE_INTERVAL_SECONDS = 30;
 const IDLE_TIMEOUT_SECONDS = SESSION_IDLE_TIMEOUT_MINUTES * 60;

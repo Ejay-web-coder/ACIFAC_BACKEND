@@ -69,7 +69,8 @@ export function createApp() {
     max: Number(process.env.API_RATE_LIMIT_PER_MINUTE || 600),
     standardHeaders: true,
     legacyHeaders: false,
-    skip: (req) => req.path === '/events',
+    // Live updates and the every-3-seconds change poll.
+    skip: (req) => req.path === '/events' || req.path === '/events/changes',
     message: { success: false, message: 'Too many requests. Please slow down.' },
   }));
   app.use('/api', noStore, csrfProtection);

@@ -1,4 +1,4 @@
-import { createDedicatedClient } from '../config/db.js';
+import { createDedicatedClient, query } from '../config/db.js';
 import { endIdleSession, loadSession } from '../middleware/auth.js';
 import { getRequestMeta } from '../utils/http.js';
 
@@ -93,6 +93,40 @@ export async function stopEventListener() {
 
 export function isListening() {
   return Boolean(listener);
+}
+
+// Where live updates are off (DISABLE_LIVE_UPDATES on Vercel), browsers poll
+// instead: the live-update trigger also writes each change to data_changes
+// (migration 027). Changes from the last few seconds are sent again on every
+// poll, so one that commits after a later one is not missed; the browser
+// skips ids it has already seen.
+const RECENT_SECONDS = 15;
+const MAX_CHANGES = 1000;
+const KEEP_HOURS = 1;
+let lastPrune = 0;
+
+// GET /api/events/changes?after=<cursor> (behind requireAuth; never counts as activity)
+// { cursor, changes: [{ id, table }] }: the changes after the cursor that the
+// signed-in user may see. Without a cursor it only returns where to start.
+export async function changesSince(req, res) {
+  const raw = String(req.query.after ?? '');
+  if (!/^\d{1,18}$/.test(raw)) {
+    const latest = (await query('SELECT COALESCE(MAX(id), 0)::text AS id FROM data_changes')).rows[0].id;
+    return res.json({ success: true, cursor: latest, changes: [] });
+  }
+  const rows = (await query(
+    `SELECT id::text AS id, table_name AS "table", member_id AS "memberId", user_id AS "userId"
+     FROM data_changes
+     WHERE id > $1::bigint OR changed_at > clock_timestamp() - make_interval(secs => $2)
+     ORDER BY id LIMIT $3`,
+    [raw, RECENT_SECONDS, MAX_CHANGES]
+  )).rows;
+  const cursor = rows.reduce((max, row) => (BigInt(row.id) > BigInt(max) ? row.id : max), raw);
+  if (Date.now() - lastPrune > 60000) {
+    lastPrune = Date.now();
+    query(`DELETE FROM data_changes WHERE changed_at < NOW() - make_interval(hours => $1)`, [KEEP_HOURS]).catch((error) => console.error('Change log cleanup failed:', error.message));
+  }
+  return res.json({ success: true, cursor, changes: rows.filter((row) => canReceiveEvent(req.user, row)).map(({ id, table }) => ({ id, table })) });
 }
 
 // GET /api/events (behind requireAuth)

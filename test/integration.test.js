@@ -194,6 +194,8 @@ before(async () => {
   Object.assign(process.env, {
     TEXTBEE_API_URL: `http://127.0.0.1:${stubServer.address().port}/textbee`, TEXTBEE_API_KEY: 'test-textbee-key', TEXTBEE_DEVICE_ID: 'test-device',
     SMS_SEND_HOURS: '0-24', SMS_SEND_GAP_MS: '0',
+    // Loan payments can be recorded whenever the tests run; the office-hours test narrows it.
+    LOAN_PAYMENT_HOURS: 'Mon-Sun 00:00-24:00',
   });
 
   const { createApp } = await import('../src/app.js');
@@ -392,6 +394,105 @@ test('savings deposits and share capital are separate ledgers', { skip }, async 
   assert.equal(mine.data.data.savings.total, 32500.5);
   assert.equal(mine.data.data.shareDetails.total, 1500);
   assert.equal(mine.data.data.member.share_capital, 1500);
+});
+
+test('savings: members with savings, history with the running balance, withdrawals', { skip }, async () => {
+  // The member has 2,500.50 (Feb 1) and 30,000 (Feb 2) from the test above.
+  const withdraw = (body) => admin.post('/api/members/savings/withdrawals', { memberId: state.memberId, paymentMethod: 'Cash', ...body });
+  const tooMuch = await withdraw({ amount: '40000', date: '2026-02-03' });
+  assert.equal(tooMuch.status, 400);
+  assert.match(tooMuch.data.message, /more than the member's savings balance of PHP 32,500\.50/);
+  // A back-dated withdrawal cannot take out money deposited later.
+  const backDated = await withdraw({ amount: '3000', date: '2026-02-01' });
+  assert.equal(backDated.status, 400);
+  assert.match(backDated.data.message, /On 2026-02-01 the member's savings balance was only PHP 2,500\.50/);
+  assert.equal((await withdraw({ amount: '0', date: '2026-02-03' })).status, 400);
+  assert.equal((await withdraw({ amount: '5', date: '2999-01-01' })).status, 400);
+  assert.equal((await member.post('/api/members/savings/withdrawals', { memberId: state.memberId, amount: '5', date: '2026-02-03' })).status, 403);
+
+  const first = await withdraw({ amount: '2000', date: '2026-02-01', reference: 'WD-1' });
+  assert.equal(first.status, 201, JSON.stringify(first.data));
+  assert.equal(first.data.memberTotal, 30500.5);
+  assert.equal(first.data.data.type, 'Withdrawal');
+  assert.equal((await withdraw({ amount: '10', date: '2026-02-03', reference: 'wd-1' })).status, 409);
+  // Only 500.50 was left on Feb 1.
+  assert.equal((await withdraw({ amount: '600', date: '2026-02-01' })).status, 400);
+  const second = await withdraw({ amount: '500.50', date: '2026-02-03', notes: 'For seeds' });
+  assert.equal(second.status, 201, JSON.stringify(second.data));
+  assert.equal(second.data.memberTotal, 30000);
+
+  // The list of members with savings, searched by member ID or name.
+  const memberNumber = (await admin.get(`/api/members/${state.memberId}`)).data.data.member_number;
+  const byId = await admin.get(`/api/members/savings/members?search=${encodeURIComponent(memberNumber)}`);
+  assert.equal(byId.status, 200, JSON.stringify(byId.data));
+  const row = byId.data.data.find((item) => item.id === state.memberId);
+  assert.deepEqual({ balance: row.balance, deposits: row.deposits, withdrawals: row.withdrawals, transactions: row.transactions }, { balance: 30000, deposits: 32500.5, withdrawals: 2500.5, transactions: 4 });
+  assert.equal(row.lastTransactionDate, '2026-02-03');
+  assert.ok((await admin.get('/api/members/savings/members?search=dela%20cruz')).data.data.some((item) => item.id === state.memberId));
+  assert.ok((await admin.get('/api/members/savings/members?search=Cruz,%20Juan')).data.data.some((item) => item.id === state.memberId), 'last name, first name');
+  assert.equal((await admin.get('/api/members/savings/members?search=nobody-here')).data.data.length, 0);
+  assert.ok(!(await admin.get('/api/members/savings/members')).data.data.some((item) => item.id === state.secondMemberId), 'members without savings are not listed');
+  assert.equal((await member.get('/api/members/savings/members')).status, 403);
+
+  // One member's history: newest first, with the balance after each entry.
+  const history = await admin.get(`/api/members/${state.memberId}/savings`);
+  assert.equal(history.status, 200, JSON.stringify(history.data));
+  assert.deepEqual(history.data.summary, { balance: 30000, deposits: 32500.5, withdrawals: 2500.5, transactions: 4 });
+  assert.deepEqual(history.data.data.map((entry) => [entry.date, entry.type, entry.amount, entry.balance]), [
+    ['2026-02-03', 'Withdrawal', 500.5, 30000],
+    ['2026-02-02', 'Deposit', 30000, 30500.5],
+    ['2026-02-01', 'Withdrawal', 2000, 500.5],
+    ['2026-02-01', 'Deposit', 2500.5, 2500.5],
+  ]);
+  assert.equal(history.data.data[0].notes, 'For seeds');
+  assert.equal(history.data.member.memberNumber, memberNumber);
+  assert.equal((await admin.get('/api/members/999999/savings')).status, 404);
+  assert.equal((await member.get(`/api/members/${state.memberId}/savings`)).status, 403);
+
+  // Totals everywhere are deposits minus withdrawals.
+  const all = await admin.get('/api/members/savings');
+  assert.equal(all.data.summary.totalAmount, 30000);
+  assert.equal(all.data.summary.withdrawals, 2500.5);
+  assert.ok(all.data.data.some((entry) => entry.type === 'Withdrawal' && entry.reference === 'WD-1'));
+  const mine = await member.get('/api/members/me');
+  assert.equal(mine.data.data.savings.total, 30000);
+  assert.deepEqual([mine.data.data.savings.transactions[0].type, mine.data.data.savings.transactions[0].balance], ['Withdrawal', 30000]);
+  const audit = await pool.query(`SELECT new_values FROM audit_logs WHERE action = 'SAVINGS_WITHDRAWAL_CREATED' ORDER BY id`);
+  assert.deepEqual(audit.rows.map((r) => r.new_values.total_savings), ['30500.50', '30000.00']);
+  const analytics = await admin.get('/api/admin/analytics');
+  assert.equal(analytics.status, 200, JSON.stringify(analytics.data));
+});
+
+test('auto refresh: browsers poll which tables changed, and only see their own', { skip }, async () => {
+  assert.equal((await new Client().get('/api/events/changes')).status, 401);
+  const start = await admin.get('/api/events/changes');
+  assert.equal(start.status, 200, JSON.stringify(start.data));
+  assert.deepEqual(start.data.changes, [], 'without a cursor it only says where to start');
+  const cursor = start.data.cursor;
+  const memberStart = (await member.get('/api/events/changes')).data.cursor;
+  assert.equal(memberStart, cursor);
+
+  // A deposit for the other member: the admin sees it, the member does not.
+  const saved = await admin.post('/api/members/savings', { memberId: state.secondMemberId, amount: '50', date: '2026-03-01' });
+  assert.equal(saved.status, 201, JSON.stringify(saved.data));
+  const after = (response) => response.data.changes.filter((change) => BigInt(change.id) > BigInt(cursor));
+  const adminPoll = await admin.get(`/api/events/changes?after=${cursor}`);
+  assert.ok(after(adminPoll).some((change) => change.table === 'savings_transactions'), JSON.stringify(adminPoll.data));
+  assert.ok(BigInt(adminPoll.data.cursor) > BigInt(cursor));
+  const memberPoll = await member.get(`/api/events/changes?after=${memberStart}`);
+  assert.ok(!after(memberPoll).some((change) => change.table === 'savings_transactions'), 'another member\'s savings stay private');
+
+  // The member's own deposit reaches them.
+  const own = await admin.post('/api/members/savings', { memberId: state.memberId, amount: '25', date: '2026-03-01' });
+  assert.equal(own.status, 201);
+  const mine = await member.get(`/api/events/changes?after=${memberPoll.data.cursor}`);
+  assert.ok(mine.data.changes.some((change) => change.table === 'savings_transactions' && BigInt(change.id) > BigInt(memberPoll.data.cursor)), JSON.stringify(mine.data));
+  // Recent changes come again with the same ids, so a change that committed late is not missed.
+  const again = await member.get(`/api/events/changes?after=${mine.data.cursor}`);
+  const ids = new Set(mine.data.changes.map((change) => change.id));
+  assert.ok(again.data.changes.some((change) => ids.has(change.id)));
+  assert.equal(again.data.cursor, mine.data.cursor);
+  assert.equal((await admin.get('/api/events/changes?after=abc')).data.changes.length, 0);
 });
 
 test('loans: quote, apply, approve, installments, payments, overdue, paid', { skip }, async () => {
@@ -795,6 +896,55 @@ test('loans: applications typed into the app need the borrower and co-maker IDs 
   assert.ok(released.data.loan.borrowerSignature, 'a loan released at once keeps the signature');
   // These loans are not part of the analytics test that follows.
   await pool.query('DELETE FROM loans WHERE id = ANY($1::int[])', [[approved.data.loanId, released.data.loan.databaseId]]);
+});
+
+test('loans: payments are received on weekdays during office hours; due dates skip closed days', { skip }, async () => {
+  const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const isoDay = (date) => ((new Date(`${date}T00:00:00Z`).getUTCDay() + 6) % 7) + 1;
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date());
+  // The most recent date (today or before) on the given ISO weekday.
+  const lastDay = (iso) => { const date = new Date(`${today}T00:00:00Z`); while (isoDay(date.toISOString().slice(0, 10)) !== iso) date.setUTCDate(date.getUTCDate() - 1); return date.toISOString().slice(0, 10); };
+  const pay = (paymentDate) => admin.post(`/api/admin/loans/${state.loanId}/payments`, { amount: '1', paymentDate });
+  try {
+    delete process.env.LOAN_PAYMENT_HOURS;
+    const policy = await member.get('/api/loans/policy');
+    assert.equal(policy.status, 200);
+    assert.deepEqual({ days: policy.data.policy.paymentHours.days, open: policy.data.policy.paymentHours.open, close: policy.data.policy.paymentHours.close, label: policy.data.policy.paymentHours.label },
+      { days: [1, 2, 3, 4, 5], open: 480, close: 1020, label: 'Monday to Friday, 8:00 AM to 5:00 PM' });
+    assert.equal(typeof policy.data.policy.paymentHours.openNow, 'boolean');
+
+    // A payment dated a Saturday or Sunday is refused.
+    process.env.LOAN_PAYMENT_HOURS = 'Mon-Fri 00:00-24:00';
+    for (const weekend of [lastDay(6), lastDay(7)]) {
+      const refused = await pay(weekend);
+      assert.equal(refused.status, 400, JSON.stringify(refused.data));
+      assert.match(refused.data.message, /Loan payments are received Monday to Friday, any time only\. .* is a (Saturday|Sunday)\./);
+    }
+
+    // Outside office hours nothing can be recorded, whatever the payment date.
+    const other = (isoDay(today) % 7) + 1;
+    process.env.LOAN_PAYMENT_HOURS = `${DAYS[other - 1]} 00:00-24:00`;
+    const closed = await pay(lastDay(other));
+    assert.equal(closed.status, 400, JSON.stringify(closed.data));
+    assert.match(closed.data.message, /only during office hours/);
+    assert.equal((await member.get('/api/loans/policy')).data.policy.paymentHours.openNow, false);
+
+    // New loans: every installment falls on a day the office receives payments.
+    process.env.LOAN_PAYMENT_HOURS = 'Mon-Fri 08:00-17:00';
+    const released = await applyWithIds(admin, '/api/admin/loans', {
+      loanType: 'agricultural', loanMode: 'cash', cashAmount: '2400', term: 12, farmArea: '2', borrowerPhone: '09171234567', borrowerAddress: 'Purok 1, Amnay', cropsPlanted: 'Palay', certified: true, memberId: state.memberId,
+    }, { acknowledgeIdWarnings: true });
+    assert.equal(released.status, 201, JSON.stringify(released.data));
+    const loanId = released.data.loan.databaseId;
+    const detail = await admin.get(`/api/admin/loans/${loanId}`);
+    const dueDates = detail.data.installments.map((row) => row.dueDate);
+    assert.equal(dueDates.length, 12);
+    assert.ok(dueDates.every((date) => isoDay(date) <= 5), JSON.stringify(dueDates));
+    assert.equal(detail.data.loan.dueDate, dueDates.at(-1), 'the loan is due with its last installment');
+    await pool.query('DELETE FROM loans WHERE id = $1', [loanId]);
+  } finally {
+    process.env.LOAN_PAYMENT_HOURS = 'Mon-Sun 00:00-24:00';
+  }
 });
 
 test('ocr: upload, classify, duplicate, failure recorded and retried, review saved', { skip }, async () => {

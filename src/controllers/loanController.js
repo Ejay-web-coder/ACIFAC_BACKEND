@@ -1,13 +1,14 @@
 import { query, withTransaction } from '../config/db.js';
 import { SQL_TODAY } from '../config/env.js';
 import { createAuditLog } from '../utils/audit.js';
-import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
+import { formatDateOnly, isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, optionalString, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import { sendEmailSafely } from '../services/emailService.js';
 import { loanApplicationReceivedEmail, loanDecisionEmail, loanSubmittedEmail, paymentEmail } from '../services/emailTemplates.js';
 import { emailMember } from '../services/memberEmails.js';
 import { sendStoredFile } from '../services/storage.js';
+import { isPaymentDay, officeOpenNow, paymentHours, weekdayName } from '../services/officeHours.js';
 import { keepAlive } from '../utils/background.js';
 import { notifyAdmins, notifyMember } from '../services/notificationService.js';
 import {
@@ -219,8 +220,10 @@ async function insertLoan(client, loan) {
   return loanId;
 }
 
+// paymentHours: when the office receives loan payments (open/close in minutes after midnight).
 export async function getLoanPolicy(req, res) {
-  return res.json({ success: true, policy: LOAN_POLICY });
+  const hours = paymentHours();
+  return res.json({ success: true, policy: { ...LOAN_POLICY, paymentHours: { ...hours, openNow: officeOpenNow(hours) } } });
 }
 
 // Server-side calculation preview used by the application form, so the
@@ -454,6 +457,10 @@ export async function recordPayment(req, res) {
   if (amountCents === null) throw badRequest('Payment amount must be greater than zero with at most two decimals.');
   if (!isValidDateOnly(paymentDate)) throw badRequest('A valid payment date (YYYY-MM-DD) is required.');
   if (paymentDate > todayDateOnly()) throw badRequest('Payment date cannot be in the future.');
+  // The office receives payments on weekdays during office hours only.
+  const hours = paymentHours();
+  if (!isPaymentDay(paymentDate, hours)) throw badRequest(`Loan payments are received ${hours.label} only. ${formatDateOnly(paymentDate)} is a ${weekdayName(paymentDate)}.`);
+  if (!officeOpenNow(hours)) throw badRequest(`Loan payments can be recorded only during office hours: ${hours.label}.`);
 
   const payment = await withTransaction(async (client) => {
     const loan = (await client.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId])).rows[0];
