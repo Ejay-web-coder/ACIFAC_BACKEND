@@ -642,3 +642,131 @@ export async function philmechReport(req, res) {
   });
   return res.json({ success: true, report });
 }
+
+// ----- PhilMech report form: header, feedback and signatories per cropping -------------------------
+
+// The "Problems Encountered" boxes of the paper form, in its order.
+export const REPORT_PROBLEMS = [
+  'low_acceptability', 'officer_conflict', 'management_training',
+  'frequent_breakdown', 'high_maintenance_cost', 'not_compatible',
+  'unpaid_collectibles', 'lack_operating_capital', 'poor_fund_management',
+];
+
+const reportFormSelect = `
+  SELECT cropping_period AS "croppingPeriod", year, from_month AS "fromMonth", to_month AS "toMonth", submission_date AS "submissionDate",
+         fca_name AS "fcaName", address, contact_person AS "contactPerson", contact_number AS "contactNumber",
+         land_preparation AS "landPreparation", harvesting_threshing AS "harvestingThreshing",
+         palay_price_fresh AS "palayPriceFresh", palay_price_dry AS "palayPriceDry", problems,
+         organization_others AS "organizationOthers", technical_others AS "technicalOthers", financial_others AS "financialOthers",
+         other_problems AS "otherProblems", suggested_solutions AS "suggestedSolutions", other_comments AS "otherComments",
+         prepared_by AS "preparedBy", prepared_by_position AS "preparedByPosition", approved_by AS "approvedBy", approved_by_position AS "approvedByPosition",
+         updated_at AS "updatedAt"
+  FROM machinery_report_forms`;
+
+// Land preparation machines (tractor and its implements) and harvest machines, by machine type.
+const LAND_PREPARATION_TYPES = '(tractor|rotavator|plow|plough|harrow|tiller|seeder|planter|transplant)';
+const HARVEST_TYPES = '(harvest|thresh|reaper)';
+
+export async function getReportForm(req, res) {
+  const croppingPeriod = readPeriod(req.query.croppingPeriod);
+  const year = readYear(req.query.year);
+  const saved = (await query(`${reportFormSelect} WHERE cropping_period = $1 AND year = $2`, [croppingPeriod, year])).rows[0];
+  if (saved) return res.json({ success: true, form: { ...saved, saved: true } });
+
+  // A cropping without a form starts from the last form's header and
+  // signatories; the type of farm operation follows the machines that served
+  // farmers in this cropping.
+  const [latest, operations] = await Promise.all([
+    query(`${reportFormSelect} ORDER BY updated_at DESC, id DESC LIMIT 1`),
+    query(`SELECT COALESCE(bool_or(lower(m.type || ' ' || m.name) ~ $3), FALSE) AS "landPreparation",
+                  COALESCE(bool_or(lower(m.type || ' ' || m.name) ~ $4), FALSE) AS "harvestingThreshing"
+           FROM machinery_services s JOIN machinery m ON m.id = s.machinery_id
+           WHERE s.cropping_period = $1 AND s.year = $2`, [croppingPeriod, year, LAND_PREPARATION_TYPES, HARVEST_TYPES]),
+  ]);
+  const last = latest.rows[0] || {};
+  return res.json({
+    success: true,
+    form: {
+      croppingPeriod, year, fromMonth: null, toMonth: null, submissionDate: null,
+      fcaName: last.fcaName ?? '', address: last.address ?? '', contactPerson: last.contactPerson ?? '', contactNumber: last.contactNumber ?? '',
+      ...operations.rows[0],
+      palayPriceFresh: null, palayPriceDry: null, problems: [],
+      organizationOthers: '', technicalOthers: '', financialOthers: '', otherProblems: '', suggestedSolutions: '', otherComments: '',
+      preparedBy: last.preparedBy ?? '', preparedByPosition: last.preparedByPosition ?? '', approvedBy: last.approvedBy ?? '', approvedByPosition: last.approvedByPosition ?? '',
+      updatedAt: null, saved: false,
+    },
+  });
+}
+
+export async function saveReportForm(req, res) {
+  const body = req.body || {};
+  const croppingPeriod = readPeriod(body.croppingPeriod);
+  const year = readYear(body.year);
+  const fromMonth = readMonth(body.fromMonth, 'From month');
+  const toMonth = readMonth(body.toMonth, 'To month');
+  if ((fromMonth === null) !== (toMonth === null)) throw badRequest('Choose both the first and the last month, or neither.');
+  if (fromMonth && toMonth < fromMonth) throw badRequest('The last month cannot be before the first month.');
+  // The date of submission may be set ahead of the day the form is handed in.
+  const submissionDate = body.submissionDate ? readDate(body.submissionDate, 'date of submission', { notFuture: false }) : null;
+  const price = (value, label) => {
+    const cents = readMoney(value, label, { required: false });
+    return cents === null ? null : centsToString(cents);
+  };
+  if (body.problems !== undefined && !Array.isArray(body.problems)) throw badRequest('Problems encountered must be a list.');
+  const problems = [...new Set(body.problems ?? [])];
+  if (problems.some((code) => !REPORT_PROBLEMS.includes(code))) throw badRequest('Unknown problem in Problems Encountered.');
+
+  const form = {
+    fromMonth, toMonth, submissionDate,
+    fcaName: cleanString(body.fcaName, 200),
+    address: cleanString(body.address, 300),
+    contactPerson: cleanString(body.contactPerson, 200),
+    contactNumber: cleanString(body.contactNumber, 40),
+    landPreparation: body.landPreparation === true,
+    harvestingThreshing: body.harvestingThreshing === true,
+    palayPriceFresh: price(body.palayPriceFresh, 'Fresh palay price'),
+    palayPriceDry: price(body.palayPriceDry, 'Dry palay price'),
+    problems: REPORT_PROBLEMS.filter((code) => problems.includes(code)),
+    organizationOthers: cleanString(body.organizationOthers, 500),
+    technicalOthers: cleanString(body.technicalOthers, 500),
+    financialOthers: cleanString(body.financialOthers, 500),
+    otherProblems: cleanString(body.otherProblems, 1000),
+    suggestedSolutions: cleanString(body.suggestedSolutions, 2000),
+    otherComments: cleanString(body.otherComments, 2000),
+    preparedBy: cleanString(body.preparedBy, 200),
+    preparedByPosition: cleanString(body.preparedByPosition, 100),
+    approvedBy: cleanString(body.approvedBy, 200),
+    approvedByPosition: cleanString(body.approvedByPosition, 100),
+  };
+
+  const saved = await withTransaction(async (client) => {
+    const before = (await client.query(`${reportFormSelect} WHERE cropping_period = $1 AND year = $2 FOR UPDATE`, [croppingPeriod, year])).rows[0];
+    await client.query(
+      `INSERT INTO machinery_report_forms (
+         cropping_period, year, from_month, to_month, submission_date, fca_name, address, contact_person, contact_number,
+         land_preparation, harvesting_threshing, palay_price_fresh, palay_price_dry, problems,
+         organization_others, technical_others, financial_others, other_problems, suggested_solutions, other_comments,
+         prepared_by, prepared_by_position, approved_by, approved_by_position, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+       ON CONFLICT (cropping_period, year) DO UPDATE SET
+         from_month = EXCLUDED.from_month, to_month = EXCLUDED.to_month, submission_date = EXCLUDED.submission_date,
+         fca_name = EXCLUDED.fca_name, address = EXCLUDED.address, contact_person = EXCLUDED.contact_person, contact_number = EXCLUDED.contact_number,
+         land_preparation = EXCLUDED.land_preparation, harvesting_threshing = EXCLUDED.harvesting_threshing,
+         palay_price_fresh = EXCLUDED.palay_price_fresh, palay_price_dry = EXCLUDED.palay_price_dry, problems = EXCLUDED.problems,
+         organization_others = EXCLUDED.organization_others, technical_others = EXCLUDED.technical_others, financial_others = EXCLUDED.financial_others,
+         other_problems = EXCLUDED.other_problems, suggested_solutions = EXCLUDED.suggested_solutions, other_comments = EXCLUDED.other_comments,
+         prepared_by = EXCLUDED.prepared_by, prepared_by_position = EXCLUDED.prepared_by_position,
+         approved_by = EXCLUDED.approved_by, approved_by_position = EXCLUDED.approved_by_position,
+         updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+      [croppingPeriod, year, form.fromMonth, form.toMonth, form.submissionDate, form.fcaName, form.address, form.contactPerson, form.contactNumber,
+        form.landPreparation, form.harvestingThreshing, form.palayPriceFresh, form.palayPriceDry, form.problems,
+        form.organizationOthers, form.technicalOthers, form.financialOthers, form.otherProblems, form.suggestedSolutions, form.otherComments,
+        form.preparedBy, form.preparedByPosition, form.approvedBy, form.approvedByPosition, currentUserId(req)]
+    );
+    const row = (await client.query(`${reportFormSelect} WHERE cropping_period = $1 AND year = $2`, [croppingPeriod, year])).rows[0];
+    const audited = ({ updatedAt, ...values }) => values;
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_REPORT_FORM_SAVED', module: 'Machinery', entityType: 'machinery_report_form', entityId: `${year}-${croppingPeriod}`, description: `Saved the PhilMech report form for the ${croppingPeriod} cropping of ${year}`, oldValues: before ? audited(before) : {}, newValues: audited(row), ...getRequestMeta(req) });
+    return row;
+  });
+  return res.json({ success: true, form: { ...saved, saved: true } });
+}

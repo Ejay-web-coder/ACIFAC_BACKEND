@@ -768,6 +768,50 @@ test('machinery services: dated rates, fees, payments, expenses and the PhilMech
   }
 });
 
+test('machinery: the PhilMech report form is saved per cropping', { skip }, async () => {
+  const url = '/api/machinery/reports/philmech/form';
+  assert.equal((await member.get(`${url}?croppingPeriod=1st&year=2026`)).status, 403);
+
+  // sql/028 records the form ACIFAC submitted for the 1st cropping of 2026.
+  const first = await admin.get(`${url}?croppingPeriod=1st&year=2026`);
+  assert.equal(first.status, 200, JSON.stringify(first.data));
+  assert.equal(first.data.form.saved, true);
+  assert.equal(first.data.form.contactNumber, '09557733522');
+  assert.deepEqual([first.data.form.fromMonth, first.data.form.toMonth, first.data.form.submissionDate], [1, 7, '2026-09-25']);
+  assert.deepEqual([first.data.form.palayPriceFresh, first.data.form.palayPriceDry], ['14.00', '24.00']);
+  assert.deepEqual([first.data.form.landPreparation, first.data.form.harvestingThreshing], [true, true]);
+
+  // A cropping without a form starts from the last form's header and signatories, nothing else.
+  const second = await admin.get(`${url}?croppingPeriod=2nd&year=2026`);
+  assert.equal(second.data.form.saved, false);
+  assert.equal(second.data.form.fcaName, first.data.form.fcaName);
+  assert.equal(second.data.form.preparedByPosition, 'SECRETARY');
+  assert.deepEqual([second.data.form.palayPriceFresh, second.data.form.submissionDate, second.data.form.problems], [null, null, []]);
+
+  const form = {
+    croppingPeriod: '2nd', year: 2026, fromMonth: 8, toMonth: 12, submissionDate: '2027-01-15', fcaName: 'ACIFAC', landPreparation: true, harvestingThreshing: false,
+    palayPriceFresh: '15.5', palayPriceDry: '', problems: ['unpaid_collectibles', 'frequent_breakdown', 'unpaid_collectibles'], technicalOthers: 'Blades wear out',
+    suggestedSolutions: 'Collect before the next cropping', preparedBy: 'Juan', preparedByPosition: 'Secretary', approvedBy: 'Pedro', approvedByPosition: 'Chairman/President',
+  };
+  assert.equal((await admin.put(url, { ...form, problems: ['made_up'] })).status, 400);
+  assert.equal((await admin.put(url, { ...form, fromMonth: 9, toMonth: 8 })).status, 400);
+  assert.equal((await admin.put(url, { ...form, toMonth: null })).status, 400);
+  assert.equal((await admin.put(url, { ...form, palayPriceFresh: '-1' })).status, 400);
+  const saved = await admin.put(url, form);
+  assert.equal(saved.status, 200, JSON.stringify(saved.data));
+  assert.equal(saved.data.form.saved, true);
+  assert.deepEqual(saved.data.form.problems, ['frequent_breakdown', 'unpaid_collectibles'], 'each box once, in the order of the paper form');
+  assert.deepEqual([saved.data.form.palayPriceFresh, saved.data.form.palayPriceDry], ['15.50', null]);
+  assert.equal(saved.data.form.submissionDate, '2027-01-15', 'the date of submission may be ahead');
+
+  assert.equal((await admin.put(url, { ...form, problems: [], technicalOthers: '' })).status, 200);
+  const reloaded = (await admin.get(`${url}?croppingPeriod=2nd&year=2026`)).data.form;
+  assert.deepEqual([reloaded.saved, reloaded.problems, reloaded.technicalOthers, reloaded.landPreparation], [true, [], '', true]);
+  assert.equal((await admin.get(`${url}?croppingPeriod=1st&year=2026`)).data.form.fcaName, first.data.form.fcaName, 'other croppings are untouched');
+  const audits = await pool.query(`SELECT COUNT(*)::int AS count FROM audit_logs WHERE action = 'MACHINERY_REPORT_FORM_SAVED'`);
+  assert.equal(audits.rows[0].count, 2);
+});
+
 test('kadiwa: sales decrement stock, reject overselling and race safely', { skip }, async () => {
   const before = await admin.get('/api/kadiwa');
   const rice = before.data.inventory.find((item) => item.id === 'INV-001');

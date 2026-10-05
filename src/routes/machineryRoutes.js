@@ -4,8 +4,8 @@ import {
   createMachinery, createRentalRequest, listMachineryCatalog, listMachineryData, reviewRentalRequest, updateMachinery, updateOperationStatus,
 } from '../controllers/machineryController.js';
 import {
-  createExpense, createRate, createService, deleteExpense, deleteRate, deleteService, getService, listExpenses, listPeriodBalances, listRates,
-  listServices, philmechReport, quoteService, receivePayment, savePeriodBalance, updateExpense, updateRate, updateService, voidPayment,
+  createExpense, createRate, createService, deleteExpense, deleteRate, deleteService, getReportForm, getService, listExpenses, listPeriodBalances, listRates,
+  listServices, philmechReport, quoteService, receivePayment, savePeriodBalance, saveReportForm, updateExpense, updateRate, updateService, voidPayment,
 } from '../controllers/machineryServiceController.js';
 
 const router = express.Router();
@@ -34,6 +34,8 @@ router.delete('/expenses/:id', requireAdmin, deleteExpense);
 router.get('/period-balances', requireAdmin, listPeriodBalances);
 router.put('/period-balances', requireAdmin, savePeriodBalance);
 router.get('/reports/philmech', requireAdmin, philmechReport);
+router.get('/reports/philmech/form', requireAdmin, getReportForm);
+router.put('/reports/philmech/form', requireAdmin, saveReportForm);
 router.patch('/rates/:rateId', requireAdmin, updateRate);
 router.delete('/rates/:rateId', requireAdmin, deleteRate);
 router.get('/:id/rates', requireAdmin, listRates);
