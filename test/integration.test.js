@@ -58,14 +58,33 @@ class Client {
   put(url, body) { return this.request('PUT', url, { body }); }
 }
 
-function memberForm(overrides = {}, file = PNG, signatures = 0) {
+// AI reads the applicant's valid ID (a back-to-back copy with 3 specimen
+// signatures) when it is picked in Add Member or Edit Member.
+async function readMemberId(client, reading, file, source = 'upload') {
+  stubIdReading = reading;
+  const form = new FormData();
+  form.append('source', source);
+  form.append('idDocument', new Blob([file], { type: 'image/png' }), 'id.png');
+  return client.request('POST', '/api/members/id-reading', { form });
+}
+
+// The applicant's ID as AI reads it: in the name and birthday on the form.
+const applicantId = (fields) => ({ ...BORROWER_ID, name: `${fields.first_name} ${fields.last_name}`.toUpperCase(), dateOfBirth: fields.date_of_birth, idNumber: '', address: '' });
+
+// A member as Add Member sends it, with the reading of the ID file. A file
+// that is not a picture or PDF is refused before AI reads it.
+async function memberForm(overrides = {}, file = PNG, signatures = 0) {
   const form = new FormData();
   const fields = {
     first_name: 'Juan', last_name: 'Dela Cruz', email: 'juan@example.com', phone: '09171234567', address: 'Purok 1, Amnay',
     membership_date: '2026-01-15', share_capital: '1000', farm_area_ha: '2', date_of_birth: '1980-05-20', status: 'active', ...overrides,
   };
   for (const [key, value] of Object.entries(fields)) form.append(key, value);
-  if (file) form.append('idDocument', new Blob([file], { type: 'image/png' }), 'id.png');
+  if (file) {
+    const read = await readMemberId(admin, applicantId(fields), file);
+    if (read.status === 201) form.append('id_document_reading', String(read.data.readingId));
+    form.append('idDocument', new Blob([file], { type: 'image/png' }), 'id.png');
+  }
   for (let index = 1; index <= signatures; index += 1) form.append('signatures', new Blob([PNG], { type: 'image/png' }), `signature-${index}.png`);
   return form;
 }
@@ -239,19 +258,19 @@ test('auth: admin login, CSRF protection and /me', { skip }, async () => {
 });
 
 test('members: create, validate, duplicate, view document, update, archive, restore', { skip }, async () => {
-  const invalidFile = await admin.request('POST', '/api/members', { form: memberForm({}, Buffer.from('not an image')) });
+  const invalidFile = await admin.request('POST', '/api/members', { form: await memberForm({}, Buffer.from('not an image')) });
   assert.equal(invalidFile.status, 400);
-  const created = await admin.request('POST', '/api/members', { form: memberForm({}, PNG, 3) });
+  const created = await admin.request('POST', '/api/members', { form: await memberForm({}, PNG, 3) });
   assert.equal(created.status, 201, JSON.stringify(created.data));
   state.memberId = created.data.data.id;
   assert.equal(created.data.data.signature_count, 3);
   assert.match(created.data.data.member_number, /^ACIFAC-\d{4}-001$/);
   assert.equal(created.data.data.share_capital, 1000);
 
-  const duplicate = await admin.request('POST', '/api/members', { form: memberForm({ email: 'JUAN@example.com' }) });
+  const duplicate = await admin.request('POST', '/api/members', { form: await memberForm({ email: 'JUAN@example.com' }) });
   assert.equal(duplicate.status, 409);
 
-  const second = await admin.request('POST', '/api/members', { form: memberForm({ first_name: 'Maria', last_name: 'Santos', email: 'maria@example.com', date_of_birth: '1985-01-01', share_capital: '0' }) });
+  const second = await admin.request('POST', '/api/members', { form: await memberForm({ first_name: 'Maria', last_name: 'Santos', email: 'maria@example.com', date_of_birth: '1985-01-01', share_capital: '0' }) });
   assert.equal(second.status, 201);
   state.secondMemberId = second.data.data.id;
 
@@ -281,9 +300,13 @@ test('members: create, validate, duplicate, view document, update, archive, rest
   assert.deepEqual(Buffer.from(await newSignature.arrayBuffer()), JPEG);
   const keptSignature = await admin.request('GET', `/api/members/${state.memberId}/documents/signature-3`, { raw: true });
   assert.deepEqual(Buffer.from(await keptSignature.arrayBuffer()), PNG);
-  // A member without signatures gets them in order.
+  // A member without signatures gets them in order. A new valid ID is read by AI first, like in Add Member.
   const firstForm = new FormData();
   firstForm.append('signature3', new Blob([PNG], { type: 'image/png' }), 's.png');
+  stubIdReading = { ...BORROWER_ID, name: 'MARIA SANTOS', dateOfBirth: '1985-01-01' };
+  const jpegRead = new FormData();
+  jpegRead.append('idDocument', new Blob([JPEG], { type: 'image/jpeg' }), 'new-id.jpg');
+  firstForm.append('id_document_reading', String((await admin.request('POST', '/api/members/id-reading', { form: jpegRead })).data.readingId));
   firstForm.append('idDocument', new Blob([JPEG], { type: 'image/jpeg' }), 'new-id.jpg');
   const firstSignature = await admin.request('POST', `/api/members/${state.secondMemberId}/documents`, { form: firstForm });
   assert.equal(firstSignature.status, 200);
@@ -311,14 +334,27 @@ test('members: create, validate, duplicate, view document, update, archive, rest
   const keepsInfo = await admin.put(`/api/members/${state.memberId}`, { ...editable, phone: '09178888888' });
   assert.equal(keepsInfo.data.data.additional_info.orNumber, 'OR-9', 'an update without additional_info keeps it');
 
-  const archived = await admin.patch(`/api/members/${state.secondMemberId}/archive`);
+  // Termination of membership: automatic, voluntary, or involuntary for one of the causes.
+  const terminate = (body) => admin.patch(`/api/members/${state.secondMemberId}/archive`, body);
+  assert.equal((await terminate({})).status, 400, 'the kind of termination is required');
+  assert.equal((await terminate({ terminationType: 'expelled' })).status, 400);
+  const noCause = await terminate({ terminationType: 'involuntary' });
+  assert.equal(noCause.status, 400);
+  assert.match(noCause.data.message, /cause of the involuntary termination/);
+  const archived = await terminate({ terminationType: 'involuntary', cause: 'failedObligations' });
   assert.equal(archived.status, 200, JSON.stringify(archived.data));
   const archivedList = await admin.get('/api/members/archived');
   assert.equal(archivedList.data.data[0].archived_by_username, 'testadmin');
-  const again = await admin.patch(`/api/members/${state.secondMemberId}/archive`);
+  assert.deepEqual({ ...archivedList.data.data[0].termination, date: 'today' }, { type: 'involuntary', cause: 'failedObligations', date: 'today' });
+  const terminated = (await admin.get(`/api/members/${state.secondMemberId}`)).data.data.additional_info;
+  assert.equal(terminated.separationDate, terminated.termination.date, 'the Separation date on the form is the termination date');
+  const again = await terminate({ terminationType: 'voluntary' });
   assert.equal(again.status, 409);
   const restored = await admin.patch(`/api/members/${state.secondMemberId}/restore`);
   assert.equal(restored.status, 200);
+  const reinstated = (await admin.get(`/api/members/${state.secondMemberId}`)).data.data.additional_info || {};
+  assert.equal(reinstated.termination, undefined);
+  assert.equal(reinstated.separationDate, undefined);
 
   const audit = await admin.get('/api/admin/audit-logs?module=Members');
   const actions = audit.data.data.map((row) => row.action);
@@ -366,6 +402,76 @@ test('authorization: members cannot read other members or admin data', { skip },
   assert.equal(ownDoc.status, 200);
   const anonymous = await new Client().get('/api/members/me');
   assert.equal(anonymous.status, 401);
+});
+
+test('members: Add Member needs the applicant ID as a back-to-back copy with 3 signatures', { skip }, async () => {
+  const fields = { first_name: 'Lito', last_name: 'Ramos', email: 'lito@example.com', date_of_birth: '1979-08-09', id_number: '5555-6666-7777' };
+  const reading = { ...applicantId(fields), idNumber: '5555-6666-7777' };
+  const post = (file, readingId, extra = {}) => {
+    const form = new FormData();
+    for (const [key, value] of Object.entries({ phone: '09170001111', address: 'Purok 4, Amnay', membership_date: '2026-02-01', status: 'active', ...fields, ...extra })) form.append(key, value);
+    if (readingId !== undefined) form.append('id_document_reading', String(readingId));
+    form.append('idDocument', new Blob([file], { type: 'image/png' }), 'id.png');
+    return admin.request('POST', '/api/members', { form });
+  };
+
+  // Only admins have an applicant's ID read.
+  assert.equal((await readMemberId(member, reading, idFile())).status, 403);
+
+  // An ID that AI has not read, or not this file: refused.
+  const file = idFile();
+  const unread = await post(file);
+  assert.equal(unread.status, 400);
+  assert.match(unread.data.message, /AI has not read the applicant's ID/);
+  const read = await readMemberId(admin, reading, file);
+  assert.equal(read.status, 201, JSON.stringify(read.data));
+  assert.equal(read.data.reading.signatureCount, 3);
+  const swapped = await post(idFile(), read.data.readingId);
+  assert.equal(swapped.status, 400);
+  assert.match(swapped.data.message, /not the one AI read/);
+
+  // Two signatures, the card itself without signatures, or someone else's ID: refused.
+  for (const [wrong, message] of [
+    [{ ...reading, signatureCount: 2 }, /2 specimen signatures; 3 are required/],
+    [{ ...reading, photocopy: false, physicalCard: true, signatureCount: 0 }, /0 specimen signatures; 3 are required/],
+    [{ ...reading, name: 'MARIA SANTOS' }, /not the applicant/],
+  ]) {
+    const other = idFile();
+    const refused = await post(other, (await readMemberId(admin, wrong, other, 'camera')).data.readingId);
+    assert.equal(refused.status, 422, JSON.stringify(refused.data));
+    assert.match(refused.data.message, message);
+  }
+
+  // The form previews the checks; a birthday that differs must be confirmed.
+  const differs = idFile();
+  const differsRead = await readMemberId(admin, { ...reading, dateOfBirth: '1979-09-08' }, differs);
+  const preview = await admin.post('/api/members/id-checks', { idReading: differsRead.data.readingId, firstName: 'Lito', lastName: 'Ramos', dateOfBirth: '1979-08-09', idNumber: '5555-6666-7777' });
+  assert.equal(preview.status, 200, JSON.stringify(preview.data));
+  assert.deepEqual(Object.fromEntries(preview.data.checks.map((check) => [check.id, check.status])), { idDocument: 'pass', idMatch: 'warn' });
+  const unconfirmed = await post(differs, differsRead.data.readingId);
+  assert.equal(unconfirmed.status, 422);
+  assert.match(unconfirmed.data.message, /Confirm that you compared the flagged ID details/);
+  assert.equal((await admin.get('/api/members?search=lito')).data.data.length, 0, 'nothing was saved');
+  const saved = await post(differs, differsRead.data.readingId, { acknowledge_id_warnings: 'true' });
+  assert.equal(saved.status, 201, JSON.stringify(saved.data));
+  assert.equal(saved.data.data.signature_count, 0, 'no signatures are drawn');
+
+  // Edit Member: a new ID is read by AI too, and must be the member's.
+  const url = `/api/members/${saved.data.data.id}/documents`;
+  const unreadForm = new FormData();
+  unreadForm.append('idDocument', new Blob([idFile()], { type: 'image/png' }), 'id.png');
+  assert.equal((await admin.request('POST', url, { form: unreadForm })).status, 400);
+  for (const [replacementReading, status] of [[{ ...reading, name: 'MARIA SANTOS' }, 422], [reading, 200]]) {
+    const replacement = idFile();
+    const form = new FormData();
+    form.append('id_document_reading', String((await readMemberId(admin, replacementReading, replacement)).data.readingId));
+    form.append('idDocument', new Blob([replacement], { type: 'image/png' }), 'id.png');
+    const replaced = await admin.request('POST', url, { form });
+    assert.equal(replaced.status, status, JSON.stringify(replaced.data));
+  }
+
+  // This member is not part of the counts in the tests that follow.
+  await pool.query('DELETE FROM members WHERE id = $1', [saved.data.data.id]);
 });
 
 test('savings deposits and share capital are separate ledgers', { skip }, async () => {
@@ -1199,7 +1305,9 @@ test('ocr: scanned forms are verified, posted to their module, and fakes are blo
 
   // Replacing the member's ID and photo later keeps the scan's copies.
   const replaceForm = new FormData();
-  replaceForm.append('idDocument', new Blob([Buffer.concat([PNG, Buffer.from([9])])], { type: 'image/png' }), 'new-id.png');
+  const newId = Buffer.concat([PNG, Buffer.from([9])]);
+  replaceForm.append('id_document_reading', String((await readMemberId(admin, idCopy, newId)).data.readingId));
+  replaceForm.append('idDocument', new Blob([newId], { type: 'image/png' }), 'new-id.png');
   replaceForm.append('profilePhoto', new Blob([Buffer.concat([PNG, Buffer.from([10])])], { type: 'image/png' }), 'new-photo.png');
   const replacedDocs = await admin.request('POST', `/api/members/${rosa.id}/documents`, { form: replaceForm });
   assert.equal(replacedDocs.status, 200, JSON.stringify(replacedDocs.data));
@@ -1469,6 +1577,58 @@ test('dashboard and analytics use real data', { skip }, async () => {
   const juan = analytics.data.memberAnalytics.find((row) => row.databaseId === state.memberId);
   assert.equal(juan.totalPaid, 51250);
   assert.ok(analytics.data.methodology.onTimePaymentRate);
+
+  // Net income: Kadiwa net sales + machinery (rentals started, service fees collected,
+  // other income, less expenses) + loan interest collected.
+  const { netIncome, netIncomeBreakdown: parts } = dashboard.data.stats;
+  assert.equal(dashboard.data.stats.kadiwaRevenue, undefined);
+  assert.equal(dashboard.data.stats.machineryOperations, undefined);
+  assert.equal(Math.round((parts.kadiwa + parts.machinery + parts.loans) * 100), Math.round(netIncome * 100));
+  assert.equal(parts.kadiwa, analytics.data.summary.kadiwaNetSales);
+  assert.equal(parts.loans, analytics.data.summary.interestCollected);
+  assert.ok(parts.loans > 0, 'the loan payments in these tests include interest');
+  const machinery = (await pool.query(`SELECT
+      (SELECT COALESCE(SUM(rental_fee), 0) FROM machinery_operations mo WHERE start_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date
+        AND NOT EXISTS (SELECT 1 FROM machinery_services s WHERE s.rental_request_id = mo.rental_request_id))
+    + (SELECT COALESCE(SUM(amount_paid), 0) FROM machinery_services)
+    + (SELECT COALESCE(SUM(other_income), 0) FROM machinery_period_balances)
+    - (SELECT COALESCE(SUM(amount), 0) FROM machinery_expenses) AS net`)).rows[0].net;
+  assert.equal(parts.machinery, Number(machinery));
+  // The card lists the statutory funds set aside from that net income.
+  assert.deepEqual(dashboard.data.stats.statutoryFunds.map(({ key, percent, amount }) => [key, percent, amount]), [
+    ['reserve', 10, Math.round(Math.max(0, netIncome) * 10) / 100],
+    ['education', 10, Math.round(Math.max(0, netIncome) * 10) / 100],
+    ['community', 3, Math.round(Math.max(0, netIncome) * 3) / 100],
+    ['optional', 7, Math.round(Math.max(0, netIncome) * 7) / 100],
+  ]);
+
+  // A member's dividend: this year's net income, less 30% statutory funds, half
+  // of the surplus shared by share capital.
+  const cents = (amount) => Math.round(amount * 100);
+  const dividend = await member.get('/api/members/me/dividend');
+  assert.equal(dividend.status, 200, JSON.stringify(dividend.data));
+  const d = dividend.data.data;
+  assert.equal(d.year, Number(d.asOf.slice(0, 4)));
+  assert.equal(d.yearComplete, false);
+  assert.deepEqual(d.rates, { statutory: 30, dividendPool: 50, patronageRefundPool: 50 });
+  assert.equal(cents(d.netIncomeParts.kadiwa + d.netIncomeParts.machinery + d.netIncomeParts.loans), cents(d.netIncome));
+  assert.equal(cents(d.statutoryTotal + d.netSurplus), cents(Math.max(0, d.netIncome)));
+  assert.equal(cents(d.dividendPool + d.patronageRefundPool), cents(d.netSurplus));
+  const shares = (await pool.query(
+    `SELECT COALESCE(SUM(amount) FILTER (WHERE member_id = $1), 0) AS member, COALESCE(SUM(amount), 0) AS total
+     FROM share_contributions WHERE contribution_date <= $2 AND member_id IN (SELECT id FROM members WHERE status <> 'archived')`,
+    [state.memberId, d.asOf]
+  )).rows[0];
+  assert.equal(d.memberShareCapital, Number(shares.member));
+  assert.equal(d.totalShareCapital, Number(shares.total));
+  assert.ok(d.memberShareCapital > 0 && d.shareRatio > 0 && d.shareRatio <= 1);
+  assert.equal(d.dividend, Math.round(d.dividendPool * d.shareRatio * 100) / 100);
+  const lastYear = await member.get(`/api/members/me/dividend?year=${d.year - 1}`);
+  assert.equal(lastYear.status, 200);
+  assert.equal(lastYear.data.data.asOf, `${d.year - 1}-12-31`);
+  assert.equal(lastYear.data.data.yearComplete, true);
+  for (const year of ['1999', String(d.year + 1), 'abc']) assert.equal((await member.get(`/api/members/me/dividend?year=${year}`)).status, 400, year);
+  assert.equal((await admin.get('/api/members/me/dividend')).status, 403, 'only a member sees their own dividend');
 });
 
 test('settings: profile, preferences, legal documents', { skip }, async () => {

@@ -20,6 +20,8 @@ import {
   updateMember,
 } from '../controllers/memberController.js';
 import { createMemberLoanRequestWithIds } from '../controllers/loanIdController.js';
+import { getMyDividend } from '../controllers/dividendController.js';
+import { previewMemberIdChecks, readMemberId } from '../controllers/memberIdController.js';
 import { getMyActivity } from '../controllers/memberActivityController.js';
 import { requireAdmin, requireAuth, requireMember } from '../middleware/auth.js';
 import { loanApplicationUpload, memberDocumentUpload } from '../middleware/upload.js';
@@ -33,6 +35,8 @@ router.get('/me', requireMember, getMyMemberData);
 // An application comes with the borrower's and the co-maker's valid IDs.
 router.post('/me/loan-requests', requireMember, loanApplicationUpload, createMemberLoanRequestWithIds);
 router.get('/me/documents/:kind', requireMember, downloadMemberDocument);
+// The member's dividend for a year, from the cooperative's net income and paid-up share capital.
+router.get('/me/dividend', requireMember, getMyDividend);
 router.get('/me/activity', requireMember, getMyActivity);
 
 // Everything below is admin-only: member lists expose personal data.
@@ -45,6 +49,11 @@ router.post('/savings', createSavingsRecord);
 router.post('/savings/withdrawals', createSavingsWithdrawal);
 router.get('/savings/members', listSavingsMembers);
 router.post('/import', importMembers);
+// The applicant's valid ID (a back-to-back copy with 3 specimen signatures):
+// AI reads it as it is picked, then the form shows how it compares with the applicant.
+router.post('/id-reading', memberDocumentUpload.single('idDocument'), readMemberId);
+router.post('/id-checks', previewMemberIdChecks);
+// Add Member sends id_document_reading (the reading of idDocument) and acknowledge_id_warnings.
 router.post('/', memberDocumentUpload.fields([
   { name: 'idDocument', maxCount: 1 },
   { name: 'profilePhoto', maxCount: 1 },

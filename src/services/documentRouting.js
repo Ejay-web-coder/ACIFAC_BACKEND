@@ -82,7 +82,7 @@ export const FORM_DEFINITIONS = {
     notes: 'For the in-kind table use the keys <row>Description, <row>Quantity, <row>Unit, <row>UnitPrice and <row>Total for the rows fertilizer, pesticides, herbicides, insecticides, seeds and plantChemicals (Plant Chemicals for Spray); leave a row empty when it is not filled. loanMode is the ticked box: cash, in-kind or combination. sex is Male or Female. irrigationType is rainfed, irrigated or other. collateralType is the ticked box: Land Title / Property, Harvest, or Savings Deposit / Share Capital. Ignore the office-use approval section (APPROVED / DISAPPROVED / FOR EVALUATION and approved amounts).',
     fields: [
       f('formNo', 'Form No.'), f('applicationDate', 'Date of Application', { kind: 'date' }),
-      f('memberName', 'Borrower Name', { required: true }), f('memberNumber', 'Associate No.'),
+      f('memberName', 'Borrower Name', { required: true }), f('memberNumber', 'Member No.'),
       f('occupation', 'Occupation'), f('yearsFarming', 'Years of Farming', { kind: 'number' }),
       f('age', 'Age', { kind: 'integer' }), f('civilStatus', 'Civil Status'), f('sex', 'Sex'),
       f('address', 'Address'), f('contactNo', 'Contact No.'), f('email', 'Email'),
@@ -206,8 +206,9 @@ export const ID_READING_INSTRUCTION = 'Read this identification document: its ty
 // person's specimen signatures (uploaded, or for a loan form also photographed
 // with the camera), or, for a membership applicant, the card itself captured
 // with the live camera (front and back joined into one picture).
-export function buildIdPrompt(source, documentType = 'Membership Form', slot = 'holder') {
-  const { person, cardCapture } = idRequirement(documentType, slot) || { person: 'applicant', cardCapture: true };
+// requirement: a different one than the form's, such as MEMBER_APPLICANT_ID.
+export function buildIdPrompt(source, documentType = 'Membership Form', slot = 'holder', requirement = idRequirement(documentType, slot)) {
+  const { person, cardCapture } = requirement || { person: 'applicant', cardCapture: true };
   const formName = FORM_DEFINITIONS[documentType]?.formName || 'cooperative form';
   const copy = source === 'camera'
     ? 'the front and back of the ID on one page, photographed with a phone camera at the cooperative office (perspective and shadows are expected)'
@@ -538,6 +539,20 @@ export function checkLoanIds(ids, data, member) {
   for (const requirement of idRequirements('Loan Form')) {
     checkIdDocument(ids[requirement.slot] || null, requirement, expectedIdHolder('Loan Form', requirement, data, member, ids.holder?.reading), add);
   }
+  return checks;
+}
+
+// The applicant's valid ID in Add Member and Edit Member: like the co-maker's
+// on a loan form, only a back-to-back copy with the 3 specimen signatures,
+// uploaded or photographed (no live capture of the card itself).
+export const MEMBER_APPLICANT_ID = { slot: 'holder', person: 'applicant', cardCapture: false, checkId: 'idDocument', matchId: 'idMatch' };
+
+// submitted: { reading, source } of the applicant's ID, or null; data:
+// firstName, middleName, lastName, suffix, dateOfBirth and idNumber as on the form.
+export function checkMemberId(submitted, data) {
+  const checks = [];
+  const add = (id, label, status, message) => checks.push({ id, label, status, message });
+  checkIdDocument(submitted, MEMBER_APPLICANT_ID, expectedIdHolder('Membership Form', MEMBER_APPLICANT_ID, data), add);
   return checks;
 }
 

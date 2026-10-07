@@ -13,6 +13,7 @@ import { DOCUMENT_TYPES, IMAGE_TYPES } from '../middleware/upload.js';
 import { loanSelect, paymentSelect, requestSelect } from './loanController.js';
 import { refreshLoanStatusesInBackground } from '../services/loanService.js';
 import { photoMimeType } from './profilePhotoController.js';
+import { checkSubmittedMemberId } from './memberIdController.js';
 
 const STATUSES = ['active', 'inactive', 'suspended', 'archived'];
 const EDITABLE_STATUSES = ['active', 'inactive', 'suspended'];
@@ -43,7 +44,7 @@ const memberListSelect = `
   SELECT m.id, m.member_number, m.first_name, m.middle_name, m.last_name, m.suffix, m.email, m.phone, m.address,
          m.barangay, m.municipality, m.province, m.date_of_birth, m.gender, m.civil_status, m.livelihood, m.farm_area_ha,
          m.membership_date, m.share_capital, m.status, m.archived_at, archived_user.username AS archived_by_username,
-         m.id_document_name, m.created_at, m.updated_at,
+         m.additional_info->'termination' AS termination, m.id_document_name, m.created_at, m.updated_at,
          TRIM(CONCAT_WS(' ', m.first_name, m.middle_name, m.last_name, m.suffix)) AS full_name
   FROM members m
   LEFT JOIN users archived_user ON archived_user.id = m.archived_by`;
@@ -291,7 +292,7 @@ async function recordContribution(req, memberId, body) {
   return withTransaction(async (client) => {
     const member = (await client.query('SELECT id, member_number, status, membership_date FROM members WHERE id = $1 FOR UPDATE', [memberId])).rows[0];
     if (!member) throw notFound('Member not found.');
-    if (member.status === 'archived') throw badRequest('Contributions cannot be recorded for an archived member.');
+    if (member.status === 'archived') throw badRequest('Contributions cannot be recorded for a member whose membership is terminated.');
     if (referenceNumber) {
       const duplicate = await client.query('SELECT 1 FROM share_contributions WHERE member_id = $1 AND LOWER(reference_number) = LOWER($2)', [memberId, referenceNumber]);
       if (duplicate.rows[0]) throw conflict('A contribution with this reference number was already recorded for this member.');
@@ -396,7 +397,7 @@ async function insertSavingsTransaction(client, req, { kind, memberId, amountCen
   const details = SAVINGS_KINDS[kind];
   const member = (await client.query('SELECT id, member_number, status FROM members WHERE id = $1 FOR UPDATE', [memberId])).rows[0];
   if (!member) throw notFound('Member not found.');
-  if (kind === 'deposit' && member.status === 'archived') throw badRequest('Savings cannot be recorded for an archived member.');
+  if (kind === 'deposit' && member.status === 'archived') throw badRequest('Savings cannot be recorded for a member whose membership is terminated.');
   if (reference) {
     const duplicate = await client.query('SELECT 1 FROM savings_transactions WHERE member_id = $1 AND LOWER(reference_number) = LOWER($2)', [memberId, reference]);
     if (duplicate.rows[0]) throw conflict('A savings record with this reference number already exists for this member.');
@@ -705,6 +706,11 @@ export async function createMember(req, res) {
   assertValidUpload(idDocument, DOCUMENT_TYPES, 'ID document');
   if (profilePhoto) assertValidUpload(profilePhoto, IMAGE_TYPES, 'profile photo');
   signatures.forEach((signature) => assertValidUpload(signature, IMAGE_TYPES, 'signature'));
+  // The valid ID: a back-to-back copy with the applicant's 3 specimen signatures, read by AI in the form.
+  await checkSubmittedMemberId(req, idDocument, {
+    firstName: values.firstName, middleName: cleanString(body.middle_name, 100), lastName: values.lastName, suffix: cleanString(body.suffix, 20),
+    dateOfBirth: cleanString(body.date_of_birth, 10), idNumber: cleanString(body.id_number, 100),
+  });
 
   // Upload first; if the database transaction fails the files are removed again.
   const folder = `members/${todayDateOnly().slice(0, 7)}`;
@@ -824,6 +830,15 @@ export async function replaceMemberDocuments(req, res) {
   if (idDocument) assertValidUpload(idDocument, DOCUMENT_TYPES, 'ID document');
   if (profilePhoto) assertValidUpload(profilePhoto, IMAGE_TYPES, 'profile photo');
   signatures.forEach((signature) => { if (signature) assertValidUpload(signature, IMAGE_TYPES, 'signature'); });
+  // A new valid ID is checked against the member's saved name, birthday and ID No., like one in Add Member.
+  if (idDocument) {
+    const saved = (await query('SELECT first_name, middle_name, last_name, suffix, date_of_birth, id_number FROM members WHERE id = $1', [id])).rows[0];
+    if (!saved) throw notFound('Member not found.');
+    await checkSubmittedMemberId(req, idDocument, {
+      firstName: saved.first_name, middleName: saved.middle_name, lastName: saved.last_name, suffix: saved.suffix,
+      dateOfBirth: saved.date_of_birth || '', idNumber: saved.id_number,
+    });
+  }
 
   const folder = `members/${todayDateOnly().slice(0, 7)}`;
   const stored = [];
@@ -880,16 +895,44 @@ export async function replaceMemberDocuments(req, res) {
   return res.status(200).json({ success: true, data: mapMember(updated), message: 'Member documents updated.' });
 }
 
+// Termination of membership under the by-laws (RA 9520, Art. 30): automatic
+// (death or insanity), voluntary (withdrawal on 60 days' notice), or
+// involuntary (majority vote of the Board of Directors for one of the causes).
+export const TERMINATION_TYPES = ['automatic', 'voluntary', 'involuntary'];
+export const INVOLUNTARY_CAUSES = ['noPatronage', 'failedObligations', 'violatedBylaws', 'injuriousAct'];
+
+function readTermination(body) {
+  const type = cleanString(body?.terminationType, 20);
+  if (!TERMINATION_TYPES.includes(type)) throw badRequest('Choose the kind of termination: automatic, voluntary or involuntary.');
+  if (type !== 'involuntary') return { type };
+  const cause = cleanString(body?.cause, 40);
+  if (!INVOLUNTARY_CAUSES.includes(cause)) throw badRequest('Choose the cause of the involuntary termination.');
+  return { type, cause };
+}
+
+// Terminating a member moves them to the terminated (archived) list. The kind
+// of termination, its cause and date are kept with the member, and the date
+// is the Separation date on their membership form. Restoring clears both.
 async function changeArchiveState(req, res, archive) {
   const id = parseId(req.params.id, 'member ID');
+  const termination = archive ? { ...readTermination(req.body), date: todayDateOnly() } : null;
   const member = await withTransaction(async (client) => {
-    const before = (await client.query(`SELECT id, member_number, status, archived_at FROM members WHERE id = $1 FOR UPDATE`, [id])).rows[0];
+    const before = (await client.query(`SELECT id, member_number, status, archived_at, additional_info FROM members WHERE id = $1 FOR UPDATE`, [id])).rows[0];
     if (!before) throw notFound('Member not found.');
-    if (archive && before.status === 'archived') throw conflict('Member is already archived.');
-    if (!archive && before.status !== 'archived') throw conflict('Member is not archived.');
+    if (archive && before.status === 'archived') throw conflict('Membership is already terminated.');
+    if (!archive && before.status !== 'archived') throw conflict('Membership is not terminated.');
+    const { termination: previous, separationDate: _separation, ...info } = before.additional_info || {};
     const result = archive
-      ? await client.query(`UPDATE members SET status = 'archived', archived_at = NOW(), archived_by = $1, updated_at = NOW() WHERE id = $2 RETURNING id, member_number, status, archived_at, archived_by`, [currentUserId(req), id])
-      : await client.query(`UPDATE members SET status = 'active', archived_at = NULL, archived_by = NULL, updated_at = NOW() WHERE id = $1 RETURNING id, member_number, status`, [id]);
+      ? await client.query(
+        `UPDATE members SET status = 'archived', archived_at = NOW(), archived_by = $1, additional_info = $3::jsonb, updated_at = NOW()
+         WHERE id = $2 RETURNING id, member_number, status, archived_at, archived_by`,
+        [currentUserId(req), id, JSON.stringify({ ...info, separationDate: termination.date, termination })]
+      )
+      : await client.query(
+        `UPDATE members SET status = 'active', archived_at = NULL, archived_by = NULL, additional_info = $2::jsonb, updated_at = NOW()
+         WHERE id = $1 RETURNING id, member_number, status`,
+        [id, JSON.stringify(info)]
+      );
     const row = result.rows[0];
     await createAuditLog({
       client,
@@ -898,14 +941,14 @@ async function changeArchiveState(req, res, archive) {
       module: 'Members',
       entityType: 'member',
       entityId: String(id),
-      description: `${archive ? 'Archived' : 'Restored'} member ${row.member_number}`,
-      oldValues: { status: before.status, archived_at: before.archived_at },
-      newValues: { status: row.status, archived_at: row.archived_at ?? null, archived_by: row.archived_by ?? null },
+      description: archive ? `Terminated the membership of ${row.member_number} (${termination.type})` : `Restored member ${row.member_number}`,
+      oldValues: { status: before.status, archived_at: before.archived_at, termination: previous ?? null },
+      newValues: { status: row.status, archived_at: row.archived_at ?? null, archived_by: row.archived_by ?? null, termination },
       ...getRequestMeta(req),
     });
-    return row;
+    return { ...row, termination };
   });
-  return res.status(200).json({ success: true, message: archive ? 'Member archived successfully.' : 'Member restored successfully.', data: member });
+  return res.status(200).json({ success: true, message: archive ? 'Membership terminated.' : 'Member restored successfully.', data: member });
 }
 
 export const archiveMember = (req, res) => changeArchiveState(req, res, true);

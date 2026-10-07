@@ -15,6 +15,12 @@ export async function applyMigrations({ log = console.log } = {}) {
   const pool = getPool();
   const files = fs.readdirSync(sqlDir).filter((file) => file.endsWith('.sql')).sort();
 
+  // Most starts have nothing new to apply. One query finds that out; the locked
+  // transaction per file below costs a round trip to the database each (about
+  // 30 seconds in all from here to Supabase), so files already applied are skipped.
+  const done = await appliedMigrations(pool);
+  if (done && files.every((file) => done.has(file))) return [];
+
   const client = await pool.connect();
   const applied = [];
   try {
@@ -27,6 +33,7 @@ export async function applyMigrations({ log = console.log } = {}) {
     await client.query('COMMIT');
 
     for (const file of files) {
+      if (done?.has(file)) continue;
       await client.query('BEGIN');
       try {
         await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [LOCK_KEY]);
@@ -50,6 +57,16 @@ export async function applyMigrations({ log = console.log } = {}) {
     client.release();
   }
   return applied;
+}
+
+// The migrations already recorded, or null before the first one ever ran.
+async function appliedMigrations(pool) {
+  try {
+    return new Set((await pool.query('SELECT filename FROM app_schema_migrations')).rows.map((row) => row.filename));
+  } catch (error) {
+    if (error.code === '42P01') return null; // app_schema_migrations does not exist yet
+    throw error;
+  }
 }
 
 // Migrations run on start-up unless AUTO_MIGRATE=false.

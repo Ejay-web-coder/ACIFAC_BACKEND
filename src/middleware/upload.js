@@ -17,7 +17,8 @@ function memoryUpload(maxBytes, allowed, maxFiles = 2) {
   });
 }
 
-// Add Member: ID document, 2x2 photo and three specimen signatures.
+// Add Member: the signed ID copy and the 2x2 photo (still accepting the
+// specimen signatures that were drawn on screen before the copy was required).
 export const memberDocumentUpload = memoryUpload(5 * 1024 * 1024, DOCUMENT_TYPES, 5);
 // A loan application: the borrower's and the co-maker's valid IDs and the borrower's signature.
 export const loanApplicationUpload = memberDocumentUpload.fields([{ name: 'borrowerId', maxCount: 1 }, { name: 'coMakerId', maxCount: 1 }, { name: 'borrowerSignature', maxCount: 1 }]);

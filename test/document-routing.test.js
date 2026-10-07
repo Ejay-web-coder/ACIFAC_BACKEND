@@ -2,8 +2,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildAnalysisPrompt, buildIdPrompt, buildPhotoPrompt, isPostable, normalizeAuthenticity, normalizeDocumentType, normalizeExtractedData, normalizeIdReading,
-  normalizePhotoReading, photoExpected, publicFormDefinitions, publicIdRequirements, requiresIdDocument, UNRECOGNIZED,
+  buildAnalysisPrompt, buildIdPrompt, buildPhotoPrompt, checkMemberId, isPostable, MEMBER_APPLICANT_ID, normalizeAuthenticity, normalizeDocumentType, normalizeExtractedData,
+  normalizeIdReading, normalizePhotoReading, photoExpected, publicFormDefinitions, publicIdRequirements, requiresIdDocument, UNRECOGNIZED,
 } from '../src/services/documentRouting.js';
 
 test('document types: postable forms, legacy names and unknown values', () => {
@@ -112,6 +112,28 @@ test('a scanned loan form needs the borrower and co-maker IDs, each with 3 speci
   assert.match(coMaker, /co-maker's 3 specimen signatures/);
   assert.match(coMaker, /phone camera/);
   assert.doesNotMatch(coMaker, /signatureCount 0/);
+});
+
+test('Add Member takes the applicant ID only as a back-to-back copy with 3 specimen signatures', () => {
+  // Taken with the camera it is still the signed copy, like a co-maker's, never the bare card.
+  const prompt = buildIdPrompt('camera', 'Membership Form', 'holder', MEMBER_APPLICANT_ID);
+  assert.match(prompt, /an applicant submits with an ACIFAC cooperative membership form/);
+  assert.match(prompt, /applicant's 3 specimen signatures/);
+  assert.doesNotMatch(prompt, /signatureCount 0/);
+
+  const form = { firstName: 'Rosa', lastName: 'Magsaysay', dateOfBirth: '1990-03-15', idNumber: '1234-5678-9012' };
+  const copy = {
+    isId: true, idType: 'PhilSys National ID', idNumber: '1234-5678-9012', name: 'ROSA MAGSAYSAY', dateOfBirth: '1990-03-15',
+    frontVisible: true, backVisible: true, photocopy: true, physicalCard: false, screen: false, signatureCount: 3, expired: false, issues: [],
+  };
+  const statuses = (submitted) => Object.fromEntries(checkMemberId(submitted, form).map((check) => [check.id, check.status]));
+  assert.deepEqual(statuses({ reading: copy, source: 'camera' }), { idDocument: 'pass', idMatch: 'pass' });
+  assert.equal(statuses({ reading: { ...copy, signatureCount: 2 }, source: 'upload' }).idDocument, 'fail');
+  // The card captured with the live camera has no signatures: not enough here.
+  assert.equal(statuses({ reading: { ...copy, photocopy: false, physicalCard: true, signatureCount: 0 }, source: 'camera' }).idDocument, 'fail');
+  assert.equal(statuses({ reading: { ...copy, name: 'PEDRO CRUZ' }, source: 'upload' }).idMatch, 'fail');
+  assert.equal(statuses({ reading: { ...copy, idNumber: '9999' }, source: 'upload' }).idMatch, 'warn');
+  assert.match(checkMemberId(null, form)[0].message, /back-to-back copy .* with 3 specimen signatures/);
 });
 
 test('the membership form 2x2 picture is checked on the form, or uploaded and checked', () => {

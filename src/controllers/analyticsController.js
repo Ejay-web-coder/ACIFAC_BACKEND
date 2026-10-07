@@ -2,6 +2,8 @@ import { query } from '../config/db.js';
 import { SQL_TODAY, TIME_ZONE } from '../config/env.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { badRequest } from '../utils/http.js';
+import { centsToNumber, netIncomeCents } from '../services/netIncome.js';
+import { computeDividend } from '../services/dividends.js';
 import { refreshLoanStatusesInBackground } from '../services/loanService.js';
 import { signedSavings } from '../services/savingsLedger.js';
 import { refreshRentalStatusesInBackground } from './machineryController.js';
@@ -224,13 +226,11 @@ export async function getAnalytics(req, res) {
 export async function getDashboard(req, res) {
   refreshLoanStatusesInBackground();
   refreshRentalStatusesInBackground();
-  const [stats, activities] = await Promise.all([
+  const [stats, activities, income] = await Promise.all([
     query(`
       SELECT
         (SELECT COUNT(*)::int FROM members WHERE status = 'active') AS "totalMembers",
         (SELECT COALESCE(SUM(balance), 0) FROM loans WHERE status IN ('active', 'overdue')) AS "outstandingLoans",
-        (SELECT COUNT(*)::int FROM machinery_operations) AS "machineryOperations",
-        (SELECT COALESCE(SUM(net_sales), 0) FROM kadiwa_sales WHERE status = 'completed') AS "kadiwaRevenue",
         (SELECT COUNT(DISTINCT i.loan_id)::int FROM loan_installments i JOIN loans l ON l.id = i.loan_id
           WHERE l.status <> 'paid' AND i.amount_paid < i.amount_due AND i.due_date BETWEEN ${SQL_TODAY} AND ${SQL_TODAY} + 7) AS "loansDueThisWeek",
         (SELECT COUNT(*)::int FROM loans WHERE status = 'overdue') AS "overdueLoans",
@@ -252,6 +252,8 @@ export async function getDashboard(req, res) {
         (SELECT 'sale-' || id, 'Store', 'Kadiwa sale recorded by ' || encoder_name || ': PHP ' || to_char(net_sales, 'FM999,999,990.00'), created_at FROM kadiwa_sales WHERE status = 'completed' ORDER BY created_at DESC LIMIT 5)
       ) recent ORDER BY at DESC LIMIT 5
     `),
+    // All time; see services/netIncome.js for what is counted.
+    netIncomeCents(),
   ]);
   const row = stats.rows[0];
   const alerts = [
@@ -264,7 +266,15 @@ export async function getDashboard(req, res) {
   ].filter(Boolean);
   return res.json({
     success: true,
-    stats: { ...row, outstandingLoans: toNumber(row.outstandingLoans), kadiwaRevenue: toNumber(row.kadiwaRevenue) },
+    stats: {
+      ...row,
+      outstandingLoans: toNumber(row.outstandingLoans),
+      netIncome: centsToNumber(income.total),
+      netIncomeBreakdown: Object.fromEntries(Object.entries(income.parts).map(([key, cents]) => [key, centsToNumber(cents)])),
+      // The statutory funds set aside from that net income (none when there is no net income).
+      statutoryFunds: computeDividend({ netIncomeCents: income.total, memberShareCents: 0, totalShareCents: 0 }).funds
+        .map(({ key, label, percent, amount }) => ({ key, label, percent, amount: centsToNumber(amount) })),
+    },
     alerts,
     recentActivities: activities.rows,
   });
