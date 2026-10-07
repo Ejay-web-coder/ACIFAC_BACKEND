@@ -919,12 +919,29 @@ test('machinery: the PhilMech report form is saved per cropping', { skip }, asyn
 });
 
 test('kadiwa: sales decrement stock, reject overselling and race safely', { skip }, async () => {
+  // A product saved before cost prices were required cannot be sold until it has one.
+  assert.equal((await admin.get('/api/kadiwa')).data.summary.missingCostItems, 4);
+  const noCost = await admin.post('/api/kadiwa/sales', { encoderName: 'Tester', items: [{ inventoryId: 'INV-001', quantity: '1' }] });
+  assert.equal(noCost.status, 400);
+  assert.match(noCost.data.message, /Set the cost price of Rice before selling it/);
+  await pool.query(`UPDATE kadiwa_inventory SET cost_price = ROUND(price * 0.8, 2) WHERE cost_price IS NULL`);
+
   const before = await admin.get('/api/kadiwa');
   const rice = before.data.inventory.find((item) => item.id === 'INV-001');
   const startStock = Number(rice.stock);
   const sale = await admin.post('/api/kadiwa/sales', { encoderName: 'Tester', items: [{ inventoryId: 'INV-001', quantity: '5' }], totalExpenses: '10' });
   assert.equal(sale.status, 201, JSON.stringify(sale.data));
   assert.equal(Number(sale.data.sale.groceries), 5 * Number(rice.price));
+  // Net income = sold - expenses - cost of the items sold; each item keeps the cost it was sold at.
+  assert.equal(Number(sale.data.sale.costOfGoods), 5 * Number(rice.costPrice));
+  assert.equal(Number(sale.data.sale.netSales), 5 * Number(rice.price) - 10 - 5 * Number(rice.costPrice));
+  assert.deepEqual([Number(sale.data.sale.items[0].unitCost), Number(sale.data.sale.items[0].lineCost)], [Number(rice.costPrice), 5 * Number(rice.costPrice)]);
+  const today = (await admin.get('/api/kadiwa')).data.summary;
+  assert.deepEqual([today.todaySales, Number(today.todayRevenue), Number(today.todayCost), Number(today.todayExpenses), Number(today.todayNetIncome), today.missingCostItems],
+    [1, 5 * Number(rice.price), 5 * Number(rice.costPrice), 10, Number(sale.data.sale.netSales), 0], 'today\'s revenue, cost, expenses and net income');
+  const audit = await pool.query(`SELECT new_values FROM audit_logs WHERE action = 'KADIWA_SALE_CREATED' AND entity_id = $1`, [sale.data.sale.id]);
+  const logged = typeof audit.rows[0].new_values === 'string' ? JSON.parse(audit.rows[0].new_values) : audit.rows[0].new_values;
+  assert.deepEqual([logged.cost_of_goods, logged.net_sales, logged.items[0].unit_cost], [sale.data.sale.costOfGoods, sale.data.sale.netSales, rice.costPrice], 'the audit log keeps the cost and the net income');
   const afterSale = await admin.get('/api/kadiwa');
   assert.equal(Number(afterSale.data.inventory.find((item) => item.id === 'INV-001').stock), startStock - 5);
 
@@ -939,6 +956,204 @@ test('kadiwa: sales decrement stock, reject overselling and race safely', { skip
   const finalStock = Number(final.data.inventory.find((item) => item.id === 'INV-001').stock);
   assert.equal(finalStock, remaining - Number(half));
   assert.ok(finalStock >= 0);
+});
+
+test('kadiwa: inventory is added as a sheet of products with size, quantity, price and cost', { skip }, async () => {
+  const before = await admin.get('/api/kadiwa');
+  const count = before.data.inventory.length;
+  const tuna = { name: 'Century Tuna', sizeValue: '150', sizeUnit: 'g', unit: 'pc', stock: '13', price: '38', costPrice: '35', reorderLevel: '5' };
+  const toyo = { name: 'Silver Swan Toyo', sizeValue: 200, sizeUnit: 'ml', unit: 'bottle', stock: 5, price: 14, costPrice: 11, reorderLevel: 2 };
+
+  // A bad row, or the same product twice, saves nothing and names the row.
+  const badUnit = await admin.post('/api/kadiwa/inventory', { items: [tuna, { ...toyo, sizeUnit: 'oz' }] });
+  assert.equal(badUnit.status, 400);
+  assert.match(badUnit.data.message, /^Row 2: Choose the size unit/);
+  const twice = await admin.post('/api/kadiwa/inventory', { items: [tuna, { ...tuna, name: 'century tuna', sizeValue: '150.0' }] });
+  assert.equal(twice.status, 400);
+  assert.match(twice.data.message, /^Row 2: .*already on row 1/);
+  assert.equal((await admin.get('/api/kadiwa')).data.inventory.length, count);
+
+  const noCost = await admin.post('/api/kadiwa/inventory', { items: [tuna, toyo, { ...tuna, sizeValue: '180', costPrice: '' }] });
+  assert.equal(noCost.status, 400);
+  assert.match(noCost.data.message, /^Row 3: Enter the cost price/, 'the cost price is required');
+  const sheet = await admin.post('/api/kadiwa/inventory', { items: [tuna, toyo, { ...tuna, sizeValue: '180', costPrice: '36' }] });
+  assert.equal(sheet.status, 201, JSON.stringify(sheet.data));
+  assert.equal(sheet.data.items.length, 3);
+  const saved = Object.fromEntries(sheet.data.items.map((item) => [`${item.name} ${Number(item.sizeValue)}${item.sizeUnit}`, item]));
+  const tunaRow = saved['Century Tuna 150g'];
+  assert.equal(saved['Silver Swan Toyo 200mL'].unit, 'bottle', 'the size unit is written mL');
+  assert.deepEqual([Number(tunaRow.stock), Number(tunaRow.price), Number(tunaRow.costPrice), Number(tunaRow.reorderLevel)], [13, 38, 35, 5]);
+  assert.equal(Number(saved['Century Tuna 180g'].costPrice), 36);
+  const audit = await pool.query(`SELECT description FROM audit_logs WHERE action = 'INVENTORY_CREATED' ORDER BY id DESC LIMIT 1`);
+  assert.equal(audit.rows[0].description, 'Added 3 inventory items');
+
+  // The same product again is refused; another size of it was not.
+  const again = await admin.post('/api/kadiwa/inventory', tuna);
+  assert.equal(again.status, 409);
+  assert.match(again.data.message, /Century Tuna 150 g \(pc\) is already in the inventory/);
+
+  // The stock is valued at cost, like the notebook total; at the selling price when no cost is set.
+  const after = await admin.get('/api/kadiwa');
+  const added = 13 * 35 + 5 * 11 + 13 * 36;
+  assert.equal(Math.round(Number(after.data.summary.inventoryValue) * 100), Math.round((Number(before.data.summary.inventoryValue) + added) * 100));
+
+  // A sale line carries the size with the name.
+  const sale = await admin.post('/api/kadiwa/sales', { encoderName: 'Tester', items: [{ inventoryId: tunaRow.id, quantity: '2' }] });
+  assert.equal(sale.status, 201, JSON.stringify(sale.data));
+  assert.equal(sale.data.sale.items[0].name, 'Century Tuna 150 g');
+  assert.equal(Number(sale.data.sale.groceries), 76);
+
+  // Editing changes the details; a count replaces the quantity only while it is still what was opened.
+  const url = `/api/kadiwa/inventory/${tunaRow.id}`;
+  const edit = await admin.patch(url, { ...tuna, price: '40', costPrice: '36', stock: undefined });
+  assert.equal(edit.status, 200, JSON.stringify(edit.data));
+  assert.deepEqual([Number(edit.data.item.price), Number(edit.data.item.costPrice), Number(edit.data.item.stock)], [40, 36, 11]);
+  const stale = await admin.patch(url, { ...tuna, price: '40', costPrice: '36', stock: '10', expectedStock: '13' });
+  assert.equal(stale.status, 409);
+  assert.match(stale.data.message, /is now 11 pc/);
+  const counted = await admin.patch(url, { ...tuna, price: '40', costPrice: '36', stock: '10', expectedStock: '11' });
+  assert.equal(counted.status, 200, JSON.stringify(counted.data));
+  assert.equal(Number(counted.data.item.stock), 10);
+  const actions = await pool.query(`SELECT action FROM audit_logs WHERE entity_id = $1 AND action IN ('INVENTORY_UPDATED', 'INVENTORY_COUNTED') ORDER BY id`, [tunaRow.id]);
+  assert.deepEqual(actions.rows.map((row) => row.action), ['INVENTORY_UPDATED', 'INVENTORY_COUNTED']);
+
+  // Renaming one size onto the other is refused.
+  const clash = await admin.patch(`/api/kadiwa/inventory/${saved['Century Tuna 180g'].id}`, { ...tuna, sizeValue: '150' });
+  assert.equal(clash.status, 409);
+  assert.equal((await admin.patch('/api/kadiwa/inventory/INV-9999', tuna)).status, 404);
+});
+
+test('kadiwa: a product is deleted; one already sold stays for its past sales', { skip }, async () => {
+  const created = await admin.post('/api/kadiwa/inventory', { items: [
+    { name: 'Delete Me', unit: 'pc', stock: '5', price: '10', costPrice: '8', reorderLevel: '1' },
+    { name: 'Sold Then Deleted', unit: 'pc', stock: '5', price: '20', costPrice: '15', reorderLevel: '1' },
+  ] });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const [unsold, sold] = ['Delete Me', 'Sold Then Deleted'].map((name) => created.data.items.find((item) => item.name === name));
+  const sale = await admin.post('/api/kadiwa/sales', { sellerName: 'Tester', items: [{ inventoryId: sold.id, quantity: '2' }] });
+  assert.equal(sale.status, 201, JSON.stringify(sale.data));
+  const valueBefore = Number((await admin.get('/api/kadiwa')).data.summary.inventoryValue);
+
+  // Never sold: removed.
+  const removed = await admin.request('DELETE', `/api/kadiwa/inventory/${unsold.id}`);
+  assert.equal(removed.status, 200, JSON.stringify(removed.data));
+  assert.deepEqual([removed.data.name, removed.data.keptForPastSales], ['Delete Me', false]);
+  assert.equal((await pool.query('SELECT 1 FROM kadiwa_inventory WHERE id = $1', [unsold.id])).rowCount, 0);
+
+  // Sold: kept for its past sale, gone from the inventory and its totals.
+  const archived = await admin.request('DELETE', `/api/kadiwa/inventory/${sold.id}`);
+  assert.equal(archived.status, 200, JSON.stringify(archived.data));
+  assert.deepEqual([archived.data.keptForPastSales, archived.data.pastSales], [true, 1]);
+  const after = (await admin.get('/api/kadiwa')).data;
+  assert.ok(!after.inventory.some((item) => item.id === sold.id || item.id === unsold.id), 'gone from the inventory');
+  assert.equal(Math.round(Number(after.summary.inventoryValue) * 100), Math.round((valueBefore - 5 * 8 - 3 * 15) * 100), 'left out of the inventory value');
+  const day = sale.data.sale.saleDate;
+  const history = await admin.get(`/api/kadiwa/sales?from=${day}&to=${day}`);
+  const pastSale = history.data.sales.find((entry) => entry.id === sale.data.sale.id);
+  assert.ok(pastSale.items.some((item) => item.inventoryId === sold.id && item.name === 'Sold Then Deleted'), 'the past sale still shows it');
+
+  // A deleted product cannot be sold, restocked, edited or deleted again; the same product can be added as a new one.
+  assert.equal((await admin.post('/api/kadiwa/sales', { sellerName: 'Tester', items: [{ inventoryId: sold.id, quantity: '1' }] })).status, 404);
+  assert.equal((await admin.patch(`/api/kadiwa/inventory/${sold.id}/restock`, { quantity: '1' })).status, 404);
+  assert.equal((await admin.patch(`/api/kadiwa/inventory/${sold.id}`, { name: 'Sold Then Deleted', unit: 'pc', price: '20', costPrice: '15' })).status, 404);
+  assert.equal((await admin.request('DELETE', `/api/kadiwa/inventory/${sold.id}`)).status, 404);
+  const again = await admin.post('/api/kadiwa/inventory', { name: 'Sold Then Deleted', unit: 'pc', stock: '1', price: '20', costPrice: '15' });
+  assert.equal(again.status, 201, JSON.stringify(again.data));
+  assert.notEqual(again.data.item.id, sold.id);
+  const audits = await pool.query(`SELECT entity_id, new_values FROM audit_logs WHERE action = 'INVENTORY_DELETED' ORDER BY id`);
+  assert.deepEqual(audits.rows.map((row) => [row.entity_id, row.new_values.kept_for_past_sales]), [[unsold.id, false], [sold.id, true]]);
+});
+
+test('kadiwa: a sale is the daily form of goods sold, reported per 15 days and per month', { skip }, async () => {
+  const url = '/api/kadiwa/sales';
+  const rice = (await admin.get('/api/kadiwa')).data.inventory.find((item) => item.id === 'INV-001');
+  const day1 = {
+    sellerName: 'Ana Seller', saleDate: '2026-09-01',
+    goods: [
+      { name: 'PORK', unit: 'KILO', price: '400', amount: '300' },
+      { name: 'Egg', unit: 'tray', price: '260', quantity: '2' },
+      { name: 'GROCERIES', amount: '745' },
+      { name: 'KALABASA', unit: 'BALOT', price: '15', amount: '517' },
+      { name: '  patola ', unit: 'kilo', price: '20', quantity: '5.75', category: 'Vegetables' },
+    ],
+    items: [{ inventoryId: 'INV-001', quantity: '1' }],
+    expenses: [{ description: 'None', amount: '0' }],
+  };
+
+  // The seller, a date not ahead of today, and an amount (or quantity and price) on every line.
+  // Without a seller name, the sale is recorded under the person who saves it (checked below, once valid).
+  const recorder = (await pool.query(`SELECT COALESCE(NULLIF(BTRIM(full_name), ''), username) AS name FROM users WHERE username = 'testadmin'`)).rows[0].name;
+  assert.match((await admin.post(url, { ...day1, saleDate: '2999-01-01' })).data.message, /cannot be in the future/);
+  assert.match((await admin.post(url, { ...day1, goods: [...day1.goods, { name: 'pork', unit: 'Kilo', amount: '1' }] })).data.message, /PORK \(KILO\) is written twice/);
+  const noAmount = await admin.post(url, { ...day1, goods: [{ name: 'SITAW', unit: 'BALOT', price: '15' }] });
+  assert.equal(noAmount.status, 400);
+  assert.match(noAmount.data.message, /^SITAW: enter the total amount, or the quantity and the price/);
+  assert.match((await admin.post(url, { sellerName: 'Ana Seller', goods: [] })).data.message, /at least one good/);
+  // The expenses are required with the goods: each with what it was for and the amount (0 if none).
+  const { expenses: _none, ...withoutExpenses } = day1;
+  assert.match((await admin.post(url, withoutExpenses)).data.message, /^Enter the expenses of the sale/);
+  assert.match((await admin.post(url, { ...day1, expenses: [] })).data.message, /^Enter the expenses of the sale/);
+  assert.match((await admin.post(url, { ...day1, expenses: [{ description: ' ', amount: '10' }] })).data.message, /^Expense 1: enter what it was for/);
+  assert.match((await admin.post(url, { ...day1, expenses: [{ description: 'Ice', amount: '' }] })).data.message, /^Ice: enter the amount/);
+  assert.match((await admin.post(url, { ...day1, expenses: [{ description: 'Ice', amount: '-5' }] })).data.message, /^Ice: enter the amount/);
+
+  const first = await admin.post(url, day1);
+  assert.equal(first.status, 201, JSON.stringify(first.data));
+  const sale = first.data.sale;
+  assert.deepEqual([sale.saleDate, sale.seller], ['2026-09-01', 'Ana Seller']);
+  assert.match(sale.id, /^S-2026-/);
+  // Groceries: egg 520 + groceries 745 + rice from the store 1 x price; vegetables: kalabasa 517 + patola 115; meat: pork 300.
+  const riceCents = Math.round(Number(rice.price) * 100);
+  assert.deepEqual([sale.groceries, sale.vegetables, sale.meat].map((value) => Math.round(Number(value) * 100)), [52000 + 74500 + riceCents, 51700 + 11500, 30000]);
+  // Only the rice from the store has a cost price; the goods typed on the form have none.
+  assert.equal(Math.round(Number(sale.costOfGoods) * 100), Math.round(Number(rice.costPrice) * 100));
+  assert.equal(Math.round(Number(sale.netSales) * 100), 52000 + 74500 + riceCents + 51700 + 11500 + 30000 - Math.round(Number(rice.costPrice) * 100));
+  const lines = Object.fromEntries(sale.lines.map((line) => [line.name, line]));
+  assert.equal(lines.PORK.quantity, 0.75, 'quantity = amount / price when only the amount is written');
+  assert.equal(lines.EGG.unit, 'TRAY');
+  assert.equal(Number(lines.EGG.amount), 520, 'amount = quantity x price when the amount is left blank');
+  assert.equal(Number(lines.GROCERIES.amount), 745 + Number(rice.price), 'store items are counted under GROCERIES');
+  assert.equal(lines.KALABASA.quantity, 34.4667);
+  assert.equal(Number(lines.PATOLA.amount), 115);
+  assert.deepEqual(sale.lines.map((line) => line.name), ['PORK', 'EGG', 'GROCERIES', 'KALABASA', 'PATOLA'], 'in the order of the paper form');
+
+  const second = await admin.post(url, { sellerName: 'Ben Seller', saleDate: '2026-09-10', totalExpenses: '999', expenses: [{ description: '  Transportation ', amount: '30' }, { description: 'Plastic bags', amount: '20.00' }], goods: [{ name: 'PORK', unit: 'KILO', price: '400', amount: '400' }, { name: 'EGG', unit: 'TRAY', price: '280', amount: '260' }] });
+  assert.equal(second.status, 201, JSON.stringify(second.data));
+  assert.equal(Number(second.data.sale.netSales), 610, 'the expenses are the sum of the lines, not totalExpenses');
+  assert.equal(Number(second.data.sale.totalExpenses), 50);
+  assert.deepEqual(second.data.sale.expenses.map((line) => [line.description, Number(line.amount)]), [['Transportation', 30], ['Plastic bags', 20]]);
+  const expenseAudit = await pool.query(`SELECT new_values FROM audit_logs WHERE action = 'KADIWA_SALE_CREATED' AND entity_id = $1`, [second.data.sale.id]);
+  const loggedExpenses = expenseAudit.rows[0].new_values.expenses;
+  assert.deepEqual(loggedExpenses, [{ description: 'Transportation', amount: '30.00' }, { description: 'Plastic bags', amount: '20.00' }], 'the audit log keeps each expense');
+  const third = await admin.post(url, { sellerName: ' ', saleDate: '2026-09-20', expenses: [{ description: 'None', amount: '0' }], goods: [{ name: 'SITAW', unit: 'BALOT', price: '15', amount: '565' }] });
+  assert.equal(third.status, 201, JSON.stringify(third.data));
+  assert.equal(third.data.sale.seller, recorder, 'recorded under the person who saved it');
+
+  // September 1 to 15: every good added up, like the 15-day summary.
+  const half = await admin.get(`${url}?from=2026-09-01&to=2026-09-15`);
+  assert.equal(half.status, 200, JSON.stringify(half.data));
+  assert.deepEqual(half.data.sales.map((entry) => entry.saleDate), ['2026-09-10', '2026-09-01'], 'newest first');
+  const report = Object.fromEntries(half.data.report.lines.map((line) => [line.name, line]));
+  assert.deepEqual([report.PORK.quantity, Number(report.PORK.amount), Number(report.PORK.price)], [1.75, 700, 400]);
+  assert.deepEqual([Number(report.EGG.price), Number(report.EGG.priceMax), Number(report.EGG.amount)], [260, 280, 780], 'a good sold at two prices shows both');
+  assert.equal(report.SITAW, undefined, 'September 20 is in the second half');
+  const totals = half.data.report.totals;
+  assert.deepEqual([totals.sales, totals.days], [2, 2]);
+  assert.equal(Math.round(Number(totals.gross) * 100), half.data.report.lines.reduce((sum, line) => sum + Math.round(Number(line.amount) * 100), 0), 'the lines add up to the gross sales');
+  assert.equal(Math.round(Number(totals.costOfGoods) * 100), Math.round(Number(rice.costPrice) * 100), 'the cost of the store items sold');
+  assert.equal(Math.round(Number(totals.net) * 100), Math.round(Number(totals.gross) * 100) - 5000 - Math.round(Number(totals.costOfGoods) * 100));
+
+  const month = await admin.get(`${url}?from=2026-09-01&to=2026-09-30`);
+  assert.equal(month.data.report.totals.sales, 3);
+  assert.equal(Number(month.data.report.lines.find((line) => line.name === 'SITAW').quantity), 37.6667);
+  assert.equal((await admin.get(`${url}?from=2026-09-15&to=2026-09-01`)).status, 400);
+
+  // The form starts from the goods with the price each was last sold at; a new good is kept.
+  const goods = (await admin.get('/api/kadiwa')).data.goods;
+  assert.deepEqual(goods.slice(0, 3).map((good) => good.name), ['PORK', 'EGG', 'GROCERIES']);
+  assert.equal(Number(goods.find((good) => good.name === 'EGG').price), 280);
+  assert.ok(goods.some((good) => good.name === 'PATOLA'));
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM kadiwa_sale_goods WHERE sale_id = $1`, [sale.id])).rows[0].count, 5);
 });
 
 test('loans: applications typed into the app need the borrower and co-maker IDs with 3 signatures', { skip }, async () => {

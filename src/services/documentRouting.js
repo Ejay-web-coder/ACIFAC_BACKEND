@@ -925,7 +925,7 @@ async function saveToModule(client, req, scan, documentType, data, target) {
     const manual = { Groceries: moneyCents(data.groceriesPrice), Vegetables: moneyCents(data.vegetablesPrice), Meat: moneyCents(data.meatPrice) };
     const expensesCents = moneyCents(data.totalExpenses);
     if ([...Object.values(manual), expensesCents].some((value) => value === null)) throw badRequest('Sales amounts must be non-negative with at most two decimals.');
-    const saleId = await insertKadiwaSale(client, req, { encoderName: String(data.encoderName || '').slice(0, 200), manual, expensesCents, items: [] });
+    const saleId = await insertKadiwaSale(client, req, { encoderName: String(data.encoderName || '').slice(0, 200), saleDate: isValidDateOnly(data.saleDate) && data.saleDate <= todayDateOnly() ? data.saleDate : null, manual, expensesCents, items: [] });
     return { module: 'kadiwa', recordId: saleId, label: `Kadiwa sale ${saleId} recorded` };
   }
 

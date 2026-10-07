@@ -1,5 +1,5 @@
 import { query } from '../config/db.js';
-import { SQL_TODAY, TIME_ZONE } from '../config/env.js';
+import { SQL_TODAY } from '../config/env.js';
 import { centsToString, toCents } from '../utils/money.js';
 
 // The cooperative's net income from its three income-earning modules, each
@@ -15,8 +15,8 @@ const NET_INCOME_SQL = `
   SELECT
     (SELECT COALESCE(SUM(net_sales), 0) FROM kadiwa_sales
       WHERE status = 'completed'
-        AND ($1::date IS NULL OR (created_at AT TIME ZONE '${TIME_ZONE}')::date >= $1::date)
-        AND ($2::date IS NULL OR (created_at AT TIME ZONE '${TIME_ZONE}')::date <= $2::date)) AS kadiwa,
+        AND ($1::date IS NULL OR sale_date >= $1::date)
+        AND ($2::date IS NULL OR sale_date <= $2::date)) AS kadiwa,
     (SELECT COALESCE(SUM(mo.rental_fee), 0) FROM machinery_operations mo
       WHERE mo.start_date <= ${SQL_TODAY}
         AND ($1::date IS NULL OR mo.start_date >= $1::date) AND ($2::date IS NULL OR mo.start_date <= $2::date)

@@ -90,7 +90,7 @@ export async function getAnalytics(req, res) {
         (SELECT COALESCE(SUM(lp.amount), 0) FROM loan_payments lp) AS "totalLoanPayments",
         (SELECT COALESCE(SUM(lp.interest_paid), 0) FROM loan_payments lp WHERE lp.payment_date BETWEEN $1::date AND $2::date) AS "interestCollected",
         (SELECT COALESCE(SUM(mo.rental_fee), 0) FROM machinery_operations mo WHERE mo.start_date BETWEEN $1::date AND $2::date) AS "machineryRevenue",
-        (SELECT COALESCE(SUM(ks.net_sales), 0) FROM kadiwa_sales ks WHERE ${localDate('ks.created_at')} BETWEEN $1::date AND $2::date AND ks.status = 'completed') AS "kadiwaNetSales",
+        (SELECT COALESCE(SUM(ks.net_sales), 0) FROM kadiwa_sales ks WHERE ks.sale_date BETWEEN $1::date AND $2::date AND ks.status = 'completed') AS "kadiwaNetSales",
         (SELECT COALESCE(SUM(l.balance), 0) FROM loans l WHERE l.status IN ('active', 'overdue')) AS "outstandingBalance",
         (SELECT COUNT(*)::int FROM loans) AS "totalLoans",
         (SELECT COUNT(*)::int FROM loans WHERE status = 'active') AS "activeLoans",
@@ -118,7 +118,7 @@ export async function getAnalytics(req, res) {
         UNION ALL
         SELECT 'Machinery Rental', COALESCE(SUM(mo.rental_fee), 0) FROM machinery_operations mo WHERE mo.start_date BETWEEN $1::date AND $2::date
         UNION ALL
-        SELECT 'Kadiwa Net Sales', COALESCE(SUM(ks.net_sales), 0) FROM kadiwa_sales ks WHERE ${localDate('ks.created_at')} BETWEEN $1::date AND $2::date AND ks.status = 'completed'
+        SELECT 'Kadiwa Net Sales', COALESCE(SUM(ks.net_sales), 0) FROM kadiwa_sales ks WHERE ks.sale_date BETWEEN $1::date AND $2::date AND ks.status = 'completed'
       ) totals WHERE amount > 0 ORDER BY amount DESC
     `, [from, to]),
     query(`
@@ -127,10 +127,10 @@ export async function getAnalytics(req, res) {
       GROUP BY mo.machinery_name ORDER BY revenue DESC, operations DESC
     `, [from, to]),
     query(`
-      SELECT TO_CHAR(DATE_TRUNC('month', ${localDate('ks.created_at')}), 'Mon YYYY') AS period,
+      SELECT TO_CHAR(DATE_TRUNC('month', ks.sale_date), 'Mon YYYY') AS period,
              COALESCE(SUM(ks.net_sales), 0) AS sales, COALESCE(SUM(ks.total_expenses), 0) AS expenses, COUNT(*)::int AS transactions
-      FROM kadiwa_sales ks WHERE ${localDate('ks.created_at')} BETWEEN $1::date AND $2::date AND ks.status = 'completed'
-      GROUP BY DATE_TRUNC('month', ${localDate('ks.created_at')}) ORDER BY DATE_TRUNC('month', ${localDate('ks.created_at')})
+      FROM kadiwa_sales ks WHERE ks.sale_date BETWEEN $1::date AND $2::date AND ks.status = 'completed'
+      GROUP BY DATE_TRUNC('month', ks.sale_date) ORDER BY DATE_TRUNC('month', ks.sale_date)
     `, [from, to]),
     // One pass per table, joined by member (no per-member sub-queries).
     query(`
@@ -237,7 +237,7 @@ export async function getDashboard(req, res) {
         (SELECT COUNT(*)::int FROM loan_requests WHERE status = 'pending') AS "pendingLoanRequests",
         (SELECT COUNT(*)::int FROM rental_requests WHERE status = 'pending') AS "pendingRentalRequests",
         (SELECT COUNT(*)::int FROM machinery_operations WHERE status = 'scheduled') AS "scheduledOperations",
-        (SELECT COUNT(*)::int FROM kadiwa_inventory WHERE stock <= reorder_level) AS "lowStockItems"
+        (SELECT COUNT(*)::int FROM kadiwa_inventory WHERE stock <= reorder_level AND deleted_at IS NULL) AS "lowStockItems"
     `),
     query(`
       SELECT * FROM (
