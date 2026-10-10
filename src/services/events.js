@@ -13,7 +13,9 @@ const ADMIN_ONLY_TABLES = new Set([
   'users', 'kadiwa_inventory', 'kadiwa_sales', 'document_scans',
   'machinery_services', 'machinery_service_payments', 'machinery_service_rates', 'machinery_expenses', 'machinery_period_balances',
 ]);
-const PUBLIC_TABLES = new Set(['machinery', 'announcements']);
+// Activities (meetings, trainings...) are shown to every member as upcoming
+// activities; attendance rows reach only the member they belong to.
+const PUBLIC_TABLES = new Set(['machinery', 'announcements', 'activities']);
 const HEARTBEAT_MS = 25000;
 
 const connections = new Set();

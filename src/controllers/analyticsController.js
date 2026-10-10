@@ -1,12 +1,36 @@
 import { query } from '../config/db.js';
 import { SQL_TODAY, TIME_ZONE } from '../config/env.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
-import { badRequest } from '../utils/http.js';
+import { badRequest, notFound } from '../utils/http.js';
 import { centsToNumber, netIncomeCents } from '../services/netIncome.js';
 import { computeDividend } from '../services/dividends.js';
 import { refreshLoanStatusesInBackground } from '../services/loanService.js';
 import { signedSavings } from '../services/savingsLedger.js';
 import { refreshRentalStatusesInBackground } from './machineryController.js';
+import { machineryAnalytics, machineryRecommendations } from '../services/machineryAnalytics.js';
+
+// A member's share capital is at most PHP 20,000 (SHARE_CAPITAL_LIMIT in
+// memberController.js, not imported: the controllers import each other).
+const SHARE_CAPITAL_LIMIT = 20000;
+
+// The share capital bands of the admin dashboard, lowest first: min is included, max is
+// not (null for the PHP 20,000 maximum itself). The counts and the member
+// list of a band both use them.
+const SHARE_CAPITAL_BANDS = [
+  { key: 'below1k', min: 0, max: 1000 },
+  { key: 'from1kTo5k', min: 1000, max: 5000 },
+  { key: 'from5kTo15k', min: 5000, max: 15000 },
+  { key: 'from15kTo20k', min: 15000, max: SHARE_CAPITAL_LIMIT },
+  { key: 'maximum', min: SHARE_CAPITAL_LIMIT, max: null },
+];
+const inBand = (band) => `total >= ${band.min}${band.max === null ? '' : ` AND total < ${band.max}`}`;
+// Each member's whole share capital, as on their member record; terminated
+// members left out.
+const MEMBER_SHARE_TOTALS = `
+  SELECT m.id, COALESCE(SUM(sc.amount), 0) AS total
+  FROM members m LEFT JOIN share_contributions sc ON sc.member_id = m.id
+  WHERE m.status <> 'archived'
+  GROUP BY m.id`;
 
 const toNumber = (value) => Number(value || 0);
 
@@ -64,18 +88,25 @@ function buildLoanRecommendation(member) {
   };
 }
 
-export async function getAnalytics(req, res) {
+// The period of an Analytics request (from and to, YYYY-MM-DD, in the query or
+// body); this year up to today by default.
+function readPeriod(source = {}) {
   const today = todayDateOnly();
-  const from = req.query.from === undefined ? `${today.slice(0, 4)}-01-01` : String(req.query.from);
-  const to = req.query.to === undefined ? today : String(req.query.to);
+  const from = source.from === undefined ? `${today.slice(0, 4)}-01-01` : String(source.from);
+  const to = source.to === undefined ? today : String(source.to);
   if (!isValidDateOnly(from) || !isValidDateOnly(to)) throw badRequest('Analytics dates must be valid YYYY-MM-DD values.');
   if (from > to) throw badRequest('The analytics start date must be before the end date.');
+  return { from, to };
+}
+
+export async function getAnalytics(req, res) {
+  const { from, to } = readPeriod(req.query);
 
   refreshLoanStatusesInBackground();
   refreshRentalStatusesInBackground();
   const localDate = (column) => `(${column} AT TIME ZONE '${TIME_ZONE}')::date`;
 
-  const [summary, membership, loans, revenue, machinery, sales, memberAnalytics] = await Promise.all([
+  const [summary, loans, revenue, machinery, sales, memberAnalytics] = await Promise.all([
     query(`
       SELECT
         (SELECT COUNT(*)::int FROM members WHERE status = 'active') AS "activeMembers",
@@ -103,11 +134,6 @@ export async function getAnalytics(req, res) {
         (SELECT COALESCE(SUM(lr.total_repayment), 0) FROM loan_requests lr WHERE ${localDate('lr.submitted_at')} BETWEEN $1::date AND $2::date) AS "projectedRepayment"
     `, [from, to]),
     query(`
-      SELECT TO_CHAR(DATE_TRUNC('month', membership_date), 'Mon YYYY') AS period, COUNT(*)::int AS members
-      FROM members WHERE membership_date BETWEEN $1::date AND $2::date AND status <> 'archived'
-      GROUP BY DATE_TRUNC('month', membership_date) ORDER BY DATE_TRUNC('month', membership_date)
-    `, [from, to]),
-    query(`
       SELECT TO_CHAR(DATE_TRUNC('month', l.date_approved), 'Mon YYYY') AS period, COALESCE(SUM(l.amount), 0) AS amount, COUNT(*)::int AS count
       FROM loans l WHERE l.date_approved BETWEEN $1::date AND $2::date
       GROUP BY DATE_TRUNC('month', l.date_approved) ORDER BY DATE_TRUNC('month', l.date_approved)
@@ -126,8 +152,23 @@ export async function getAnalytics(req, res) {
       FROM machinery_operations mo WHERE mo.start_date BETWEEN $1::date AND $2::date
       GROUP BY mo.machinery_name ORDER BY revenue DESC, operations DESC
     `, [from, to]),
-    query(`
+    // A period inside one calendar month is shown day by day: every day up to
+    // today (or the last sale, if later), with ₱0 on days without a sale.
+    // Longer periods are shown month by month. gross is the goods sold; sales
+    // (the net income) is gross - expenses - costOfGoods.
+    from.slice(0, 7) === to.slice(0, 7) ? query(`
+      WITH days AS (
+        SELECT generate_series($1::date, LEAST($2::date, GREATEST(${SQL_TODAY},
+                 (SELECT MAX(sale_date) FROM kadiwa_sales WHERE sale_date BETWEEN $1::date AND $2::date AND status = 'completed'))), INTERVAL '1 day')::date AS day
+      )
+      SELECT TO_CHAR(d.day, 'Mon FMDD') AS period,
+             COALESCE(SUM(ks.groceries + ks.vegetables + ks.meat), 0) AS gross, COALESCE(SUM(ks.cost_of_goods), 0) AS "costOfGoods",
+             COALESCE(SUM(ks.net_sales), 0) AS sales, COALESCE(SUM(ks.total_expenses), 0) AS expenses, COUNT(ks.id)::int AS transactions
+      FROM days d LEFT JOIN kadiwa_sales ks ON ks.sale_date = d.day AND ks.status = 'completed'
+      GROUP BY d.day ORDER BY d.day
+    `, [from, to]) : query(`
       SELECT TO_CHAR(DATE_TRUNC('month', ks.sale_date), 'Mon YYYY') AS period,
+             COALESCE(SUM(ks.groceries + ks.vegetables + ks.meat), 0) AS gross, COALESCE(SUM(ks.cost_of_goods), 0) AS "costOfGoods",
              COALESCE(SUM(ks.net_sales), 0) AS sales, COALESCE(SUM(ks.total_expenses), 0) AS expenses, COUNT(*)::int AS transactions
       FROM kadiwa_sales ks WHERE ks.sale_date BETWEEN $1::date AND $2::date AND ks.status = 'completed'
       GROUP BY DATE_TRUNC('month', ks.sale_date) ORDER BY DATE_TRUNC('month', ks.sale_date)
@@ -210,11 +251,10 @@ export async function getAnalytics(req, res) {
       totalOperatingRevenue: toNumber(totals.interestCollected) + toNumber(totals.machineryRevenue) + toNumber(totals.kadiwaNetSales),
       paymentToOutstandingRate: loanPayments + outstandingBalance > 0 ? Number(((loanPayments / (loanPayments + outstandingBalance)) * 100).toFixed(1)) : 0,
     },
-    membership: mapRows(membership.rows, ['members']),
     loans: mapRows(loans.rows, ['amount', 'count']),
     revenue: mapRows(revenue.rows, ['amount']),
     machinery: mapRows(machinery.rows, ['operations', 'days', 'revenue']),
-    sales: mapRows(sales.rows, ['sales', 'expenses', 'transactions']),
+    sales: mapRows(sales.rows, ['gross', 'costOfGoods', 'sales', 'expenses', 'transactions']),
     memberAnalytics: memberRows,
     repaymentRatings: ['Excellent', 'Good', 'Fair', 'Needs Improvement', 'Insufficient data'].map((rating) => ({ rating, members: memberRows.filter((member) => member.repaymentRating === rating).length })),
     loanCapacity: ['Strong', 'Good', 'Moderate', 'Needs Review'].map((assessment) => ({ assessment, members: recommendationCounts[assessment] || 0 })),
@@ -222,14 +262,54 @@ export async function getAnalytics(req, res) {
   });
 }
 
+// GET /api/admin/analytics/machinery
+// The machinery fleet card of Analytics (see services/machineryAnalytics.js).
+export async function getMachineryAnalytics(req, res) {
+  const { from, to } = readPeriod(req.query);
+  refreshRentalStatusesInBackground();
+  return res.json({ success: true, ...(await machineryAnalytics(from, to)) });
+}
+
+// POST /api/admin/analytics/machinery/recommendations
+// Asked only when an admin opens the AI recommendations, as each one is an AI call.
+export async function recommendMachinery(req, res) {
+  const { from, to } = readPeriod(req.body || {});
+  return res.json({ success: true, ...(await machineryRecommendations(from, to)) });
+}
+
+// GET /api/admin/dashboard/share-capital/:band
+// The members in one share capital band of the dashboard (a bar clicked on
+// the chart), most share capital first.
+export async function listShareCapitalBandMembers(req, res) {
+  const band = SHARE_CAPITAL_BANDS.find((item) => item.key === req.params.band);
+  if (!band) throw notFound('Unknown share capital range.');
+  const result = await query(`
+    WITH totals AS (${MEMBER_SHARE_TOTALS})
+    SELECT m.id, m.member_number AS "memberNumber", TRIM(CONCAT_WS(' ', m.first_name, m.middle_name, m.last_name, m.suffix)) AS "memberName",
+           m.status, totals.total AS "shareCapital"
+    FROM totals JOIN members m ON m.id = totals.id
+    WHERE ${inBand(band)}
+    ORDER BY totals.total DESC, m.last_name, m.first_name, m.id
+  `);
+  return res.json({
+    success: true,
+    band,
+    members: result.rows.map((row) => ({ ...row, id: Number(row.id), memberNumber: row.memberNumber || '—', shareCapital: Number(row.shareCapital) })),
+  });
+}
+
 // Everything the admin dashboard shows, in one request.
 export async function getDashboard(req, res) {
   refreshLoanStatusesInBackground();
   refreshRentalStatusesInBackground();
-  const [stats, activities, income] = await Promise.all([
+  const [stats, shareCapitalLevels, activities, income] = await Promise.all([
+    // The counts after "outstandingLoans" are what needs the admin's attention now.
     query(`
       SELECT
         (SELECT COUNT(*)::int FROM members WHERE status = 'active') AS "totalMembers",
+        -- Members (terminated ones left out) with and without a login account.
+        (SELECT COUNT(*)::int FROM members m WHERE m.status <> 'archived' AND EXISTS (SELECT 1 FROM users u WHERE u.member_id = m.id)) AS "registeredMembers",
+        (SELECT COUNT(*)::int FROM members m WHERE m.status <> 'archived' AND NOT EXISTS (SELECT 1 FROM users u WHERE u.member_id = m.id)) AS "unregisteredMembers",
         (SELECT COALESCE(SUM(balance), 0) FROM loans WHERE status IN ('active', 'overdue')) AS "outstandingLoans",
         (SELECT COUNT(DISTINCT i.loan_id)::int FROM loan_installments i JOIN loans l ON l.id = i.loan_id
           WHERE l.status <> 'paid' AND i.amount_paid < i.amount_due AND i.due_date BETWEEN ${SQL_TODAY} AND ${SQL_TODAY} + 7) AS "loansDueThisWeek",
@@ -238,6 +318,12 @@ export async function getDashboard(req, res) {
         (SELECT COUNT(*)::int FROM rental_requests WHERE status = 'pending') AS "pendingRentalRequests",
         (SELECT COUNT(*)::int FROM machinery_operations WHERE status = 'scheduled') AS "scheduledOperations",
         (SELECT COUNT(*)::int FROM kadiwa_inventory WHERE stock <= reorder_level AND deleted_at IS NULL) AS "lowStockItems"
+    `),
+    // Members by their share capital now, in bands up to the PHP 20,000 maximum.
+    query(`
+      WITH totals AS (${MEMBER_SHARE_TOTALS})
+      SELECT ${SHARE_CAPITAL_BANDS.map((band) => `COUNT(*) FILTER (WHERE ${inBand(band)})::int AS "${band.key}"`).join(',\n             ')}
+      FROM totals
     `),
     query(`
       SELECT * FROM (
@@ -256,14 +342,6 @@ export async function getDashboard(req, res) {
     netIncomeCents(),
   ]);
   const row = stats.rows[0];
-  const alerts = [
-    row.overdueLoans > 0 && { id: 'loans-overdue', message: `${row.overdueLoans} loan${row.overdueLoans === 1 ? ' is' : 's are'} overdue`, type: 'warning' },
-    row.loansDueThisWeek > 0 && { id: 'loans-due', message: `${row.loansDueThisWeek} loan${row.loansDueThisWeek === 1 ? '' : 's'} due for payment this week`, type: 'warning' },
-    row.pendingLoanRequests > 0 && { id: 'loan-requests', message: `${row.pendingLoanRequests} loan application${row.pendingLoanRequests === 1 ? '' : 's'} waiting for review`, type: 'info' },
-    row.pendingRentalRequests > 0 && { id: 'rental-requests', message: `${row.pendingRentalRequests} rental request${row.pendingRentalRequests === 1 ? '' : 's'} waiting for review`, type: 'info' },
-    row.scheduledOperations > 0 && { id: 'machinery-scheduled', message: `${row.scheduledOperations} machinery operation${row.scheduledOperations === 1 ? '' : 's'} scheduled`, type: 'info' },
-    row.lowStockItems > 0 && { id: 'kadiwa-low-stock', message: `${row.lowStockItems} Kadiwa item${row.lowStockItems === 1 ? '' : 's'} at or below reorder level`, type: 'warning' },
-  ].filter(Boolean);
   return res.json({
     success: true,
     stats: {
@@ -275,7 +353,7 @@ export async function getDashboard(req, res) {
       statutoryFunds: computeDividend({ netIncomeCents: income.total, memberShareCents: 0, totalShareCents: 0 }).funds
         .map(({ key, label, percent, amount }) => ({ key, label, percent, amount: centsToNumber(amount) })),
     },
-    alerts,
+    shareCapitalLevels: SHARE_CAPITAL_BANDS.map((band) => ({ ...band, members: shareCapitalLevels.rows[0][band.key] })),
     recentActivities: activities.rows,
   });
 }

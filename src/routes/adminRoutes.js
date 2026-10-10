@@ -4,7 +4,7 @@ import { requireAdmin, requireAuth } from '../middleware/auth.js';
 import { downloadLoanId, downloadLoanRequestId, downloadLoanRequestSignature, downloadLoanSignature, getLoan, listLoanRequests, listLoans, listPayments, recordPayment, reviewLoanRequest } from '../controllers/loanController.js';
 import { createLoanWithIds } from '../controllers/loanIdController.js';
 import { loanApplicationUpload } from '../middleware/upload.js';
-import { getAnalytics, getDashboard } from '../controllers/analyticsController.js';
+import { getAnalytics, getDashboard, getMachineryAnalytics, listShareCapitalBandMembers, recommendMachinery } from '../controllers/analyticsController.js';
 
 const router = express.Router();
 
@@ -20,6 +20,9 @@ router.post('/accounts/:id/reset-password', resetMemberPassword);
 router.get('/audit-logs', listAuditLogs);
 router.post('/email-test', sendEmailTest);
 router.get('/analytics', getAnalytics);
+router.get('/dashboard/share-capital/:band', listShareCapitalBandMembers);
+router.get('/analytics/machinery', getMachineryAnalytics);
+router.post('/analytics/machinery/recommendations', recommendMachinery);
 router.get('/loans', listLoans);
 // A new loan comes with the borrower's and the co-maker's valid IDs and the borrower's signature.
 router.post('/loans', loanApplicationUpload, createLoanWithIds);

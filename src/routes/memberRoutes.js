@@ -23,6 +23,7 @@ import { createMemberLoanRequestWithIds } from '../controllers/loanIdController.
 import { getMyDividend } from '../controllers/dividendController.js';
 import { previewMemberIdChecks, readMemberId } from '../controllers/memberIdController.js';
 import { getMyActivity } from '../controllers/memberActivityController.js';
+import { getMyAttendance } from '../controllers/attendanceController.js';
 import { requireAdmin, requireAuth, requireMember } from '../middleware/auth.js';
 import { loanApplicationUpload, memberDocumentUpload } from '../middleware/upload.js';
 
@@ -38,6 +39,8 @@ router.get('/me/documents/:kind', requireMember, downloadMemberDocument);
 // The member's dividend for a year, from the cooperative's net income and paid-up share capital.
 router.get('/me/dividend', requireMember, getMyDividend);
 router.get('/me/activity', requireMember, getMyActivity);
+// Their attendance at cooperative activities (read-only) and the upcoming activities.
+router.get('/me/attendance', requireMember, getMyAttendance);
 
 // Everything below is admin-only: member lists expose personal data.
 router.use(requireAdmin);

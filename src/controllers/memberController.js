@@ -384,6 +384,12 @@ async function savingsAvailableOn(db, memberId, date) {
   return result.rows[0].available;
 }
 
+// A member keeps at least PHP 500 in savings (the maintaining balance): a
+// withdrawal never takes the balance below it. A terminated member's savings
+// can be paid out in full.
+const SAVINGS_MAINTAINING_CENTS = 50000;
+const maintainingCentsFor = (status) => (status === 'archived' ? 0 : SAVINGS_MAINTAINING_CENTS);
+
 const SAVINGS_KINDS = {
   deposit: { action: 'SAVINGS_DEPOSIT_CREATED', label: 'deposit', title: 'Savings deposit recorded', notification: 'savings_recorded' },
   withdrawal: { action: 'SAVINGS_WITHDRAWAL_CREATED', label: 'withdrawal', title: 'Savings withdrawal recorded', notification: 'savings_withdrawn' },
@@ -404,9 +410,15 @@ async function insertSavingsTransaction(client, req, { kind, memberId, amountCen
   }
   const before = (await savingsBalanceOf(client, memberId)).rows[0].total;
   if (kind === 'withdrawal') {
-    if (amountCents > toCents(before)) throw badRequest(`The withdrawal is more than the member's savings balance of ${pesos(before)}.`);
+    const keepCents = maintainingCentsFor(member.status);
+    const keep = pesos(centsToString(keepCents));
+    if (amountCents > toCents(before) - keepCents) {
+      throw badRequest(keepCents
+        ? `${keep} must stay in the member's savings. With a balance of ${pesos(before)}, the most that can be withdrawn is ${pesos(centsToString(Math.max(0, toCents(before) - keepCents)))}.`
+        : `The withdrawal is more than the member's savings balance of ${pesos(before)}.`);
+    }
     const available = await savingsAvailableOn(client, memberId, date);
-    if (amountCents > toCents(available)) throw badRequest(`On ${date} the member's savings balance was only ${pesos(available)}. Use a later date or a smaller amount.`);
+    if (amountCents > toCents(available) - keepCents) throw badRequest(`On ${date} the member's savings balance was only ${pesos(available)}${keepCents ? `, and ${keep} must stay in savings` : ''}. Use a later date or a smaller amount.`);
   }
   const inserted = (await client.query(
     `INSERT INTO savings_transactions (member_id, transaction_type, amount, transaction_date, payment_method, reference_number, notes, recorded_by)
@@ -467,7 +479,8 @@ export async function createSavingsRecord(req, res) {
 }
 
 // POST /api/members/savings/withdrawals  { memberId, amount, date, paymentMethod?, reference?, notes? }
-// Takes money out of the member's savings; never more than the balance.
+// Takes money out of the member's savings, leaving at least PHP 500 (all of
+// it can go to a terminated member).
 export async function createSavingsWithdrawal(req, res) {
   const input = readSavingsInput(req.body, 'Cash');
   const result = await withTransaction((client) => insertSavingsTransaction(client, req, { ...input, kind: 'withdrawal' }));
@@ -541,10 +554,15 @@ export async function getMemberSavings(req, res) {
     ),
   ]);
   const t = totals.rows[0];
+  // What must stay in savings, and so the most a withdrawal can take now.
+  const keepCents = maintainingCentsFor(member.status);
   return res.status(200).json({
     success: true,
     member: { id: Number(member.id), memberNumber: member.member_number || '—', memberName: member.name, status: member.status },
-    summary: { balance: Number(t.balance), deposits: Number(t.deposits), withdrawals: Number(t.withdrawals), transactions: t.entries },
+    summary: {
+      balance: Number(t.balance), deposits: Number(t.deposits), withdrawals: Number(t.withdrawals), transactions: t.entries,
+      maintainingBalance: keepCents / 100, withdrawable: Number(centsToString(Math.max(0, toCents(t.balance) - keepCents))),
+    },
     data: rows.rows.map((row) => ({
       id: Number(row.id), type: row.type, amount: Number(row.amount), balance: Number(row.balance), date: row.date,
       paymentMethod: row.paymentMethod || 'Not specified', reference: row.reference || `SAV-${row.id}`, notes: row.notes || '',

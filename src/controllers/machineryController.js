@@ -2,7 +2,7 @@ import { query, withTransaction } from '../config/db.js';
 import { SQL_TODAY } from '../config/env.js';
 import { createAuditLog } from '../utils/audit.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
-import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, optionalString, paginationMeta, parseId, parsePagination } from '../utils/http.js';
+import { badRequest, cleanString, conflict, currentUserId, forbidden, getRequestMeta, notFound, optionalString, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput } from '../utils/money.js';
 import { notifyAdmins, notifyMember } from '../services/notificationService.js';
 import { sendEmailSafely } from '../services/emailService.js';
@@ -14,27 +14,30 @@ import { emailMember } from '../services/memberEmails.js';
 // minimum 1 (a same-day rental counts as one day). Fee = daily_fee x days.
 const DURATION_SQL = 'GREATEST(1, ($2::date - $1::date))';
 
+// A rental is a member's (memberDatabaseId and memberId set) or a
+// non-member's, known only by name (memberName; memberId null).
 const requestSelect = `
-  SELECT r.id, r.machinery_id AS "machineryId", m.name AS "machineryName",
+  SELECT r.id, r.machinery_id AS "machineryId", m.name AS "machineryName", r.client_category AS "clientCategory",
          r.member_id AS "memberDatabaseId", r.member_name AS "memberName",
          COALESCE(mb.member_number, r.member_id::text) AS "memberId", r.purpose,
          r.start_date AS "startDate", r.end_date AS "endDate", r.duration,
          r.rental_fee AS "rentalFee", r.notes, r.status, r.submitted_at AS "submittedAt", r.reviewed_at AS "reviewedAt"
   FROM rental_requests r
   JOIN machinery m ON m.id = r.machinery_id
-  JOIN members mb ON mb.id = r.member_id`;
+  LEFT JOIN members mb ON mb.id = r.member_id`;
 
 const operationSelect = `
   SELECT o.id, o.machinery_id AS "machineryId", o.machinery_name AS "machineryName", o.rental_request_id AS "rentalRequestId",
-         o.member_name AS "memberName", COALESCE(m.member_number, o.member_id::text) AS "memberId",
+         o.client_category AS "clientCategory", o.member_name AS "memberName", COALESCE(m.member_number, o.member_id::text) AS "memberId",
          o.purpose, o.start_date AS "startDate", o.end_date AS "endDate", o.duration,
          o.rental_fee AS "rentalFee", o.status, o.created_at AS "createdAt"
-  FROM machinery_operations o JOIN members m ON m.id = o.member_id`;
+  FROM machinery_operations o LEFT JOIN members m ON m.id = o.member_id`;
 
 const machinerySelect = `
   SELECT id, name, type, status, acquisition_date AS "acquisitionDate", last_maintenance AS "lastMaintenance",
          next_maintenance AS "nextMaintenance", daily_fee AS "dailyFee", updated_at AS "updatedAt",
-         delivery_date AS "deliveryDate", condition, parent_machinery_id AS "parentMachineryId", pricing_mode AS "pricingMode"
+         delivery_date AS "deliveryDate", condition, parent_machinery_id AS "parentMachineryId", pricing_mode AS "pricingMode",
+         purchase_cost AS "purchaseCost"
   FROM machinery`;
 
 const CONDITIONS = ['operational', 'non_operational', 'always_repair', 'idle'];
@@ -160,6 +163,15 @@ function readMachineryInput(body, { partial = false } = {}) {
     values.condition = value;
   }
   if (body.parentMachineryId !== undefined) values.parent_machinery_id = optionalString(body.parentMachineryId, 20);
+  // Optional, for the return on investment in Analytics: blank = not entered, 0 = a grant.
+  if (body.purchaseCost !== undefined) {
+    if (body.purchaseCost === null || String(body.purchaseCost).trim() === '') values.purchase_cost = null;
+    else {
+      const cents = parseMoneyInput(body.purchaseCost, { allowZero: true });
+      if (cents === null) throw badRequest('Purchase cost must be a non-negative amount, or left blank.');
+      values.purchase_cost = centsToString(cents);
+    }
+  }
   for (const [key, column] of [['lastMaintenance', 'last_maintenance'], ['nextMaintenance', 'next_maintenance']]) {
     if (body[key] !== undefined) {
       const value = optionalString(body[key], 10);
@@ -196,10 +208,10 @@ export async function createMachinery(req, res) {
     const next = await client.query(`SELECT COALESCE(MAX(NULLIF(regexp_replace(id, '\\D', '', 'g'), '')::int), 0) + 1 AS n FROM machinery WHERE id ~ '^M-[0-9]+$'`);
     const id = `M-${String(next.rows[0].n).padStart(3, '0')}`;
     await client.query(
-      `INSERT INTO machinery (id, name, type, daily_fee, status, acquisition_date, last_maintenance, next_maintenance, delivery_date, condition, parent_machinery_id, pricing_mode)
-       VALUES ($1, $2, $3, $4::numeric, $5, $6, $7, $8, $9, $10, $11, $12)`,
+      `INSERT INTO machinery (id, name, type, daily_fee, status, acquisition_date, last_maintenance, next_maintenance, delivery_date, condition, parent_machinery_id, pricing_mode, purchase_cost)
+       VALUES ($1, $2, $3, $4::numeric, $5, $6, $7, $8, $9, $10, $11, $12, $13::numeric)`,
       [id, values.name, values.type, values.daily_fee, values.status || 'available', values.acquisition_date, values.last_maintenance ?? null, values.next_maintenance ?? null,
-        values.delivery_date ?? null, values.condition ?? null, values.parent_machinery_id ?? null, values.pricing_mode]
+        values.delivery_date ?? null, values.condition ?? null, values.parent_machinery_id ?? null, values.pricing_mode, values.purchase_cost ?? null]
     );
     await createAuditLog({ client, user: req.user, action: 'MACHINERY_CREATED', module: 'Machinery', entityType: 'machinery', entityId: id, description: `Added machinery ${values.name}`, newValues: values, ...getRequestMeta(req) });
     return (await client.query(`${machinerySelect} WHERE id = $1`, [id])).rows[0];
@@ -231,23 +243,31 @@ export async function updateMachinery(req, res) {
 }
 
 // Inserts a pending rental request inside the caller's transaction. Shared by
-// the booking form and by OCR-posted machinery forms.
-export async function insertRentalRequest(client, req, { machineryId, memberId, purpose, notes, startDate, endDate }) {
+// the booking form and by OCR-posted machinery forms. A member's request names
+// the member (memberId); a non-member's (clientCategory 'non_member', office
+// only) has just the renter's name (clientName). Both pay the daily fee.
+export async function insertRentalRequest(client, req, { machineryId, memberId, clientCategory = 'member', clientName = '', purpose, notes, startDate, endDate }) {
   const machine = (await client.query('SELECT id, name, daily_fee, status, pricing_mode FROM machinery WHERE id = $1 FOR UPDATE', [cleanString(String(machineryId), 20)])).rows[0];
   if (!machine) throw notFound('Machinery not found.');
   if (machine.pricing_mode === 'per_service') throw conflict(`${machine.name} is paid per service, not rented by the day. Ask the cooperative office to schedule it.`);
   if (machine.status === 'maintenance') throw conflict('That machinery is under maintenance and cannot be booked right now.');
   await assertNoOverlap(client, machine.id, startDate, endDate);
-  const member = (await client.query(`SELECT id, TRIM(CONCAT_WS(' ', first_name, middle_name, last_name, suffix)) AS full_name FROM members WHERE id = $1 AND status = 'active'`, [memberId])).rows[0];
-  if (!member) throw badRequest('Active member record not found.');
+  let renter;
+  if (clientCategory === 'non_member') {
+    renter = { id: null, full_name: clientName, label: `${clientName} (non-member)` };
+  } else {
+    const member = (await client.query(`SELECT id, TRIM(CONCAT_WS(' ', first_name, middle_name, last_name, suffix)) AS full_name FROM members WHERE id = $1 AND status = 'active'`, [memberId])).rows[0];
+    if (!member) throw badRequest('Active member record not found.');
+    renter = { ...member, label: member.full_name };
+  }
   const inserted = await client.query(
-    `INSERT INTO rental_requests (machinery_id, member_id, member_name, purpose, start_date, end_date, duration, rental_fee, notes)
-     VALUES ($3, $4, $5, $6, $1::date, $2::date, ${DURATION_SQL}, $7::numeric * ${DURATION_SQL}, $8) RETURNING id`,
-    [startDate, endDate, machine.id, member.id, member.full_name, purpose, machine.daily_fee, notes]
+    `INSERT INTO rental_requests (machinery_id, client_category, member_id, member_name, purpose, start_date, end_date, duration, rental_fee, notes)
+     VALUES ($3, $9, $4, $5, $6, $1::date, $2::date, ${DURATION_SQL}, $7::numeric * ${DURATION_SQL}, $8) RETURNING id`,
+    [startDate, endDate, machine.id, renter.id, renter.full_name, purpose, machine.daily_fee, notes, clientCategory]
   );
   const id = inserted.rows[0].id;
-  await createAuditLog({ client, user: req.user, action: 'RENTAL_REQUESTED', module: 'Machinery', entityType: 'rental_request', entityId: String(id), description: `Rental request for ${machine.name} by ${member.full_name}`, newValues: { machinery_id: machine.id, start_date: startDate, end_date: endDate }, ...getRequestMeta(req) });
-  await notifyAdmins(client, { type: 'rental_requested', title: 'New rental request', message: `${member.full_name} requested ${machine.name} from ${startDate} to ${endDate}.`, link: '/machinery', entityType: 'rental_request', entityId: id, dedupeKey: `rental-${id}-requested` }, { exceptUserId: req.user.role === 'ADMIN' ? currentUserId(req) : null });
+  await createAuditLog({ client, user: req.user, action: 'RENTAL_REQUESTED', module: 'Machinery', entityType: 'rental_request', entityId: String(id), description: `Rental request for ${machine.name} by ${renter.label}`, newValues: { machinery_id: machine.id, client_category: clientCategory, start_date: startDate, end_date: endDate }, ...getRequestMeta(req) });
+  await notifyAdmins(client, { type: 'rental_requested', title: 'New rental request', message: `${renter.label} requested ${machine.name} from ${startDate} to ${endDate}.`, link: '/machinery', entityType: 'rental_request', entityId: id, dedupeKey: `rental-${id}-requested` }, { exceptUserId: req.user.role === 'ADMIN' ? currentUserId(req) : null });
   return (await client.query(`${requestSelect} WHERE r.id = $1`, [id])).rows[0];
 }
 
@@ -260,6 +280,18 @@ export async function createRentalRequest(req, res) {
   if (!machineryId || !purpose || !isValidDateOnly(startDate) || !isValidDateOnly(endDate)) throw badRequest('Machinery, valid dates, and purpose are required.');
   if (endDate < startDate) throw badRequest('End date cannot be before the start date.');
   if (startDate < todayDateOnly()) throw badRequest('Start date cannot be in the past.');
+
+  // The office may record a rental for someone who is not a member, by name only.
+  const clientCategory = req.body?.clientCategory ?? 'member';
+  if (!['member', 'non_member'].includes(clientCategory)) throw badRequest('The renter must be a member or a non-member.');
+  if (clientCategory === 'non_member') {
+    if (req.user.role !== 'ADMIN') throw forbidden('Only the cooperative office can record a rental for a non-member.');
+    const clientName = cleanString(req.body?.clientName, 200);
+    if (!clientName) throw badRequest('Enter the non-member\'s full name.');
+    const request = await withTransaction((client) => insertRentalRequest(client, req, { machineryId, clientCategory, clientName, purpose, notes, startDate, endDate }));
+    return res.status(201).json({ success: true, request });
+  }
+
   const requestedMemberId = req.user.role === 'ADMIN' ? parseId(memberDatabaseId, 'member') : Number(req.user.member_id);
   if (!Number.isInteger(requestedMemberId) || requestedMemberId <= 0) throw badRequest('A valid member is required.');
 
@@ -284,15 +316,16 @@ export async function reviewRentalRequest(req, res) {
       if (row.end_date < todayDateOnly()) throw badRequest('This request\'s rental period has already passed.');
       await assertNoOverlap(client, row.machinery_id, row.start_date, row.end_date, row.id);
       await client.query(
-        `INSERT INTO machinery_operations (rental_request_id, machinery_id, machinery_name, member_id, member_name, purpose, start_date, end_date, duration, rental_fee, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CASE WHEN $7::date <= ${SQL_TODAY} THEN 'ongoing' ELSE 'scheduled' END)`,
-        [row.id, row.machinery_id, row.machinery_name, row.member_id, row.member_name, row.purpose, row.start_date, row.end_date, row.duration, row.rental_fee]
+        `INSERT INTO machinery_operations (rental_request_id, machinery_id, machinery_name, client_category, member_id, member_name, purpose, start_date, end_date, duration, rental_fee, status)
+         VALUES ($1, $2, $3, $11, $4, $5, $6, $7, $8, $9, $10, CASE WHEN $7::date <= ${SQL_TODAY} THEN 'ongoing' ELSE 'scheduled' END)`,
+        [row.id, row.machinery_id, row.machinery_name, row.member_id, row.member_name, row.purpose, row.start_date, row.end_date, row.duration, row.rental_fee, row.client_category]
       );
     }
     await client.query('UPDATE rental_requests SET status = $1, reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3', [status, currentUserId(req), id]);
     await refreshRentalStatuses(client);
-    await createAuditLog({ client, user: req.user, action: status === 'approved' ? 'RENTAL_APPROVED' : 'RENTAL_DECLINED', module: 'Machinery', entityType: 'rental_request', entityId: String(id), description: `Rental request ${status} for ${row.member_name}`, oldValues: { status: row.status }, newValues: { status }, ...getRequestMeta(req) });
-    await notifyMember(client, row.member_id, {
+    await createAuditLog({ client, user: req.user, action: status === 'approved' ? 'RENTAL_APPROVED' : 'RENTAL_DECLINED', module: 'Machinery', entityType: 'rental_request', entityId: String(id), description: `Rental request ${status} for ${row.member_name}${row.member_id ? '' : ' (non-member)'}`, oldValues: { status: row.status }, newValues: { status }, ...getRequestMeta(req) });
+    // A non-member has no account to notify.
+    if (row.member_id) await notifyMember(client, row.member_id, {
       type: status === 'approved' ? 'rental_approved' : 'rental_declined',
       title: status === 'approved' ? 'Rental request approved' : 'Rental request declined',
       message: `Your request for ${row.machinery_name} (${row.start_date} to ${row.end_date}) was ${status}.`,
@@ -305,7 +338,9 @@ export async function reviewRentalRequest(req, res) {
     return row;
   });
 
-  const recipient = (await query(`SELECT u.id AS user_id, COALESCE(u.email, m.email) AS email FROM members m LEFT JOIN users u ON u.member_id = m.id WHERE m.id = $1`, [request.member_id])).rows[0];
+  const recipient = request.member_id
+    ? (await query(`SELECT u.id AS user_id, COALESCE(u.email, m.email) AS email FROM members m LEFT JOIN users u ON u.member_id = m.id WHERE m.id = $1`, [request.member_id])).rows[0]
+    : null;
   if (recipient?.email) {
     const email = rentalDecisionEmail({ machineryName: request.machinery_name, startDate: request.start_date, endDate: request.end_date, status, rentalFee: request.rental_fee });
     void sendEmailSafely({ ...email, to: recipient.email, relatedUserId: recipient.user_id });

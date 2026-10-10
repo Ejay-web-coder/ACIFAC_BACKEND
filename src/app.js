@@ -13,6 +13,7 @@ import machineryRoutes from './routes/machineryRoutes.js';
 import kadiwaRoutes from './routes/kadiwaRoutes.js';
 import ocrRoutes from './routes/ocrRoutes.js';
 import loanRoutes from './routes/loanRoutes.js';
+import attendanceRoutes from './routes/attendanceRoutes.js';
 import { announcementRoutes, eventRoutes, legalDocumentRoutes, notificationRoutes } from './routes/communicationRoutes.js';
 import { isListening } from './services/events.js';
 import { refreshLoanStatuses } from './services/loanService.js';
@@ -82,6 +83,7 @@ export function createApp() {
   app.use('/api/machinery', machineryRoutes);
   app.use('/api/kadiwa', kadiwaRoutes);
   app.use('/api/ocr', ocrRoutes);
+  app.use('/api/attendance', attendanceRoutes);
   app.use('/api/notifications', notificationRoutes);
   app.use('/api/announcements', announcementRoutes);
   app.use('/api/legal-documents', legalDocumentRoutes);

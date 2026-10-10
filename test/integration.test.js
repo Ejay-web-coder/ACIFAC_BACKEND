@@ -21,6 +21,9 @@ let stubAnalysis = DEFAULT_STUB_ANALYSIS;
 // What the stub AI answers when it is asked to read an applicant's ID or check their 2x2 picture.
 let stubIdReading = {};
 let stubPhotoReading = {};
+// What the stub AI answers for the machinery recommendations, and the figures it was sent.
+let stubRecommendations = {};
+const recommendationRequests = [];
 const geminiCalls = [];
 let pool;
 const sentEmails = [];
@@ -203,7 +206,9 @@ before(async () => {
       }
       if (stubMode === 'fail') { res.writeHead(500); res.end('{}'); return; }
       const prompt = String(JSON.parse(Buffer.concat(chunks).toString() || '{}').messages?.[0]?.content || '');
-      const answer = prompt.startsWith('You check the valid ID that') ? stubIdReading : prompt.includes('2x2 ID picture that an applicant submits') ? stubPhotoReading : stubAnalysis;
+      if (prompt.startsWith('You advise the officers of ACIFAC')) recommendationRequests.push(JSON.parse(Buffer.concat(chunks).toString()).messages[1].content);
+      const answer = prompt.startsWith('You check the valid ID that') ? stubIdReading : prompt.includes('2x2 ID picture that an applicant submits') ? stubPhotoReading
+        : prompt.startsWith('You advise the officers of ACIFAC') ? stubRecommendations : stubAnalysis;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(answer) } }] }));
     });
@@ -505,13 +510,17 @@ test('savings deposits and share capital are separate ledgers', { skip }, async 
 test('savings: members with savings, history with the running balance, withdrawals', { skip }, async () => {
   // The member has 2,500.50 (Feb 1) and 30,000 (Feb 2) from the test above.
   const withdraw = (body) => admin.post('/api/members/savings/withdrawals', { memberId: state.memberId, paymentMethod: 'Cash', ...body });
+  // PHP 500 always stays in savings.
   const tooMuch = await withdraw({ amount: '40000', date: '2026-02-03' });
   assert.equal(tooMuch.status, 400);
-  assert.match(tooMuch.data.message, /more than the member's savings balance of PHP 32,500\.50/);
+  assert.match(tooMuch.data.message, /^PHP 500\.00 must stay in the member's savings\. With a balance of PHP 32,500\.50, the most that can be withdrawn is PHP 32,000\.50\.$/);
+  assert.equal((await withdraw({ amount: '32500.50', date: '2026-02-03' })).status, 400, 'not all of it');
+  assert.equal((await withdraw({ amount: '32000.51', date: '2026-02-03' })).status, 400);
   // A back-dated withdrawal cannot take out money deposited later.
   const backDated = await withdraw({ amount: '3000', date: '2026-02-01' });
   assert.equal(backDated.status, 400);
-  assert.match(backDated.data.message, /On 2026-02-01 the member's savings balance was only PHP 2,500\.50/);
+  assert.match(backDated.data.message, /On 2026-02-01 the member's savings balance was only PHP 2,500\.50, and PHP 500\.00 must stay in savings/);
+  assert.equal((await withdraw({ amount: '2000.51', date: '2026-02-01' })).status, 400, 'PHP 500 stays on Feb 1 too');
   assert.equal((await withdraw({ amount: '0', date: '2026-02-03' })).status, 400);
   assert.equal((await withdraw({ amount: '5', date: '2999-01-01' })).status, 400);
   assert.equal((await member.post('/api/members/savings/withdrawals', { memberId: state.memberId, amount: '5', date: '2026-02-03' })).status, 403);
@@ -521,8 +530,8 @@ test('savings: members with savings, history with the running balance, withdrawa
   assert.equal(first.data.memberTotal, 30500.5);
   assert.equal(first.data.data.type, 'Withdrawal');
   assert.equal((await withdraw({ amount: '10', date: '2026-02-03', reference: 'wd-1' })).status, 409);
-  // Only 500.50 was left on Feb 1.
-  assert.equal((await withdraw({ amount: '600', date: '2026-02-01' })).status, 400);
+  // Only 500.50 was left on Feb 1, so 0.50 more at most.
+  assert.equal((await withdraw({ amount: '0.51', date: '2026-02-01' })).status, 400);
   const second = await withdraw({ amount: '500.50', date: '2026-02-03', notes: 'For seeds' });
   assert.equal(second.status, 201, JSON.stringify(second.data));
   assert.equal(second.data.memberTotal, 30000);
@@ -543,7 +552,7 @@ test('savings: members with savings, history with the running balance, withdrawa
   // One member's history: newest first, with the balance after each entry.
   const history = await admin.get(`/api/members/${state.memberId}/savings`);
   assert.equal(history.status, 200, JSON.stringify(history.data));
-  assert.deepEqual(history.data.summary, { balance: 30000, deposits: 32500.5, withdrawals: 2500.5, transactions: 4 });
+  assert.deepEqual(history.data.summary, { balance: 30000, deposits: 32500.5, withdrawals: 2500.5, transactions: 4, maintainingBalance: 500, withdrawable: 29500 });
   assert.deepEqual(history.data.data.map((entry) => [entry.date, entry.type, entry.amount, entry.balance]), [
     ['2026-02-03', 'Withdrawal', 500.5, 30000],
     ['2026-02-02', 'Deposit', 30000, 30500.5],
@@ -567,6 +576,19 @@ test('savings: members with savings, history with the running balance, withdrawa
   assert.deepEqual(audit.rows.map((r) => r.new_values.total_savings), ['30500.50', '30000.00']);
   const analytics = await admin.get('/api/admin/analytics');
   assert.equal(analytics.status, 200, JSON.stringify(analytics.data));
+
+  // A member with less than PHP 500 cannot withdraw; a terminated member gets all of it.
+  const other = (body) => admin.post('/api/members/savings/withdrawals', { memberId: state.secondMemberId, paymentMethod: 'Cash', date: '2026-02-05', ...body });
+  assert.equal((await admin.post('/api/members/savings', { memberId: state.secondMemberId, amount: '450', date: '2026-02-05' })).status, 201);
+  assert.match((await other({ amount: '1' })).data.message, /the most that can be withdrawn is PHP 0\.00/);
+  assert.deepEqual((await admin.get(`/api/members/${state.secondMemberId}/savings`)).data.summary, { balance: 450, deposits: 450, withdrawals: 0, transactions: 1, maintainingBalance: 500, withdrawable: 0 });
+  assert.equal((await admin.patch(`/api/members/${state.secondMemberId}/archive`, { terminationType: 'involuntary', cause: 'failedObligations' })).status, 200);
+  assert.deepEqual((await admin.get(`/api/members/${state.secondMemberId}/savings`)).data.summary, { balance: 450, deposits: 450, withdrawals: 0, transactions: 1, maintainingBalance: 0, withdrawable: 450 });
+  assert.match((await other({ amount: '450.01' })).data.message, /more than the member's savings balance of PHP 450\.00/);
+  const payout = await other({ amount: '450', notes: 'Membership terminated' });
+  assert.equal(payout.status, 201, JSON.stringify(payout.data));
+  assert.equal(payout.data.memberTotal, 0);
+  assert.equal((await admin.patch(`/api/members/${state.secondMemberId}/restore`)).status, 200);
 });
 
 test('auto refresh: browsers poll which tables changed, and only see their own', { skip }, async () => {
@@ -754,11 +776,63 @@ test('machinery: catalogue, request, approve, overlap protection, member status'
   assert.equal(blocked.status, 409);
 });
 
+test('machinery: the office rents to a non-member by name only', { skip }, async () => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const today = todayDateOnly();
+  const plus = (days) => { const d = new Date(`${today}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
+  const pump = (await admin.get('/api/machinery')).data.machinery.find((row) => row.id === 'M-003');
+  const base = { machineryId: pump.id, clientCategory: 'non_member', startDate: plus(20), endDate: plus(22), purpose: 'Irrigation' };
+
+  assert.equal((await admin.post('/api/machinery/requests', { ...base, clientName: '   ' })).status, 400, 'a name is required');
+  assert.equal((await admin.post('/api/machinery/requests', { ...base, clientCategory: 'guest', clientName: 'Rosa Reyes' })).status, 400);
+  assert.equal((await member.post('/api/machinery/requests', { ...base, clientName: 'Rosa Reyes' })).status, 403, 'members book only for themselves');
+  assert.equal((await admin.post('/api/machinery/requests', { ...base, clientCategory: 'member', clientName: 'Rosa Reyes' })).status, 400, 'a member rental still needs the member');
+
+  const notesBefore = (await pool.query(`SELECT COUNT(*)::int AS count FROM notifications WHERE type IN ('rental_approved', 'rental_declined')`)).rows[0].count;
+  const mailsBefore = sentEmails.length;
+  const created = await admin.post('/api/machinery/requests', { ...base, clientName: 'Rosa Reyes', memberDatabaseId: state.memberId });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const request = created.data.request;
+  assert.deepEqual([request.clientCategory, request.memberName, request.memberId, request.memberDatabaseId], ['non_member', 'Rosa Reyes', null, null], 'the member ID sent along is ignored');
+  assert.equal(Number(request.rentalFee), Number(pump.dailyFee) * 2, 'the same daily fee as members');
+
+  assert.equal((await admin.patch(`/api/machinery/requests/${request.id}`, { status: 'approved' })).status, 200);
+  const data = (await admin.get('/api/machinery')).data;
+  assert.equal(data.requests.find((row) => row.id === request.id).status, 'approved');
+  const operation = data.operations.find((row) => row.rentalRequestId === request.id);
+  assert.deepEqual([operation.clientCategory, operation.memberName, operation.memberId, operation.status], ['non_member', 'Rosa Reyes', null, 'scheduled']);
+  // The dates are booked for everyone, and nobody's account is notified or emailed.
+  assert.equal((await member.post('/api/machinery/requests', { machineryId: pump.id, startDate: plus(21), endDate: plus(21), purpose: 'x' })).status, 409);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM notifications WHERE type IN ('rental_approved', 'rental_declined')`)).rows[0].count, notesBefore);
+  assert.equal(sentEmails.length, mailsBefore);
+  assert.ok(!(await member.get('/api/members/me')).data.data.rentalRequests.some((row) => row.id === request.id), 'not in any member\'s history');
+  const audit = (await pool.query(`SELECT description FROM audit_logs WHERE entity_type = 'rental_request' AND entity_id = $1 ORDER BY id`, [String(request.id)])).rows.map((row) => row.description);
+  assert.deepEqual(audit, [`Rental request for ${pump.name} by Rosa Reyes (non-member)`, 'Rental request approved for Rosa Reyes (non-member)']);
+
+  // The database itself keeps the two kinds apart.
+  await assert.rejects(pool.query(`UPDATE rental_requests SET member_id = $1 WHERE id = $2`, [state.memberId, request.id]), /rental_request_client_valid/);
+  await assert.rejects(pool.query(`UPDATE machinery_operations SET member_name = ' ' WHERE id = $1`, [operation.id]), /machinery_operation_client_valid/);
+});
+
 test('machinery services: dated rates, fees, payments, expenses and the PhilMech report', { skip }, async () => {
-  // Seeded by sql/017: per-service machines stay out of the per-day booking.
+  // Seeded by sql/017 and sql/038: per-service machines stay out of the per-day booking.
   const fleet = (await admin.get('/api/machinery')).data.machinery;
-  const tractor = fleet.find((row) => row.name === 'Tractor with Rotavator');
+  const tractor = fleet.find((row) => row.name === 'Hand Tractor 2');
   const harvester = fleet.find((row) => row.name === 'Harvester' && row.pricingMode === 'per_service');
+  // ACIFAC's fleet: 2 harvesters, 2 hand tractors, 2 rotavators, a water pump and a rice thresher.
+  const seeded = fleet.filter((row) => row.id <= 'M-008').map((row) => [row.id, row.name, row.pricingMode]);
+  assert.deepEqual(seeded, [
+    ['M-001', 'Hand Tractor (Kubota)', 'per_day'], ['M-002', 'Rice Thresher', 'per_day'], ['M-003', 'Water Pump', 'per_day'], ['M-004', 'Rotavator', 'per_day'],
+    ['M-005', 'Harvester', 'per_service'], ['M-006', 'Hand Tractor 2', 'per_service'], ['M-007', 'Harvester 2', 'per_service'], ['M-008', 'Rotavator 2', 'per_day'],
+  ]);
+  const harvester2 = fleet.find((row) => row.id === 'M-007');
+  const rotavator2 = fleet.find((row) => row.id === 'M-008');
+  assert.deepEqual([harvester2.acquisitionDate, harvester2.condition, harvester2.deliveryDate, harvester2.parentMachineryId], ['2026-10-09', 'operational', null, null]);
+  assert.deepEqual([rotavator2.acquisitionDate, Number(rotavator2.dailyFee), rotavator2.parentMachineryId], ['2026-10-09', 700, null]);
+  const harvester2Rates = (await admin.get('/api/machinery/M-007/rates')).data.rates;
+  assert.deepEqual(harvester2Rates.map((rate) => [rate.serviceType, rate.unit, rate.memberRate, rate.nonMemberRate, rate.effectiveFrom, rate.effectiveTo]),
+    [['Harvesting', 'per_100_bags', '10.00', '12.00', '2026-10-09', null]], 'the first harvester\'s rates, from the day the second was acquired');
   assert.equal(tractor.pricingMode, 'per_service');
   assert.equal(tractor.deliveryDate, '2025-02-21');
   assert.equal(tractor.condition, 'always_repair');
@@ -916,6 +990,94 @@ test('machinery: the PhilMech report form is saved per cropping', { skip }, asyn
   assert.equal((await admin.get(`${url}?croppingPeriod=1st&year=2026`)).data.form.fcaName, first.data.form.fcaName, 'other croppings are untouched');
   const audits = await pool.query(`SELECT COUNT(*)::int AS count FROM audit_logs WHERE action = 'MACHINERY_REPORT_FORM_SAVED'`);
   assert.equal(audits.rows[0].count, 2);
+});
+
+test('machinery analytics: utilization, revenue and cost, alerts, downtime, ROI and recommendations', { skip }, async () => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const today = todayDateOnly();
+  const plus = (days) => { const d = new Date(`${today}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
+
+  // A machine owned for 101 days, with an overdue maintenance date and a purchase cost.
+  assert.equal((await admin.post('/api/machinery', { name: 'Analytics Tractor', type: 'Tractor', dailyFee: '1000', acquisitionDate: plus(-100), purchaseCost: '-5' })).status, 400);
+  const created = await admin.post('/api/machinery', { name: 'Analytics Tractor', type: 'Tractor', dailyFee: '1000', acquisitionDate: plus(-100), nextMaintenance: plus(-3), purchaseCost: '200000' });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const id = created.data.machinery.id;
+  assert.equal(Number(created.data.machinery.purchaseCost), 200000);
+
+  // A 3-day rental 10 days ago, fuel and repairs, and 2 days in maintenance.
+  await pool.query(`INSERT INTO machinery_operations (machinery_id, machinery_name, member_id, member_name, purpose, start_date, end_date, duration, rental_fee, status)
+                    VALUES ($1, 'Analytics Tractor', $2, 'Juan Dela Cruz', 'Plowing', $3, $4, 3, 3000, 'completed')`, [id, state.memberId, plus(-10), plus(-7)]);
+  for (const [category, amount] of [['fuel', '500'], ['repair_maintenance', '2000']]) {
+    const expense = await admin.post('/api/machinery/expenses', { machineryId: id, expenseDate: plus(-5), croppingPeriod: '2nd', year: Number(today.slice(0, 4)), category, amount });
+    assert.equal(expense.status, 201, JSON.stringify(expense.data));
+  }
+  assert.equal((await admin.patch(`/api/machinery/${id}`, { status: 'maintenance' })).status, 200);
+  assert.equal((await admin.patch(`/api/machinery/${id}`, { status: 'available' })).status, 200);
+  await pool.query(`UPDATE audit_logs SET created_at = NOW() - CASE WHEN new_values ->> 'status' = 'maintenance' THEN INTERVAL '3 days' ELSE INTERVAL '1 day' END
+                    WHERE entity_type = 'machinery' AND entity_id = $1 AND action = 'MACHINERY_UPDATED'`, [id]);
+
+  assert.equal((await member.get(`/api/admin/analytics/machinery?from=${plus(-30)}&to=${today}`)).status, 403);
+  assert.equal((await admin.get('/api/admin/analytics/machinery?from=2026-02-30&to=2026-03-01')).status, 400);
+  const response = await admin.get(`/api/admin/analytics/machinery?from=${plus(-30)}&to=${today}`);
+  assert.equal(response.status, 200, JSON.stringify(response.data));
+  const data = response.data;
+  const machine = data.machines.find((row) => row.id === id);
+  assert.deepEqual([machine.usedDays, machine.ownedDays, machine.utilization, machine.bookings], [3, 31, 9.7, 1]);
+  assert.deepEqual([machine.revenue, machine.cost, machine.net], [3000, 2500, 500]);
+  assert.deepEqual(machine.costByCategory, { fuel: 500, labor: 0, repair_maintenance: 2000, other: 0 });
+  assert.deepEqual([machine.downtimeDays, machine.downtimeEvents, machine.downSince], [2, 1, null]);
+  assert.deepEqual(machine.alerts.map((alert) => alert.kind).sort(), ['overdue', 'repair_cost']);
+  assert.equal(data.alerts[0].severity, 'high', 'the most urgent alerts come first');
+  assert.ok(data.fleet.revenue >= 3000 && data.fleet.utilization !== null);
+  assert.ok(data.bookings.upcoming.some((row) => row.kind === 'booking'), 'the booking approved in the machinery test is coming up');
+
+  assert.equal(machine.roi.status, 'ok');
+  assert.deepEqual([machine.roi.lifetimeRevenue, machine.roi.lifetimeCost, machine.roi.lifetimeNet], [3000, 2500, 500]);
+  assert.ok(machine.roi.earnedBack > 0 && machine.roi.paybackYears > 100);
+  assert.equal(data.forecast.history.length, 13);
+  assert.equal(data.forecast.forecast.length, 6);
+  // Used 3 of 101 days in the last 12 months while earning more than it cost: find it more work
+  // (one recommendation for all such machines). Repairs are 2/3 of its revenue.
+  assert.ok(data.ruleRecommendations.some((item) => item.type === 'promote' && `${item.title} ${item.reason}`.includes('Analytics Tractor (3%)')));
+  assert.ok(data.ruleRecommendations.some((item) => item.machineId === id && item.type === 'maintenance' && /66\.7%/.test(item.reason)));
+
+  // A period still to come has nothing to measure yet.
+  const ahead = (await admin.get(`/api/admin/analytics/machinery?from=${plus(10)}&to=${plus(20)}`)).data;
+  assert.ok(ahead.machines.every((row) => row.utilization === null && row.downtimeDays === 0));
+
+  // The purchase cost is cleared with a blank; 0 is a machine received as a grant.
+  assert.equal((await admin.patch(`/api/machinery/${id}`, { purchaseCost: '' })).data.machinery.purchaseCost, null);
+  assert.equal(Number((await admin.patch(`/api/machinery/${id}`, { purchaseCost: '0' })).data.machinery.purchaseCost), 0);
+  assert.equal((await admin.get(`/api/admin/analytics/machinery?from=${plus(-30)}&to=${today}`)).data.machines.find((row) => row.id === id).roi.status, 'grant');
+
+  // AI recommendations: only known types, priorities and machines are kept.
+  stubRecommendations = { summary: 'A small fleet.', recommendations: [
+    { type: 'rates', priority: 'high', machineId: id, title: 'Raise the rate', reason: 'Used 9.7% of days.', impact: 'More revenue' },
+    { type: 'made_up', priority: 'urgent', machineId: 'M-999', title: 'Something else', reason: 'Because.' },
+    { type: 'buy', priority: 'low', title: '' },
+  ] };
+  const url = '/api/admin/analytics/machinery/recommendations';
+  assert.equal((await member.post(url, { from: plus(-30), to: today })).status, 403);
+  const advice = await admin.post(url, { from: plus(-30), to: today });
+  assert.equal(advice.status, 200, JSON.stringify(advice.data));
+  assert.equal(advice.data.source, 'ai');
+  assert.equal(advice.data.summary, 'A small fleet.');
+  assert.deepEqual(advice.data.recommendations.map(({ type, priority, machineId, machine: name }) => [type, priority, machineId, name]),
+    [['rates', 'high', id, 'Analytics Tractor'], ['other', 'medium', null, null]]);
+  const facts = JSON.parse(recommendationRequests.at(-1).replace(/^[^{]*/, '').replace(/ Return JSON only\.$/, ''));
+  assert.equal(facts.machines.find((row) => row.id === id).last12Months.revenue, 3000);
+  assert.ok(!JSON.stringify(facts).includes('Juan Dela Cruz'), 'no member names are sent to the AI');
+
+  // When the AI is down, the rule-based recommendations are shown instead.
+  stubMode = 'fail';
+  try {
+    const rules = (await admin.post(url, { from: plus(-30), to: today })).data;
+    assert.equal(rules.source, 'rules');
+    assert.match(rules.notice, /AI could not answer/);
+    assert.ok(rules.recommendations.some((item) => item.machineId === id));
+  } finally {
+    stubMode = 'ok';
+  }
 });
 
 test('kadiwa: sales decrement stock, reject overselling and race safely', { skip }, async () => {
@@ -1154,6 +1316,24 @@ test('kadiwa: a sale is the daily form of goods sold, reported per 15 days and p
   assert.equal(Number(goods.find((good) => good.name === 'EGG').price), 280);
   assert.ok(goods.some((good) => good.name === 'PATOLA'));
   assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM kadiwa_sale_goods WHERE sale_id = $1`, [sale.id])).rows[0].count, 5);
+
+  // Analytics plots one month day by day, with 0 on the days without a sale; longer periods month by month.
+  const daily = (await admin.get('/api/admin/analytics?from=2026-09-01&to=2026-09-30')).data.sales;
+  assert.equal(daily.length, 30);
+  assert.deepEqual([daily[0].period, daily[29].period], ['Sep 1', 'Sep 30']);
+  assert.deepEqual([daily[9].gross, daily[9].expenses, daily[9].costOfGoods, daily[9].sales, daily[9].transactions], [660, 50, 0, 610, 1], 'September 10: net income = total sold - expenses - cost');
+  assert.equal(Math.round(daily[0].costOfGoods * 100), Math.round(Number(rice.costPrice) * 100), 'September 1: the rice from the store has a cost');
+  assert.equal(Math.round(daily[0].sales * 100), Math.round((daily[0].gross - daily[0].expenses - daily[0].costOfGoods) * 100));
+  assert.deepEqual([daily[1].sales, daily[1].expenses, daily[1].transactions], [0, 0, 0], 'September 2 has no sale');
+  assert.deepEqual(daily.filter((day) => day.transactions).map((day) => day.period), ['Sep 1', 'Sep 10', 'Sep 20']);
+  const quarter = (await admin.get('/api/admin/analytics?from=2026-07-01&to=2026-09-30')).data.sales;
+  assert.deepEqual(quarter.map((row) => [row.period, row.transactions]), [['Sep 2026', 3]]);
+  // The current month stops at today.
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const [year, monthNumber, dayNumber] = todayDateOnly().split('-').map(Number);
+  const monthPrefix = todayDateOnly().slice(0, 8);
+  const current = (await admin.get(`/api/admin/analytics?from=${monthPrefix}01&to=${monthPrefix}${new Date(Date.UTC(year, monthNumber, 0)).getUTCDate()}`)).data.sales;
+  assert.equal(current.length, dayNumber);
 });
 
 test('loans: applications typed into the app need the borrower and co-maker IDs with 3 signatures', { skip }, async () => {
@@ -1793,6 +1973,46 @@ test('dashboard and analytics use real data', { skip }, async () => {
   assert.equal(juan.totalPaid, 51250);
   assert.ok(analytics.data.methodology.onTimePaymentRate);
 
+  // What needs the admin's attention: counts the dashboard turns into links.
+  for (const key of ['overdueLoans', 'loansDueThisWeek', 'pendingLoanRequests', 'pendingRentalRequests', 'scheduledOperations', 'lowStockItems']) {
+    assert.ok(Number.isInteger(dashboard.data.stats[key]), key);
+  }
+  assert.equal(dashboard.data.alerts, undefined, 'the dashboard shows the counts, not alert sentences');
+  // The member cards are on the dashboard, no longer in Analytics.
+  assert.equal(analytics.data.shareCapitalLevels, undefined);
+  assert.equal(analytics.data.summary.registeredMembers, undefined);
+
+  // Members (terminated ones left out) by share capital, in bands up to the PHP 20,000 maximum.
+  const levels = dashboard.data.shareCapitalLevels;
+  assert.deepEqual(levels.map((level) => [level.key, level.min, level.max]), [['below1k', 0, 1000], ['from1kTo5k', 1000, 5000], ['from5kTo15k', 5000, 15000], ['from15kTo20k', 15000, 20000], ['maximum', 20000, null]]);
+  const memberShares = (await pool.query(`SELECT COALESCE(SUM(sc.amount), 0) AS total FROM members m LEFT JOIN share_contributions sc ON sc.member_id = m.id WHERE m.status <> 'archived' GROUP BY m.id`)).rows.map((row) => Number(row.total));
+  const bandOf = (total) => levels.findIndex((level) => total >= level.min && (level.max === null || total < level.max));
+  assert.deepEqual(levels.map((level) => level.members), levels.map((_, index) => memberShares.filter((total) => bandOf(total) === index).length));
+  assert.equal(levels.reduce((sum, level) => sum + level.members, 0), dashboard.data.stats.totalMembers);
+  assert.ok(levels[1].members >= 1, 'Juan is in PHP 1,000 to 4,999');
+
+  // Members (terminated ones left out) with and without a login account.
+  const accounts = (await pool.query(`SELECT COUNT(u.id)::int AS registered, (COUNT(*) - COUNT(u.id))::int AS unregistered
+    FROM members m LEFT JOIN users u ON u.member_id = m.id WHERE m.status <> 'archived'`)).rows[0];
+  const { registeredMembers, unregisteredMembers } = dashboard.data.stats;
+  assert.deepEqual([registeredMembers, unregisteredMembers], [accounts.registered, accounts.unregistered]);
+  assert.ok(registeredMembers >= 1, 'Juan has an account');
+  assert.equal(registeredMembers + unregisteredMembers, levels.reduce((sum, level) => sum + level.members, 0), 'the same members as the share capital chart');
+  // A bar clicked: the members in that band, most share capital first.
+  for (const level of levels) {
+    const list = await admin.get(`/api/admin/dashboard/share-capital/${level.key}`);
+    assert.equal(list.status, 200, JSON.stringify(list.data));
+    assert.equal(list.data.members.length, level.members, level.key);
+    assert.ok(list.data.members.every((row) => row.shareCapital >= level.min && (level.max === null || row.shareCapital < level.max) && row.status !== 'archived'), level.key);
+    assert.deepEqual(list.data.members.map((row) => row.shareCapital), list.data.members.map((row) => row.shareCapital).sort((a, b) => b - a));
+  }
+  // The same share capital as on the member record.
+  const juanShare = (await admin.get(`/api/members/${state.memberId}`)).data.data.shareDetails.total;
+  const juanBand = (await admin.get('/api/admin/dashboard/share-capital/from1kTo5k')).data.members.find((row) => row.id === state.memberId);
+  assert.deepEqual([juanBand.memberName, juanBand.shareCapital], ['Juan Dela Cruz', juanShare]);
+  assert.equal((await admin.get('/api/admin/dashboard/share-capital/nonsense')).status, 404);
+  assert.equal((await member.get('/api/admin/dashboard/share-capital/below1k')).status, 403);
+
   // Net income: Kadiwa net sales + machinery (rentals started, service fees collected,
   // other income, less expenses) + loan interest collected.
   const { netIncome, netIncomeBreakdown: parts } = dashboard.data.stats;
@@ -2318,4 +2538,177 @@ test('change password in settings: a code by text or email instead of the curren
   const actions = (await pool.query(`SELECT action, details FROM audit_logs WHERE user_id = (SELECT id FROM users WHERE username = 'lito') ORDER BY id`)).rows;
   assert.deepEqual(actions.filter((row) => row.action === 'PASSWORD_CHANGED').map((row) => row.details.method), ['code', 'code']);
   assert.ok(actions.some((row) => row.action === 'PASSWORD_CHANGE_CODE_SENT' && row.details.channel === 'sms'));
+});
+
+test('attendance: activities, recording, duplicates, finalization, rates, cancellation and privacy', { skip }, async () => {
+  const { hashPassword } = await import('../src/utils/password.js');
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const { canReceiveEvent } = await import('../src/services/events.js');
+  const shift = (days) => new Date(Date.parse(`${todayDateOnly()}T00:00:00Z`) + days * 86400000).toISOString().slice(0, 10);
+  const [today, yesterday, lastWeek, nextWeek] = [todayDateOnly(), shift(-1), shift(-7), shift(7)];
+
+  // Ana and Ben are active members, Carla is inactive, Dan joined today.
+  const addMember = async (number, first, last, status, since) => (await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status)
+     VALUES ($1, $2, $3, $4, '09170000000', 'Purok 3', $5, 0, $6) RETURNING id`,
+    [number, first, last, `${first.toLowerCase()}.att@example.com`, since, status]
+  )).rows[0].id;
+  const ana = await addMember('ATT-001', 'Ana', 'Reyes', 'active', '2020-01-01');
+  const ben = await addMember('ATT-002', 'Ben', 'Cruz', 'active', '2020-01-01');
+  const carla = await addMember('ATT-003', 'Carla', 'Diaz', 'inactive', '2020-01-01');
+  const dan = await addMember('ATT-004', 'Dan', 'Lim', 'active', today);
+  await pool.query(`INSERT INTO users (member_id, username, email, password_hash, role, account_status) VALUES ($1, 'ana.att', NULL, $2, 'MEMBER', 'ACTIVE')`, [ana, await hashPassword('AnaPass1!')]);
+  const office = new Client('10.0.10.1');
+  const anaClient = new Client('10.0.10.2');
+  assert.equal((await office.post('/api/auth/login', { usernameOrEmail: 'testadmin', password: 'AdminPass1!' })).status, 200);
+  assert.equal((await anaClient.post('/api/auth/login', { usernameOrEmail: 'ana.att', password: 'AnaPass1!' })).status, 200);
+
+  // Creating activities: required fields, the end after the start, nothing completed in the future.
+  const meeting = { title: 'Monthly Meeting', category: 'meeting', activityDate: lastWeek, startTime: '08:00', endTime: '10:00', venue: 'ACIFAC Hall', organizer: 'Board of Directors' };
+  const badTime = await office.post('/api/attendance/activities', { ...meeting, endTime: '07:30' });
+  assert.deepEqual([badTime.status, badTime.data.message], [400, 'The end time must be later than the start time.']);
+  assert.equal((await office.post('/api/attendance/activities', { ...meeting, title: '' })).status, 400);
+  assert.equal((await office.post('/api/attendance/activities', { ...meeting, category: 'party' })).status, 400);
+  assert.equal((await office.post('/api/attendance/activities', { ...meeting, activityDate: nextWeek, status: 'completed' })).status, 400);
+  const created = await office.post('/api/attendance/activities', meeting);
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const m1 = created.data.data.id;
+  assert.deepEqual([created.data.data.status, created.data.data.final, created.data.data.categoryLabel], ['scheduled', false, 'Meeting']);
+  const seminar = { ...meeting, title: 'Organic Farming Seminar', category: 'education_training', activityDate: nextWeek };
+  const training = (await office.post('/api/attendance/activities', seminar)).data.data;
+
+  // Recording: future activities wait for their day; only members on the activity date are listed.
+  assert.equal((await office.request('PUT', `/api/attendance/activities/${training.id}/attendance`, { body: { records: [{ memberId: ana, status: 'present' }] } })).status, 400);
+  const listed = await office.get(`/api/attendance/activities/${m1}/members?search=ATT-00`);
+  assert.equal(listed.status, 200);
+  assert.deepEqual(listed.data.data.map((row) => row.memberNumber).sort(), ['ATT-001', 'ATT-002', 'ATT-003']);
+  assert.equal((await office.get(`/api/attendance/activities/${m1}/members?search=ana%20reyes`)).data.data.length, 1);
+
+  const save = (id, records, reason) => office.request('PUT', `/api/attendance/activities/${id}/attendance`, { body: { records, reason } });
+  const first = await save(m1, [{ memberId: ana, status: 'present', checkInTime: '08:05', remarks: 'Brought the minutes' }, { memberId: ben, status: 'late', checkInTime: '08:40' }]);
+  assert.equal(first.status, 200, JSON.stringify(first.data));
+  assert.deepEqual([first.data.data.added, first.data.data.updated], [2, 0]);
+
+  // No duplicates: saving again changes nothing, the database refuses a second row, a payload cannot list a member twice.
+  const again = await save(m1, [{ memberId: ana, status: 'present', checkInTime: '08:05', remarks: 'Brought the minutes' }, { memberId: ben, status: 'late', checkInTime: '08:40' }]);
+  assert.deepEqual([again.data.data.added, again.data.data.updated, again.data.data.unchanged], [0, 0, 2]);
+  const rowsFor = async (id) => (await pool.query('SELECT member_id, attendance_status, source FROM activity_attendance WHERE activity_id = $1', [id])).rows;
+  assert.equal((await rowsFor(m1)).length, 2);
+  await assert.rejects(pool.query(`INSERT INTO activity_attendance (activity_id, member_id, attendance_status) VALUES ($1, $2, 'absent')`, [m1, ana]), (error) => error.code === '23505');
+  assert.equal((await save(m1, [{ memberId: ana, status: 'present' }, { memberId: ana, status: 'late' }])).status, 400);
+  const notMember = await save(m1, [{ memberId: dan, status: 'present' }]);
+  assert.deepEqual([notMember.status, notMember.data.message], [400, 'Dan Lim was not a member on the activity date.']);
+
+  // Before finalization nobody is counted absent and nothing counts in the rate.
+  let mine = (await anaClient.get('/api/members/me/attendance')).data.data;
+  assert.deepEqual([mine.summary.eligible, mine.summary.rate, mine.pending, mine.history[0].final], [0, null, 1, false]);
+  assert.equal((await office.get('/api/attendance/reports/participation?member=ATT-00')).data.data.length, 0);
+  const changed = await save(m1, [{ memberId: ben, status: 'excused', remarks: 'Sick' }]);
+  assert.equal(changed.data.data.updated, 1);
+
+  // Finalizing records every unmarked active member absent; inactive members and later members are left out.
+  const expectedAbsent = Number((await pool.query(
+    `SELECT COUNT(*) FROM members m WHERE m.status = 'active' AND m.membership_date <= $2::date
+       AND NOT EXISTS (SELECT 1 FROM activity_attendance r WHERE r.activity_id = $1 AND r.member_id = m.id)`, [m1, lastWeek])).rows[0].count);
+  const details = (await office.get(`/api/attendance/activities/${m1}`)).data.data;
+  assert.deepEqual([details.toMarkAbsent, details.canFinalize, details.recordable], [expectedAbsent, true, true]);
+  const finalized = await office.post(`/api/attendance/activities/${m1}/finalize`);
+  assert.equal(finalized.status, 200, JSON.stringify(finalized.data));
+  assert.equal(finalized.data.data.markedAbsent, expectedAbsent);
+  assert.deepEqual([finalized.data.data.activity.status, finalized.data.data.activity.final], ['completed', true]);
+  const m1Rows = await rowsFor(m1);
+  assert.equal(m1Rows.find((row) => row.member_id === ana).attendance_status, 'present');
+  assert.equal(m1Rows.find((row) => row.member_id === ben).attendance_status, 'excused');
+  assert.ok(!m1Rows.some((row) => row.member_id === carla || row.member_id === dan));
+  assert.ok(m1Rows.filter((row) => row.source === 'finalization').every((row) => row.attendance_status === 'absent'));
+  assert.equal((await office.post(`/api/attendance/activities/${m1}/finalize`)).status, 409);
+
+  // Corrections after finalizing need a reason and keep the old value in the audit log.
+  const noReason = await save(m1, [{ memberId: ben, status: 'present' }]);
+  assert.equal(noReason.status, 400);
+  assert.equal((await save(m1, [{ memberId: ben, status: 'present', remarks: 'Signed the logbook late' }], 'Logbook checked')).status, 200);
+  const corrected = (await pool.query(`SELECT old_values, new_values, details FROM audit_logs WHERE action = 'ATTENDANCE_CORRECTED' ORDER BY id DESC LIMIT 1`)).rows[0];
+  assert.deepEqual([corrected.old_values.attendance_status, corrected.new_values.attendance_status, corrected.details.reason], ['excused', 'present', 'Logbook checked']);
+  const history = (await office.get(`/api/attendance/activities/${m1}/history`)).data.data;
+  assert.deepEqual(history.map((entry) => entry.action).slice(0, 2), ['ATTENDANCE_CORRECTED', 'ATTENDANCE_FINALIZED']);
+  assert.deepEqual([history[0].from, history[0].to, history[0].reason], ['excused', 'present', 'Logbook checked']);
+  assert.ok(history.some((entry) => entry.action === 'ATTENDANCE_UPDATED') && history.some((entry) => entry.action === 'ACTIVITY_CREATED'));
+  // A finalized activity took place: it keeps its date and cannot be cancelled.
+  assert.equal((await office.put(`/api/attendance/activities/${m1}`, { ...meeting, activityDate: shift(-8), status: 'completed' })).status, 400);
+  assert.equal((await office.put(`/api/attendance/activities/${m1}`, { ...meeting, venue: 'Barangay Hall', status: 'completed' })).status, 200);
+  assert.equal((await office.patch(`/api/attendance/activities/${m1}/cancel`, { reason: 'Mistake' })).status, 409);
+
+  // A second meeting where Ana is excused, and a cancelled clean-up drive that never counts.
+  const m2 = (await office.post('/api/attendance/activities', { ...meeting, title: 'Special Meeting', activityDate: yesterday })).data.data.id;
+  assert.equal((await save(m2, [{ memberId: ana, status: 'excused', remarks: 'Out of town' }])).status, 200);
+  assert.equal((await office.post(`/api/attendance/activities/${m2}/finalize`)).status, 200);
+  const drive = (await office.post('/api/attendance/activities', { ...meeting, title: 'Canal Clean-up', category: 'community_development', activityDate: lastWeek })).data.data.id;
+  assert.equal((await save(drive, [{ memberId: ana, status: 'present' }])).status, 200);
+  assert.equal((await office.patch(`/api/attendance/activities/${drive}/cancel`, { reason: '' })).status, 400);
+  const cancelled = await office.patch(`/api/attendance/activities/${drive}/cancel`, { reason: 'Heavy rain' });
+  assert.deepEqual([cancelled.status, cancelled.data.data.status, cancelled.data.data.cancellationReason], [200, 'cancelled', 'Heavy rain']);
+  assert.equal((await save(drive, [{ memberId: ben, status: 'present' }])).status, 409);
+  assert.equal((await office.post(`/api/attendance/activities/${drive}/finalize`)).status, 409);
+
+  // Ana: 2 eligible completed activities (the cancelled one is left out), 1 attended, 1 excused: 50%.
+  mine = (await anaClient.get(`/api/members/me/attendance?memberId=${ben}`)).data.data;
+  assert.equal(mine.member.id, ana, 'members only ever get their own records');
+  assert.deepEqual([mine.summary.eligible, mine.summary.attended, mine.summary.present, mine.summary.excused, mine.summary.absent, mine.summary.rate], [2, 1, 1, 1, 0, 50]);
+  assert.deepEqual(mine.byCategory.find((row) => row.category === 'meeting'), { category: 'meeting', label: 'Meeting', eligible: 2, attended: 1, present: 1, late: 0, absent: 0, excused: 1, rate: 50 });
+  assert.equal(mine.byCategory.find((row) => row.category === 'community_development').rate, null, 'N/A without eligible activities');
+  assert.equal(mine.mostRecent.title, 'Monthly Meeting');
+  assert.deepEqual(mine.history.map((row) => row.title), ['Special Meeting', 'Monthly Meeting']);
+  assert.deepEqual(mine.upcoming.map((row) => row.title), ['Organic Farming Seminar']);
+  assert.equal(mine.history[0].recordedBy, undefined, 'members do not see who recorded it');
+  assert.deepEqual((await office.get(`/api/attendance/members/${ana}`)).data.data.summary, mine.summary);
+  assert.equal((await office.get(`/api/attendance/members/${dan}`)).data.data.summary.rate, null);
+
+  // Reports: participation per member, history with filters, and the dashboard from the saved records.
+  const report = (await office.get('/api/attendance/reports/participation?member=ATT-00')).data;
+  assert.deepEqual(report.data.map((row) => [row.memberNumber, row.eligible, row.attended, row.excused, row.absent, row.rate]), [
+    ['ATT-002', 2, 1, 0, 1, 50],
+    ['ATT-001', 2, 1, 1, 0, 50],
+  ]);
+  assert.deepEqual((await office.get('/api/attendance/reports/participation?member=ATT-00&status=excused')).data.data.map((row) => row.memberNumber), ['ATT-001']);
+  assert.deepEqual((await office.get(`/api/attendance/reports/participation?member=ATT-00&category=education_training`)).data.data, []);
+  const records = (await office.get('/api/attendance/records?member=ATT-001')).data;
+  assert.deepEqual(records.data.map((row) => [row.title, row.status]), [['Special Meeting', 'excused'], ['Monthly Meeting', 'present']]);
+  assert.deepEqual([records.summary.present, records.summary.excused, records.summary.total], [1, 1, 2]);
+  assert.equal((await office.get('/api/attendance/records?member=ATT-00&status=absent')).data.data.length, 1);
+
+  const dashboard = (await office.get(`/api/attendance/dashboard?from=${shift(-30)}&to=${shift(30)}`)).data.data;
+  const perActivity = (await pool.query(
+    `SELECT 100.0 * COUNT(*) FILTER (WHERE attendance_status IN ('present', 'late')) / COUNT(*) AS rate FROM activity_attendance WHERE activity_id = ANY($1::int[]) GROUP BY activity_id`, [[m1, m2]])).rows;
+  const entries = Number((await pool.query('SELECT COUNT(*) FROM activity_attendance WHERE activity_id = ANY($1::int[])', [[m1, m2]])).rows[0].count);
+  assert.deepEqual(
+    [dashboard.summary.scheduled, dashboard.summary.completed, dashboard.summary.cancelled, dashboard.summary.upcoming, dashboard.summary.attendanceEntries, dashboard.summary.membersParticipated, dashboard.summary.needsFinalizing],
+    [1, 2, 1, 1, entries, 2, 0]
+  );
+  const meanRate = perActivity.reduce((sum, row) => sum + Number(row.rate), 0) / perActivity.length;
+  assert.ok(Math.abs(dashboard.summary.averageRate - meanRate) <= 0.05, `average of each finalized activity's rate: ${dashboard.summary.averageRate} vs ${meanRate}`);
+  assert.deepEqual(dashboard.upcoming.map((row) => row.title), ['Organic Farming Seminar']);
+  const list = (await office.get('/api/attendance/activities?category=meeting&status=completed')).data;
+  assert.deepEqual(list.data.map((row) => row.title), ['Special Meeting', 'Monthly Meeting']);
+  assert.equal(list.data[1].venue, 'Barangay Hall');
+
+  // Cancelling from the edit form needs a reason; a cancelled activity can be scheduled again.
+  assert.equal((await office.put(`/api/attendance/activities/${training.id}`, { ...seminar, status: 'cancelled' })).status, 400);
+  assert.equal((await office.put(`/api/attendance/activities/${training.id}`, { ...seminar, status: 'cancelled', cancellationReason: 'Speaker unavailable' })).data.data.status, 'cancelled');
+  const restored = await office.put(`/api/attendance/activities/${training.id}`, { ...seminar, status: 'scheduled' });
+  assert.deepEqual([restored.data.data.status, restored.data.data.cancelledAt], ['scheduled', null]);
+
+  // Members cannot reach the office endpoints, another member's records, or change their own.
+  for (const url of ['/api/attendance/dashboard', '/api/attendance/activities', `/api/attendance/activities/${m1}`, `/api/attendance/activities/${m1}/members`, '/api/attendance/records', '/api/attendance/reports/participation', `/api/attendance/members/${ben}`]) {
+    assert.equal((await anaClient.get(url)).status, 403, url);
+  }
+  assert.equal((await anaClient.request('PUT', `/api/attendance/activities/${m1}/attendance`, { body: { records: [{ memberId: ana, status: 'present' }] } })).status, 403);
+  assert.equal((await anaClient.post(`/api/attendance/activities/${m2}/finalize`)).status, 403);
+  assert.equal((await anaClient.post('/api/attendance/activities', meeting)).status, 403);
+  assert.equal((await new Client('10.0.10.3').get('/api/members/me/attendance')).status, 401);
+  assert.equal((await office.get('/api/members/me/attendance')).status, 403, 'the office reads a member through /api/attendance/members/:id');
+  // Live updates: a member hears about their own attendance rows only.
+  const anaUser = { role: 'MEMBER', member_id: ana, user_id: 1 };
+  assert.equal(canReceiveEvent(anaUser, { table: 'activity_attendance', memberId: ana }), true);
+  assert.equal(canReceiveEvent(anaUser, { table: 'activity_attendance', memberId: ben }), false);
+  assert.equal(canReceiveEvent(anaUser, { table: 'activities' }), true);
 });
