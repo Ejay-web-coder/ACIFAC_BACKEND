@@ -2058,6 +2058,30 @@ test('dashboard and analytics use real data', { skip }, async () => {
   assert.equal(d.totalShareCapital, Number(shares.total));
   assert.ok(d.memberShareCapital > 0 && d.shareRatio > 0 && d.shareRatio <= 1);
   assert.equal(d.dividend, Math.round(d.dividendPool * d.shareRatio * 100) / 100);
+
+  // The patronage refund: the pool shared 70/30 by business points (1 per PHP
+  // 100 of machinery fees and loan interest) and attendance points.
+  const p = d.patronage;
+  assert.deepEqual(p.rules, { pesosPerBusinessPoint: 100, activityPoints: { meeting: 10, community_development: 5, education_training: 5 } });
+  const interest = (await pool.query(
+    `SELECT COALESCE(SUM(lp.interest_paid) FILTER (WHERE l.member_id = $1), 0) AS member, COALESCE(SUM(lp.interest_paid), 0) AS total
+     FROM loan_payments lp JOIN loans l ON l.id = lp.loan_id JOIN members m ON m.id = l.member_id
+     WHERE m.status <> 'archived' AND lp.payment_date BETWEEN $2 AND $3`,
+    [state.memberId, d.from, d.asOf]
+  )).rows[0];
+  assert.equal(p.business.loans, Number(interest.member));
+  assert.ok(p.business.loans > 0, 'the member paid loan interest this year');
+  assert.equal(cents(p.business.machinery + p.business.loans), cents(p.business.total));
+  assert.ok(Math.abs(p.businessPoints - p.business.total / 100) < 1e-9);
+  assert.ok(p.totalBusiness >= Number(interest.total) && p.totalBusiness >= p.business.total);
+  assert.equal(p.businessShare, p.business.total / p.totalBusiness);
+  if (d.patronageRefundPool > 0) {
+    assert.ok([70, 100].includes(p.weights.business), JSON.stringify(p.weights));
+    assert.equal(p.weights.business + p.weights.participation, 100);
+    assert.equal(cents(p.businessPool + p.participationPool), cents(d.patronageRefundPool));
+  }
+  assert.equal(p.businessRefund, Math.round(p.businessPool * p.businessShare * 100) / 100);
+  assert.equal(cents(p.refund), cents(p.businessRefund) + cents(p.participationRefund));
   const lastYear = await member.get(`/api/members/me/dividend?year=${d.year - 1}`);
   assert.equal(lastYear.status, 200);
   assert.equal(lastYear.data.data.asOf, `${d.year - 1}-12-31`);
@@ -2711,4 +2735,103 @@ test('attendance: activities, recording, duplicates, finalization, rates, cancel
   assert.equal(canReceiveEvent(anaUser, { table: 'activity_attendance', memberId: ana }), true);
   assert.equal(canReceiveEvent(anaUser, { table: 'activity_attendance', memberId: ben }), false);
   assert.equal(canReceiveEvent(anaUser, { table: 'activities' }), true);
+});
+
+test('loans: restructuring gives an open loan a new schedule and stays in the credit history', { skip }, async () => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const { refreshLoanStatuses } = await import('../src/services/loanService.js');
+  const today = todayDateOnly();
+  const plus = (date, days) => { const d = new Date(`${date}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
+  const approved = plus(today, -100);
+  // PHP 12,000 at 2.5% over 6 months, approved 100 days ago: three installments have fallen due.
+  const loanId = (await pool.query(
+    `INSERT INTO loans (loan_number, member_id, member_name, loan_type, amount, balance, interest_rate, term, status, date_approved, due_date, monthly_payment, calculated_interest, total_repayment)
+     VALUES ('L-RS-001', $1, 'Juan Dela Cruz', 'agricultural', 12000, 12300, 2.5, 6, 'active', $2, $3, 2050, 300, 12300) RETURNING id`,
+    [state.memberId, approved, plus(approved, 182)]
+  )).rows[0].id;
+  await refreshLoanStatuses({ force: true });
+  const before = (await admin.get(`/api/admin/loans/${loanId}`)).data;
+  assert.equal(before.installments.length, 6);
+  // The first installment is paid ten days late; the next two are left unpaid.
+  const late = await admin.post(`/api/admin/loans/${loanId}/payments`, { amount: '2050', paymentDate: plus(before.installments[0].dueDate, 10) });
+  assert.equal(late.status, 201, JSON.stringify(late.data));
+  await refreshLoanStatuses({ force: true });
+  const overdue = (await admin.get(`/api/admin/loans/${loanId}`)).data.loan;
+  assert.deepEqual([overdue.status, overdue.balance, overdue.overdueInstallments], ['overdue', '10250.00', 2]);
+  const juanBefore = (await admin.get('/api/admin/analytics?from=2000-01-01&to=2999-12-31')).data.memberAnalytics.find((row) => row.databaseId === state.memberId);
+  const historyBefore = juanBefore.loanHistory.find((loan) => loan.id === loanId);
+  assert.deepEqual([historyBefore.onTimePayments, historyBefore.latePayments, historyBefore.restructureCount], [0, 3, 0]);
+
+  const url = `/api/admin/loans/${loanId}/restructure`;
+  const valid = { term: 4, interestRate: '2.5', reason: 'Typhoon damaged the crop' };
+  // Admins only (the test member may already be signed out by the session tests).
+  assert.ok([401, 403].includes((await member.post(url, valid)).status));
+  assert.equal((await admin.post(url, { ...valid, term: 0 })).status, 400);
+  assert.equal((await admin.post(url, { ...valid, term: 61 })).status, 400);
+  assert.equal((await admin.post(url, { ...valid, interestRate: 'ten' })).status, 400);
+  assert.equal((await admin.post(url, { ...valid, reason: '  ' })).status, 400);
+  assert.equal((await admin.post(`/api/admin/loans/${state.loanId}/restructure`, valid)).status, 409, 'a fully paid loan has nothing to restructure');
+
+  const done = await admin.post(url, valid);
+  assert.equal(done.status, 201, JSON.stringify(done.data));
+  // PHP 10,250 still owed (two installments of it overdue) + 2.5% = 10,506.25 over 4 months.
+  assert.deepEqual(
+    [done.data.restructuring.balance_carried, done.data.restructuring.overdue_installments, done.data.restructuring.added_interest, done.data.restructuring.new_monthly_payment],
+    ['10250.00', 2, '256.25', '2626.56']
+  );
+  const loan = done.data.loan;
+  assert.deepEqual([loan.status, loan.balance, loan.totalAmount, loan.totalInterest, loan.monthlyPayment, loan.restructureCount, loan.lastRestructuredOn, loan.amount, loan.term],
+    ['active', '10506.25', '12556.25', '556.25', '2626.56', 1, today, '12000.00', 6]);
+  const detail = (await admin.get(`/api/admin/loans/${loanId}`)).data;
+  assert.deepEqual(detail.installments.map((row) => row.status), ['paid_late', 'restructured', 'restructured', 'restructured', 'restructured', 'restructured', 'upcoming', 'upcoming', 'upcoming', 'upcoming']);
+  const fresh = detail.installments.slice(6);
+  assert.deepEqual(fresh.map((row) => row.number), [7, 8, 9, 10]);
+  assert.equal(fresh.reduce((sum, row) => sum + Math.round(Number(row.amountDue) * 100), 0), 1050625);
+  assert.equal(fresh.reduce((sum, row) => sum + Math.round(Number(row.interestDue) * 100), 0), 25625 + 25000, 'the unpaid interest of the old schedule stays interest');
+  assert.ok(fresh[0].dueDate > today && detail.loan.dueDate === fresh[3].dueDate);
+  assert.deepEqual(detail.restructurings.map((row) => [row.reason, row.newTerm, row.recordedBy]), [['Typhoon damaged the crop', 4, 'testadmin']]);
+
+  // The replaced installments no longer make the loan overdue, even after the daily refresh.
+  await refreshLoanStatuses({ force: true });
+  assert.equal((await admin.get(`/api/admin/loans/${loanId}`)).data.loan.status, 'active');
+  // Payments now go to the new schedule.
+  const next = await admin.post(`/api/admin/loans/${loanId}/payments`, { amount: '2626.56', paymentDate: today });
+  assert.equal(next.status, 201, JSON.stringify(next.data));
+  assert.equal(next.data.payment.remainingBalance, '7879.69');
+  const afterPayment = (await admin.get(`/api/admin/loans/${loanId}`)).data.installments;
+  assert.equal(afterPayment[6].status, 'paid');
+  assert.ok(afterPayment.slice(1, 6).every((row) => row.status === 'restructured' && row.amountPaid === '0.00'));
+
+  // The member is told; the credit history keeps the late installments and counts the restructured loan.
+  const told = (await pool.query(`SELECT message FROM notifications WHERE user_id = $1 AND type = 'loan_restructured'`, [state.memberUserId])).rows;
+  assert.ok(told.length === 1 && told[0].message.includes('L-RS-001') && told[0].message.includes('4 months'), JSON.stringify(told));
+  const analytics = (await admin.get('/api/admin/analytics?from=2000-01-01&to=2999-12-31')).data;
+  const juan = analytics.memberAnalytics.find((row) => row.databaseId === state.memberId);
+  const history = juan.loanHistory.find((row) => row.id === loanId);
+  assert.deepEqual([history.onTimePayments, history.latePayments, history.restructureCount], [0, 3, 1]);
+  assert.deepEqual([juan.restructuredLoans, juan.restructurings], [1, 1]);
+  assert.equal(juan.latePayments, juanBefore.latePayments, 'restructuring does not erase late payments');
+  assert.equal(juan.overdueInstallments, juanBefore.overdueInstallments - 2);
+  assert.ok(analytics.methodology.restructuredLoans);
+  // Debt-to-capital was removed from the analytics.
+  assert.ok(!('debtToCapitalRatio' in juan) && !('exposure' in juan) && !('savings' in juan) && !analytics.methodology.debtToCapital);
+  const audit = (await pool.query(`SELECT new_values FROM audit_logs WHERE action = 'LOAN_RESTRUCTURED' AND entity_id = $1`, [String(loanId)])).rows;
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].new_values.reason, 'Typhoon damaged the crop');
+
+  // Clicking the member in the credit history: a suggestion from how they
+  // repaid, with the same figures as the table (rule-based here: no AI key).
+  const advice = await admin.post(`/api/admin/analytics/members/${state.memberId}/credit-advice`);
+  assert.equal(advice.status, 200, JSON.stringify(advice.data));
+  assert.equal(advice.data.source, 'rules');
+  assert.ok(['lend', 'caution', 'do_not_lend', 'no_history'].includes(advice.data.verdict));
+  assert.ok(advice.data.suggestion.length > 20);
+  assert.deepEqual(
+    [advice.data.facts.installments.due, advice.data.facts.installments.onTime, advice.data.facts.installments.late, advice.data.facts.installments.overdueNow, advice.data.facts.loans.restructured],
+    [juan.installmentsDue, juan.onTimePayments, juan.latePayments, juan.overdueInstallments, juan.restructuredLoans]
+  );
+  assert.notEqual(advice.data.verdict, 'lend', 'late installments never get a plain "can lend"');
+  assert.equal((await admin.post('/api/admin/analytics/members/999999/credit-advice')).status, 404);
+  // Admins only (the member's session has ended by this test, hence 401 or 403).
+  assert.ok([401, 403].includes((await member.post(`/api/admin/analytics/members/${state.memberId}/credit-advice`)).status));
 });

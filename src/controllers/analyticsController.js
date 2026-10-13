@@ -1,13 +1,14 @@
 import { query } from '../config/db.js';
 import { SQL_TODAY, TIME_ZONE } from '../config/env.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
-import { badRequest, notFound } from '../utils/http.js';
+import { badRequest, notFound, parseId } from '../utils/http.js';
 import { centsToNumber, netIncomeCents } from '../services/netIncome.js';
 import { computeDividend } from '../services/dividends.js';
 import { refreshLoanStatusesInBackground } from '../services/loanService.js';
 import { signedSavings } from '../services/savingsLedger.js';
 import { refreshRentalStatusesInBackground } from './machineryController.js';
 import { machineryAnalytics, machineryRecommendations } from '../services/machineryAnalytics.js';
+import { adviseOnCredit, creditFacts } from '../services/creditAdvice.js';
 
 // A member's share capital is at most PHP 20,000 (SHARE_CAPITAL_LIMIT in
 // memberController.js, not imported: the controllers import each other).
@@ -56,6 +57,8 @@ export const METHODOLOGY = {
     'Needs Improvement': 'On-time rate below 50%.',
   },
   loanCapacity: 'Rule-based recommendation: Strong/Good require a fully paid loan, on-time rate >= 80% and no overdue installments. It is guidance for the credit committee, not an approval.',
+  latePayments: 'Installments already due that were not fully paid on or before their due date, including ones past due when the loan was restructured.',
+  restructuredLoans: 'Loans given a new schedule for their remaining balance (Loans & Payments, Restructure).',
 };
 
 function repaymentRating(member) {
@@ -186,24 +189,38 @@ export async function getAnalytics(req, res) {
       ), payment_totals AS (
         SELECT l.member_id, COUNT(p.id)::int AS "paymentCount", COALESCE(SUM(p.amount), 0) AS "totalPaid"
         FROM loan_payments p JOIN loans l ON l.id = p.loan_id WHERE l.member_id IS NOT NULL GROUP BY l.member_id
+      ), loan_installment_totals AS (
+        -- Per loan. An installment a restructuring replaced counts only if it was
+        -- already past due then (a late payment); the rest of it was rescheduled.
+        SELECT i.loan_id,
+               COUNT(*) FILTER (WHERE i.due_date <= ${SQL_TODAY})::int AS due,
+               COUNT(*) FILTER (WHERE i.due_date <= ${SQL_TODAY} AND i.amount_paid >= i.amount_due AND i.paid_date <= i.due_date)::int AS on_time,
+               COUNT(*) FILTER (WHERE i.due_date <= ${SQL_TODAY} AND NOT (i.amount_paid >= i.amount_due AND i.paid_date <= i.due_date))::int AS late,
+               COUNT(*) FILTER (WHERE i.due_date < ${SQL_TODAY} AND i.amount_paid < i.amount_due AND i.superseded_by IS NULL)::int AS overdue
+        FROM loan_installments i LEFT JOIN loan_restructurings r ON r.id = i.superseded_by
+        WHERE i.superseded_by IS NULL OR i.due_date < r.restructured_on
+        GROUP BY i.loan_id
       ), installment_totals AS (
-        SELECT l.member_id,
-               COUNT(*) FILTER (WHERE i.due_date <= ${SQL_TODAY})::int AS "installmentsDue",
-               COUNT(*) FILTER (WHERE i.due_date <= ${SQL_TODAY} AND i.amount_paid >= i.amount_due AND i.paid_date <= i.due_date)::int AS "onTimePayments",
-               COUNT(*) FILTER (WHERE i.due_date <= ${SQL_TODAY} AND NOT (i.amount_paid >= i.amount_due AND i.paid_date <= i.due_date))::int AS "latePayments",
-               COUNT(*) FILTER (WHERE i.due_date < ${SQL_TODAY} AND i.amount_paid < i.amount_due)::int AS "overdueInstallments"
-        FROM loan_installments i JOIN loans l ON l.id = i.loan_id WHERE l.member_id IS NOT NULL GROUP BY l.member_id
+        SELECT l.member_id, SUM(t.due)::int AS "installmentsDue", SUM(t.on_time)::int AS "onTimePayments",
+               SUM(t.late)::int AS "latePayments", SUM(t.overdue)::int AS "overdueInstallments"
+        FROM loan_installment_totals t JOIN loans l ON l.id = t.loan_id WHERE l.member_id IS NOT NULL GROUP BY l.member_id
+      ), restructure_counts AS (
+        SELECT loan_id, COUNT(*)::int AS count FROM loan_restructurings GROUP BY loan_id
+      ), restructure_totals AS (
+        SELECT l.member_id, COUNT(*)::int AS "restructuredLoans", SUM(rc.count)::int AS "restructurings"
+        FROM restructure_counts rc JOIN loans l ON l.id = rc.loan_id WHERE l.member_id IS NOT NULL GROUP BY l.member_id
       ), share_totals AS (
         SELECT member_id, COALESCE(SUM(amount), 0) AS total FROM share_contributions GROUP BY member_id
-      ), savings_totals AS (
-        SELECT st.member_id, COALESCE(SUM(${signedSavings('st')}), 0) AS total FROM savings_transactions st GROUP BY st.member_id
       ), history AS (
         SELECT l.member_id, json_agg(json_build_object(
                  'id', l.id, 'loanNumber', l.loan_number, 'amount', l.amount, 'balance', l.balance, 'status', l.status,
-                 'dateApproved', l.date_approved, 'dueDate', l.due_date, 'paymentCount', COALESCE(pc.count, 0), 'totalPaid', COALESCE(pc.total, 0)
+                 'dateApproved', l.date_approved, 'dueDate', l.due_date, 'paymentCount', COALESCE(pc.count, 0), 'totalPaid', COALESCE(pc.total, 0),
+                 'onTimePayments', COALESCE(t.on_time, 0), 'latePayments', COALESCE(t.late, 0), 'restructureCount', COALESCE(rc.count, 0)
                ) ORDER BY l.date_approved DESC) AS loans
         FROM loans l
         LEFT JOIN (SELECT loan_id, COUNT(*) AS count, SUM(amount) AS total FROM loan_payments GROUP BY loan_id) pc ON pc.loan_id = l.id
+        LEFT JOIN loan_installment_totals t ON t.loan_id = l.id
+        LEFT JOIN restructure_counts rc ON rc.loan_id = l.id
         WHERE l.member_id IS NOT NULL GROUP BY l.member_id
       )
       SELECT m.id AS "databaseId", m.member_number AS "memberId",
@@ -214,13 +231,14 @@ export async function getAnalytics(req, res) {
              COALESCE(lt."overdueLoans", 0) AS "overdueLoans", COALESCE(pt."paymentCount", 0) AS "paymentCount",
              COALESCE(it."installmentsDue", 0) AS "installmentsDue", COALESCE(it."onTimePayments", 0) AS "onTimePayments",
              COALESCE(it."latePayments", 0) AS "latePayments", COALESCE(it."overdueInstallments", 0) AS "overdueInstallments",
-             COALESCE(st.total, 0) AS "shareCapital", COALESCE(sv.total, 0) AS "savings", COALESCE(h.loans, '[]'::json) AS "loanHistory"
+             COALESCE(rt."restructuredLoans", 0) AS "restructuredLoans", COALESCE(rt."restructurings", 0) AS "restructurings",
+             COALESCE(st.total, 0) AS "shareCapital", COALESCE(h.loans, '[]'::json) AS "loanHistory"
       FROM members m
       LEFT JOIN loan_totals lt ON lt.member_id = m.id
       LEFT JOIN payment_totals pt ON pt.member_id = m.id
       LEFT JOIN installment_totals it ON it.member_id = m.id
+      LEFT JOIN restructure_totals rt ON rt.member_id = m.id
       LEFT JOIN share_totals st ON st.member_id = m.id
-      LEFT JOIN savings_totals sv ON sv.member_id = m.id
       LEFT JOIN history h ON h.member_id = m.id
       WHERE m.status <> 'archived'
       ORDER BY COALESCE(st.total, 0) DESC, "memberName"
@@ -229,9 +247,10 @@ export async function getAnalytics(req, res) {
   ]);
 
   const totals = summary.rows[0];
-  const numericKeys = ['totalLoans', 'completedLoans', 'activeLoans', 'totalBorrowed', 'totalPaid', 'outstandingBalance', 'overdueLoans', 'paymentCount', 'installmentsDue', 'onTimePayments', 'latePayments', 'overdueInstallments', 'shareCapital', 'savings'];
+  const numericKeys = ['totalLoans', 'completedLoans', 'activeLoans', 'totalBorrowed', 'totalPaid', 'outstandingBalance', 'overdueLoans', 'paymentCount', 'installmentsDue', 'onTimePayments', 'latePayments', 'overdueInstallments', 'restructuredLoans', 'restructurings', 'shareCapital'];
+  const loanNumbers = ['amount', 'balance', 'totalPaid'];
   const memberRows = memberAnalytics.rows.map((row) => {
-    const member = { ...row, databaseId: toNumber(row.databaseId), loanHistory: row.loanHistory || [] };
+    const member = { ...row, databaseId: toNumber(row.databaseId), loanHistory: (row.loanHistory || []).map((loan) => ({ ...loan, ...Object.fromEntries(loanNumbers.map((key) => [key, toNumber(loan[key])])) })) };
     for (const key of numericKeys) member[key] = toNumber(row[key]);
     member.overduePayments = member.overdueInstallments;
     member.onTimePaymentRate = member.installmentsDue > 0 ? Number(((member.onTimePayments / member.installmentsDue) * 100).toFixed(1)) : 0;
@@ -277,6 +296,48 @@ export async function recommendMachinery(req, res) {
   return res.json({ success: true, ...(await machineryRecommendations(from, to)) });
 }
 
+// POST /api/admin/analytics/members/:id/credit-advice
+// A short suggestion on lending to the member again, from how they repaid
+// (see services/creditAdvice.js). The installments are counted as in the
+// Member Credit History: one a restructuring replaced counts only if it was
+// already past due then, and its days late stop at the restructuring.
+export async function adviseMemberCredit(req, res) {
+  const memberId = parseId(req.params.id, 'member ID');
+  refreshLoanStatusesInBackground();
+  const [member, loans, installments, shares] = await Promise.all([
+    query(`SELECT id FROM members WHERE id = $1 AND status <> 'archived'`, [memberId]),
+    query(
+      `SELECT l.id, l.amount, l.balance, l.status, TO_CHAR(l.date_approved, 'YYYY-MM-DD') AS "dateApproved",
+              (SELECT COUNT(*) FROM loan_restructurings r WHERE r.loan_id = l.id)::int AS restructurings
+         FROM loans l WHERE l.member_id = $1 ORDER BY l.date_approved, l.id`,
+      [memberId]
+    ),
+    query(
+      `SELECT i.loan_id AS "loanId", TO_CHAR(i.due_date, 'YYYY-MM-DD') AS "dueDate",
+              (i.amount_paid >= i.amount_due AND i.paid_date <= i.due_date) AS "onTime",
+              (i.due_date < ${SQL_TODAY} AND i.amount_paid < i.amount_due AND i.superseded_by IS NULL) AS overdue,
+              GREATEST(0, CASE
+                WHEN i.amount_paid >= i.amount_due THEN COALESCE(i.paid_date, i.last_payment_date, ${SQL_TODAY}) - i.due_date
+                WHEN r.id IS NOT NULL THEN r.restructured_on - i.due_date
+                ELSE ${SQL_TODAY} - i.due_date END)::int AS "daysLate"
+         FROM loan_installments i JOIN loans l ON l.id = i.loan_id
+         LEFT JOIN loan_restructurings r ON r.id = i.superseded_by
+        WHERE l.member_id = $1 AND i.due_date <= ${SQL_TODAY} AND (i.superseded_by IS NULL OR i.due_date < r.restructured_on)
+        ORDER BY i.due_date, i.loan_id, i.installment_number`,
+      [memberId]
+    ),
+    query(`SELECT COALESCE(SUM(amount), 0) AS total FROM share_contributions WHERE member_id = $1`, [memberId]),
+  ]);
+  if (!member.rows[0]) throw notFound('Member not found.');
+  const facts = creditFacts({
+    loans: loans.rows.map((loan) => ({ ...loan, amount: toNumber(loan.amount), balance: toNumber(loan.balance) })),
+    installments: installments.rows,
+    shareCapital: toNumber(shares.rows[0].total),
+    today: todayDateOnly(),
+  });
+  return res.json({ success: true, ...(await adviseOnCredit(facts)), facts: { loans: facts.loans, installments: facts.installments } });
+}
+
 // GET /api/admin/dashboard/share-capital/:band
 // The members in one share capital band of the dashboard (a bar clicked on
 // the chart), most share capital first.
@@ -312,7 +373,7 @@ export async function getDashboard(req, res) {
         (SELECT COUNT(*)::int FROM members m WHERE m.status <> 'archived' AND NOT EXISTS (SELECT 1 FROM users u WHERE u.member_id = m.id)) AS "unregisteredMembers",
         (SELECT COALESCE(SUM(balance), 0) FROM loans WHERE status IN ('active', 'overdue')) AS "outstandingLoans",
         (SELECT COUNT(DISTINCT i.loan_id)::int FROM loan_installments i JOIN loans l ON l.id = i.loan_id
-          WHERE l.status <> 'paid' AND i.amount_paid < i.amount_due AND i.due_date BETWEEN ${SQL_TODAY} AND ${SQL_TODAY} + 7) AS "loansDueThisWeek",
+          WHERE l.status <> 'paid' AND i.amount_paid < i.amount_due AND i.superseded_by IS NULL AND i.due_date BETWEEN ${SQL_TODAY} AND ${SQL_TODAY} + 7) AS "loansDueThisWeek",
         (SELECT COUNT(*)::int FROM loans WHERE status = 'overdue') AS "overdueLoans",
         (SELECT COUNT(*)::int FROM loan_requests WHERE status = 'pending') AS "pendingLoanRequests",
         (SELECT COUNT(*)::int FROM rental_requests WHERE status = 'pending') AS "pendingRentalRequests",

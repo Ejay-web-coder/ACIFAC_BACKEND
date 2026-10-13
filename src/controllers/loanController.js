@@ -12,7 +12,7 @@ import { isPaymentDay, officeOpenNow, paymentHours, weekdayName } from '../servi
 import { keepAlive } from '../utils/background.js';
 import { notifyAdmins, notifyMember } from '../services/notificationService.js';
 import {
-  allocatePayment, calculateLoanFinancials, createInstallments, ensureInstallments, LOAN_POLICY, recomputeLoanState, refreshLoanStatusesInBackground,
+  allocatePayment, calculateLoanFinancials, createInstallments, ensureInstallments, LOAN_POLICY, recomputeLoanState, refreshLoanStatusesInBackground, restructureLoan,
 } from '../services/loanService.js';
 
 const MONEY_PATTERN = /^\d+(\.\d{1,2})?$/;
@@ -44,6 +44,7 @@ const loanSelect = `
          l.co_maker_address AS "coMakerAddress", l.co_maker_contact AS "coMakerContact",
          l.co_maker_relationship AS "coMakerRelationship", l.collateral_type AS "collateralType",
          l.collateral_details AS "collateralDetails", l.in_kind_items AS "inKindItems", l.loan_request_id AS "loanRequestId",
+         COALESCE(rs.restructure_count, 0)::int AS "restructureCount", rs.last_restructured_on AS "lastRestructuredOn",
          ${idDocumentsColumn('l')}, ${signatureColumn('l')}
   FROM loans l
   LEFT JOIN members m ON m.id = l.member_id
@@ -52,9 +53,10 @@ const loanSelect = `
     SELECT SUM(i.amount_due - i.amount_paid) FILTER (WHERE i.amount_paid < i.amount_due AND i.due_date < ${SQL_TODAY}) AS overdue_amount,
            COUNT(*) FILTER (WHERE i.amount_paid < i.amount_due AND i.due_date < ${SQL_TODAY}) AS overdue_installments,
            COUNT(*) FILTER (WHERE i.amount_paid >= i.amount_due) AS paid_installments,
-           (SELECT i2.amount_due - i2.amount_paid FROM loan_installments i2 WHERE i2.loan_id = l.id AND i2.amount_paid < i2.amount_due ORDER BY i2.installment_number LIMIT 1) AS next_amount_due
-    FROM loan_installments i WHERE i.loan_id = l.id
-  ) inst ON TRUE`;
+           (SELECT i2.amount_due - i2.amount_paid FROM loan_installments i2 WHERE i2.loan_id = l.id AND i2.amount_paid < i2.amount_due AND i2.superseded_by IS NULL ORDER BY i2.installment_number LIMIT 1) AS next_amount_due
+    FROM loan_installments i WHERE i.loan_id = l.id AND i.superseded_by IS NULL
+  ) inst ON TRUE
+  LEFT JOIN LATERAL (SELECT COUNT(*) AS restructure_count, MAX(r.restructured_on) AS last_restructured_on FROM loan_restructurings r WHERE r.loan_id = l.id) rs ON TRUE`;
 
 const paymentSelect = `
   SELECT p.id, p.loan_id AS "loanId", l.loan_number AS "loanNumber", l.member_id AS "memberDatabaseId", l.member_name AS "memberName",
@@ -63,6 +65,14 @@ const paymentSelect = `
   FROM loan_payments p
   JOIN loans l ON l.id = p.loan_id
   LEFT JOIN users u ON u.id = p.recorded_by`;
+
+const restructuringSelect = `
+  SELECT r.id, r.loan_id AS "loanId", r.restructured_on AS "restructuredOn", r.reason, r.balance_carried AS "balanceCarried",
+         r.principal_carried AS "principalCarried", r.interest_carried AS "interestCarried", r.overdue_amount AS "overdueAmount",
+         r.overdue_installments AS "overdueInstallments", r.interest_rate AS "interestRate", r.added_interest AS "addedInterest",
+         r.new_term AS "newTerm", r.new_monthly_payment AS "newMonthlyPayment", r.previous_due_date AS "previousDueDate",
+         r.new_due_date AS "newDueDate", u.username AS "recordedBy", r.created_at AS "createdAt"
+  FROM loan_restructurings r LEFT JOIN users u ON u.id = r.recorded_by`;
 
 const requestSelect = `
   SELECT r.id, r.member_id AS "memberDatabaseId", COALESCE(m.member_number, r.member_number) AS "memberId", r.member_number AS "memberNumber",
@@ -295,18 +305,20 @@ export async function getLoan(req, res) {
   const id = parseId(req.params.id, 'loan ID');
   const loan = await query(`${loanSelect} WHERE l.id = $1`, [id]);
   if (!loan.rows[0]) throw notFound('Loan not found.');
-  const [installments, payments] = await Promise.all([
+  const [installments, payments, restructurings] = await Promise.all([
     query(
       `SELECT id, installment_number AS "number", due_date AS "dueDate", amount_due AS "amountDue", principal_due AS "principalDue",
               interest_due AS "interestDue", amount_paid AS "amountPaid", last_payment_date AS "lastPaymentDate", paid_date AS "paidDate",
-              CASE WHEN amount_paid >= amount_due THEN (CASE WHEN paid_date > due_date THEN 'paid_late' ELSE 'paid' END)
+              CASE WHEN superseded_by IS NOT NULL THEN 'restructured'
+                   WHEN amount_paid >= amount_due THEN (CASE WHEN paid_date > due_date THEN 'paid_late' ELSE 'paid' END)
                    WHEN due_date < ${SQL_TODAY} THEN 'overdue' WHEN amount_paid > 0 THEN 'partial' ELSE 'upcoming' END AS status
        FROM loan_installments WHERE loan_id = $1 ORDER BY installment_number`,
       [id]
     ),
     query(`${paymentSelect} WHERE p.loan_id = $1 ORDER BY p.payment_date DESC, p.id DESC`, [id]),
+    query(`${restructuringSelect} WHERE r.loan_id = $1 ORDER BY r.restructured_on, r.id`, [id]),
   ]);
-  return res.json({ success: true, loan: loan.rows[0], installments: installments.rows, payments: payments.rows });
+  return res.json({ success: true, loan: loan.rows[0], installments: installments.rows, payments: payments.rows, restructurings: restructurings.rows });
 }
 
 export async function listPayments(req, res) {
@@ -515,6 +527,63 @@ export async function recordPayment(req, res) {
     void sendEmailSafely({ ...email, to: recipient.email, relatedUserId: recipient.user_id });
   }
   return res.status(201).json({ success: true, payment });
+}
+
+const RATE_PATTERN = /^\d{1,2}(\.\d{1,2})?$/;
+
+// POST /api/admin/loans/:id/restructure { term, interestRate, reason }
+// Gives an open loan a new schedule for what is still owed, from today (see
+// restructureLoan): term months, plus interestRate% of the balance (the loan
+// policy's 2.5% unless the office sets another, 0 for none).
+export async function restructureLoanRequest(req, res) {
+  const loanId = parseId(req.params.id, 'loan ID');
+  const term = readTerm(req.body?.term);
+  const rateText = String(req.body?.interestRate ?? LOAN_POLICY.interestRate).trim();
+  if (!RATE_PATTERN.test(rateText)) throw badRequest('Interest on the restructured balance must be a percentage from 0 to 99.99.');
+  const reason = clean(req.body?.reason, 1000);
+  if (!reason) throw badRequest('Enter the reason for restructuring the loan.');
+  const today = todayDateOnly();
+
+  const { loan, restructuring } = await withTransaction(async (client) => {
+    const row = (await client.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId])).rows[0];
+    if (!row) throw notFound('Loan not found.');
+    await ensureInstallments(client, loanId);
+    const state = await recomputeLoanState(client, loanId);
+    if (state.status === 'paid' || toCents(state.balance) <= 0) throw conflict('This loan is already fully paid, so there is nothing to restructure.');
+    const result = await restructureLoan(client, loanId, { term, interestRate: rateText, reason, restructuredOn: today, userId: currentUserId(req) });
+    const newState = await recomputeLoanState(client, loanId);
+    await createAuditLog({
+      client,
+      user: req.user,
+      action: 'LOAN_RESTRUCTURED',
+      module: 'Loans',
+      entityType: 'loan',
+      entityId: String(loanId),
+      description: `Restructured loan ${row.loan_number} of ${row.member_name}`,
+      oldValues: { balance: state.balance, status: state.status, due_date: row.due_date, monthly_payment: row.monthly_payment },
+      newValues: {
+        balance: newState.balance, status: newState.status, due_date: result.new_due_date, monthly_payment: result.new_monthly_payment, term,
+        interest_rate: result.interest_rate, added_interest: result.added_interest, overdue_installments: result.overdue_installments, reason,
+      },
+      ...getRequestMeta(req),
+    });
+    if (row.member_id) {
+      const money = (value) => `PHP ${Number(value).toLocaleString('en-PH', { minimumFractionDigits: 2 })}`;
+      await notifyMember(client, row.member_id, {
+        type: 'loan_restructured',
+        title: 'Loan restructured',
+        message: `Your loan ${row.loan_number} was restructured: ${money(newState.balance)} over ${term} month${term === 1 ? '' : 's'} at ${money(result.new_monthly_payment)} a month, the last due on ${formatDateOnly(result.new_due_date)}.`,
+        severity: 'info',
+        link: '/loan-status',
+        entityType: 'loan',
+        entityId: loanId,
+        dedupeKey: `loan-restructured-${result.id}`,
+      });
+    }
+    return { loan: row, restructuring: result };
+  });
+  const updated = (await query(`${loanSelect} WHERE l.id = $1`, [loanId])).rows[0];
+  return res.status(201).json({ success: true, loan: updated, restructuring: { ...restructuring, loanNumber: loan.loan_number } });
 }
 
 // Inserts a pending loan application inside the caller's transaction. Used by

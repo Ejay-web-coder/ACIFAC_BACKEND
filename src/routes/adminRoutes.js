@@ -1,10 +1,10 @@
 import express from 'express';
 import { createMemberAccount, getAccount, listAccounts, listAuditLogs, listMembersWithoutAccounts, resetMemberPassword, sendEmailTest, updateAccountStatus } from '../controllers/adminController.js';
 import { requireAdmin, requireAuth } from '../middleware/auth.js';
-import { downloadLoanId, downloadLoanRequestId, downloadLoanRequestSignature, downloadLoanSignature, getLoan, listLoanRequests, listLoans, listPayments, recordPayment, reviewLoanRequest } from '../controllers/loanController.js';
+import { downloadLoanId, downloadLoanRequestId, downloadLoanRequestSignature, downloadLoanSignature, getLoan, listLoanRequests, listLoans, listPayments, recordPayment, restructureLoanRequest, reviewLoanRequest } from '../controllers/loanController.js';
 import { createLoanWithIds } from '../controllers/loanIdController.js';
 import { loanApplicationUpload } from '../middleware/upload.js';
-import { getAnalytics, getDashboard, getMachineryAnalytics, listShareCapitalBandMembers, recommendMachinery } from '../controllers/analyticsController.js';
+import { adviseMemberCredit, getAnalytics, getDashboard, getMachineryAnalytics, listShareCapitalBandMembers, recommendMachinery } from '../controllers/analyticsController.js';
 
 const router = express.Router();
 
@@ -23,6 +23,8 @@ router.get('/analytics', getAnalytics);
 router.get('/dashboard/share-capital/:band', listShareCapitalBandMembers);
 router.get('/analytics/machinery', getMachineryAnalytics);
 router.post('/analytics/machinery/recommendations', recommendMachinery);
+// A short AI suggestion on lending to a member again, from how they repaid (Member Credit History).
+router.post('/analytics/members/:id/credit-advice', adviseMemberCredit);
 router.get('/loans', listLoans);
 // A new loan comes with the borrower's and the co-maker's valid IDs and the borrower's signature.
 router.post('/loans', loanApplicationUpload, createLoanWithIds);
@@ -30,6 +32,7 @@ router.get('/loans/:id', getLoan);
 router.get('/loans/:id/id-documents/:holder', downloadLoanId);
 router.get('/loans/:id/borrower-signature', downloadLoanSignature);
 router.post('/loans/:id/payments', recordPayment);
+router.post('/loans/:id/restructure', restructureLoanRequest);
 router.get('/loan-payments', listPayments);
 router.get('/loan-requests', listLoanRequests);
 router.patch('/loan-requests/:id', reviewLoanRequest);

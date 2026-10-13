@@ -4,12 +4,46 @@ import { badRequest, notFound } from '../utils/http.js';
 import { toCents } from '../utils/money.js';
 import { centsToNumber, netIncomeCents } from '../services/netIncome.js';
 import { computeDividend, DIVIDEND_POOL_PERCENT, PATRONAGE_POOL_PERCENT, STATUTORY_PERCENT } from '../services/dividends.js';
+import { ACTIVITY_POINTS, computePatronageRefund, participationPoints, PESOS_PER_BUSINESS_POINT } from '../services/patronage.js';
+
+// The business and the activities attended between $1 and $2, of the member
+// ($3) and of all current members, for the patronage refund (see
+// services/patronage.js). Business is counted as the net income counts it:
+// rental fees of rentals started (a rental also recorded as a service counts
+// once, as the service), service fees collected, and loan interest paid.
+const PATRONAGE_SQL = `
+  WITH current_members AS (SELECT id FROM members WHERE status <> 'archived'),
+  business AS (
+    SELECT mo.member_id, 'machinery' AS service, mo.rental_fee AS amount FROM machinery_operations mo
+    WHERE mo.start_date BETWEEN $1::date AND $2::date
+      AND NOT EXISTS (SELECT 1 FROM machinery_services s WHERE s.rental_request_id = mo.rental_request_id)
+    UNION ALL
+    SELECT s.member_id, 'machinery', p.amount FROM machinery_service_payments p JOIN machinery_services s ON s.id = p.service_id
+    WHERE p.payment_date BETWEEN $1::date AND $2::date
+    UNION ALL
+    SELECT l.member_id, 'loans', lp.interest_paid FROM loan_payments lp JOIN loans l ON l.id = lp.loan_id
+    WHERE lp.payment_date BETWEEN $1::date AND $2::date
+  ),
+  attended AS (
+    SELECT aa.member_id, a.category FROM activity_attendance aa JOIN activities a ON a.id = aa.activity_id
+    WHERE a.status = 'completed' AND a.attendance_finalized_at IS NOT NULL
+      AND aa.attendance_status IN ('present', 'late') AND a.activity_date BETWEEN $1::date AND $2::date
+  )
+  SELECT
+    (SELECT COALESCE(SUM(amount) FILTER (WHERE service = 'machinery'), 0) FROM business WHERE member_id = $3) AS machinery,
+    (SELECT COALESCE(SUM(amount) FILTER (WHERE service = 'loans'), 0) FROM business WHERE member_id = $3) AS loans,
+    (SELECT COALESCE(SUM(amount), 0) FROM business WHERE member_id IN (SELECT id FROM current_members)) AS "totalBusiness",
+    (SELECT COALESCE(json_object_agg(category, n), '{}') FROM
+      (SELECT category, COUNT(*)::int AS n FROM attended WHERE member_id = $3 GROUP BY category) t) AS attended,
+    (SELECT COALESCE(json_object_agg(category, n), '{}') FROM
+      (SELECT category, COUNT(*)::int AS n FROM attended WHERE member_id IN (SELECT id FROM current_members) GROUP BY category) t) AS "totalAttended"`;
 
 // GET /api/members/me/dividend?year=YYYY
 // The signed-in member's dividend for a calendar year (default: this year, to
 // date), from the year's net income and the paid-up share capital at the end
-// of the year. An estimate from the records: the General Assembly declares the
-// actual dividend.
+// of the year, and their patronage refund from the business they did with the
+// cooperative and the activities they attended that year. Estimates from the
+// records: the General Assembly declares the actual dividend and refund.
 export async function getMyDividend(req, res) {
   const memberId = Number(req.user?.member_id);
   if (!Number.isInteger(memberId) || memberId <= 0) throw notFound('No member record is linked to this account.');
@@ -22,7 +56,7 @@ export async function getMyDividend(req, res) {
   const yearComplete = year < thisYear;
   const asOf = yearComplete ? `${year}-12-31` : today;
 
-  const [member, shares, income] = await Promise.all([
+  const [member, shares, income, patronageRows] = await Promise.all([
     query(`SELECT EXTRACT(YEAR FROM membership_date)::int AS "joinedYear" FROM members WHERE id = $1 AND status <> 'archived'`, [memberId]),
     query(
       `SELECT COALESCE(SUM(sc.amount) FILTER (WHERE sc.member_id = $1), 0) AS member,
@@ -32,10 +66,19 @@ export async function getMyDividend(req, res) {
       [memberId, asOf]
     ),
     netIncomeCents({ from, to: asOf }),
+    query(PATRONAGE_SQL, [from, asOf, memberId]),
   ]);
   if (!member.rows[0]) throw notFound('Linked member record not found.');
 
   const result = computeDividend({ netIncomeCents: income.total, memberShareCents: toCents(shares.rows[0].member), totalShareCents: toCents(shares.rows[0].total) });
+  const activity = patronageRows.rows[0];
+  const patronage = computePatronageRefund({
+    poolCents: result.patronageRefundPool,
+    memberBusiness: { machinery: toCents(activity.machinery), loans: toCents(activity.loans) },
+    memberAttended: activity.attended,
+    totalBusinessCents: toCents(activity.totalBusiness),
+    totalParticipationPoints: participationPoints(activity.totalAttended),
+  });
   const peso = centsToNumber;
   return res.json({
     success: true,
@@ -54,6 +97,26 @@ export async function getMyDividend(req, res) {
       totalShareCapital: peso(result.totalShare),
       shareRatio: result.shareRatio,
       dividend: peso(result.dividend),
+      patronage: {
+        rules: { pesosPerBusinessPoint: PESOS_PER_BUSINESS_POINT, activityPoints: ACTIVITY_POINTS },
+        // Percent of the pool shared by each kind of points (100 and 0 when no member has points of one kind).
+        weights: patronage.weights,
+        businessPool: peso(patronage.businessPool),
+        participationPool: peso(patronage.participationPool),
+        business: Object.fromEntries(Object.entries(patronage.memberBusiness).map(([key, cents]) => [key, peso(cents)])),
+        businessPoints: patronage.businessPoints,
+        totalBusiness: peso(patronage.totalBusinessCents),
+        totalBusinessPoints: patronage.totalBusinessPoints,
+        attended: patronage.memberAttended,
+        participationPoints: patronage.participationPoints,
+        totalParticipationPoints: patronage.totalParticipationPoints,
+        businessShare: patronage.businessShare,
+        participationShare: patronage.participationShare,
+        poolShare: patronage.poolShare,
+        businessRefund: peso(patronage.businessRefund),
+        participationRefund: peso(patronage.participationRefund),
+        refund: peso(patronage.refund),
+      },
     },
   });
 }
