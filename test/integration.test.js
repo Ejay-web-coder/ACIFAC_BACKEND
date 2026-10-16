@@ -59,6 +59,7 @@ class Client {
   post(url, body, options = {}) { return this.request('POST', url, { ...options, body }); }
   patch(url, body, options = {}) { return this.request('PATCH', url, { ...options, body }); }
   put(url, body) { return this.request('PUT', url, { body }); }
+  delete(url) { return this.request('DELETE', url); }
 }
 
 // AI reads the applicant's valid ID (a back-to-back copy with 3 specimen
@@ -816,16 +817,20 @@ test('machinery: the office rents to a non-member by name only', { skip }, async
 });
 
 test('machinery services: dated rates, fees, payments, expenses and the PhilMech report', { skip }, async () => {
-  // Seeded by sql/017 and sql/038: per-service machines stay out of the per-day booking.
+  // Seeded by sql/017, sql/038 and sql/041: per-service machines stay out of the per-day booking.
   const fleet = (await admin.get('/api/machinery')).data.machinery;
   const tractor = fleet.find((row) => row.name === 'Hand Tractor 2');
   const harvester = fleet.find((row) => row.name === 'Harvester' && row.pricingMode === 'per_service');
-  // ACIFAC's fleet: 2 harvesters, 2 hand tractors, 2 rotavators, a water pump and a rice thresher.
+  // ACIFAC's fleet: 2 harvesters, 2 hand tractors (both per service since 041), 2 rotavators, a water pump and a rice thresher.
   const seeded = fleet.filter((row) => row.id <= 'M-008').map((row) => [row.id, row.name, row.pricingMode]);
   assert.deepEqual(seeded, [
-    ['M-001', 'Hand Tractor (Kubota)', 'per_day'], ['M-002', 'Rice Thresher', 'per_day'], ['M-003', 'Water Pump', 'per_day'], ['M-004', 'Rotavator', 'per_day'],
+    ['M-001', 'Hand Tractor', 'per_service'], ['M-002', 'Rice Thresher', 'per_day'], ['M-003', 'Water Pump', 'per_day'], ['M-004', 'Rotavator', 'per_day'],
     ['M-005', 'Harvester', 'per_service'], ['M-006', 'Hand Tractor 2', 'per_service'], ['M-007', 'Harvester 2', 'per_service'], ['M-008', 'Rotavator 2', 'per_day'],
   ]);
+  const handTractorRates = (await admin.get('/api/machinery/M-001/rates')).data.rates;
+  assert.deepEqual(handTractorRates.map((rate) => [rate.serviceType, rate.unit, rate.memberRate, rate.nonMemberRate, rate.effectiveFrom, rate.effectiveTo]).sort(),
+    [['Rotavator', 'per_ha', '3800.00', '4000.00', '2026-10-15', null], ['Squadrone', 'per_ha', '3400.00', '3400.00', '2026-10-15', null], ['Tudling', 'per_ha', '1800.00', '1800.00', '2026-10-15', null]],
+    'Hand Tractor 2\'s rates in force on 2026-10-15, from that day');
   const harvester2 = fleet.find((row) => row.id === 'M-007');
   const rotavator2 = fleet.find((row) => row.id === 'M-008');
   assert.deepEqual([harvester2.acquisitionDate, harvester2.condition, harvester2.deliveryDate, harvester2.parentMachineryId], ['2026-10-09', 'operational', null, null]);
@@ -839,7 +844,24 @@ test('machinery services: dated rates, fees, payments, expenses and the PhilMech
   assert.equal(harvester.deliveryDate, '2020-12-08');
   assert.equal(fleet.find((row) => row.id === 'M-004').parentMachineryId, tractor.id);
   const catalog = (await member.get('/api/machinery/catalog')).data.machinery;
-  assert.ok(catalog.every((row) => row.id !== tractor.id && row.id !== harvester.id));
+  assert.ok(catalog.every((row) => row.id !== tractor.id && row.id !== harvester.id && row.id !== 'M-001'));
+
+  // Day rentals (shown under Services): every booking, with the machine's current name and the fee per day.
+  assert.equal((await member.get('/api/machinery/day-rentals')).status, 403);
+  const dayRentals = (await admin.get('/api/machinery/day-rentals?limit=200')).data;
+  const bookings = (await pool.query('SELECT COUNT(*)::int AS count, COALESCE(SUM(duration), 0)::int AS days, COALESCE(SUM(rental_fee), 0) AS fees FROM machinery_operations')).rows[0];
+  assert.deepEqual([dayRentals.totals.count, dayRentals.totals.days, Number(dayRentals.totals.rentalFees)], [bookings.count, bookings.days, Number(bookings.fees)]);
+  assert.ok(dayRentals.rentals.length > 0, 'the machinery tests before this one booked machines');
+  for (const rental of dayRentals.rentals) {
+    assert.equal(Math.round(Number(rental.dailyFee) * 100) * rental.duration, Math.round(Number(rental.rentalFee) * 100));
+    assert.equal(rental.machineryName, fleet.find((row) => row.id === rental.machineryId).name);
+  }
+  const first = dayRentals.rentals[0];
+  const byMachine = (await admin.get(`/api/machinery/day-rentals?machineryId=${first.machineryId}&year=${first.startDate.slice(0, 4)}`)).data.rentals;
+  assert.ok(byMachine.length > 0 && byMachine.every((row) => row.machineryId === first.machineryId && row.startDate.startsWith(first.startDate.slice(0, 4))));
+  const byName = (await admin.get(`/api/machinery/day-rentals?search=${encodeURIComponent(first.memberName.slice(0, 4))}`)).data.rentals;
+  assert.ok(byName.some((row) => row.id === first.id));
+  assert.equal((await admin.get('/api/machinery/day-rentals?year=1999')).status, 400);
   assert.ok(catalog.some((row) => row.id === 'M-003'), 'per-day machines such as the Water Pump are still bookable');
   const perDay = await member.post('/api/machinery/requests', { machineryId: tractor.id, startDate: '2099-01-01', endDate: '2099-01-02', purpose: 'Plowing' });
   assert.equal(perDay.status, 409);
@@ -1950,6 +1972,31 @@ test('notifications, announcements and live updates', { skip }, async () => {
   assert.equal(list.data.data[0].title, 'General Assembly');
   assert.equal((await member.post('/api/announcements', { title: 'x', message: 'y' })).status, 403);
 
+  // Done: off the list, kept on record, the members' notification stays in their history.
+  const doneId = announcement.data.data.id;
+  const memberHas = async (id) => (await member.get('/api/notifications?limit=100')).data.data.some((note) => note.entityType === 'announcement' && String(note.entityId) === String(id));
+  assert.ok(await memberHas(doneId), 'the member was notified of the announcement');
+  assert.equal((await member.patch(`/api/announcements/${doneId}/done`)).status, 403);
+  assert.equal((await admin.patch(`/api/announcements/${doneId}/done`)).status, 200);
+  assert.ok(!(await admin.get('/api/announcements')).data.data.some((row) => row.id === doneId), 'a done announcement leaves the list');
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM announcements WHERE id = $1 AND archived_at IS NOT NULL', [doneId])).rows[0].n, 1, 'and stays on record');
+  assert.ok(await memberHas(doneId), 'the notification already sent stays');
+  assert.equal((await admin.patch(`/api/announcements/${doneId}/done`)).status, 404, 'already done');
+
+  // Delete: gone for everyone, notifications included; the audit log keeps its text.
+  const mistake = (await admin.post('/api/announcements', { title: 'Wrong date', message: 'Posted by mistake', audience: 'All Members' })).data.data;
+  assert.ok(await memberHas(mistake.id));
+  assert.equal((await member.delete(`/api/announcements/${mistake.id}`)).status, 403);
+  const deleted = await admin.delete(`/api/announcements/${mistake.id}`);
+  assert.equal(deleted.status, 200);
+  assert.ok(deleted.data.data.notificationsRemoved >= 1);
+  assert.ok(!(await member.get('/api/announcements')).data.data.some((row) => row.id === mistake.id));
+  assert.ok(!(await memberHas(mistake.id)), 'the member\'s notification is removed too');
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM announcements WHERE id = $1', [mistake.id])).rows[0].n, 0);
+  const audit = (await pool.query(`SELECT old_values FROM audit_logs WHERE action = 'ANNOUNCEMENT_DELETED' AND entity_id = $1`, [String(mistake.id)])).rows[0];
+  assert.equal(audit.old_values.title, 'Wrong date');
+  assert.equal((await admin.delete(`/api/announcements/${mistake.id}`)).status, 404);
+
   const notes = await member.get('/api/notifications');
   assert.ok(notes.data.unreadCount > 0);
   const first = notes.data.data[0];
@@ -1972,6 +2019,60 @@ test('dashboard and analytics use real data', { skip }, async () => {
   const juan = analytics.data.memberAnalytics.find((row) => row.databaseId === state.memberId);
   assert.equal(juan.totalPaid, 51250);
   assert.ok(analytics.data.methodology.onTimePaymentRate);
+
+  // Loan disbursement: every month (0 without a loan), each with its change from the month before.
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const thisMonth = todayDateOnly().slice(0, 7);
+  const year = thisMonth.slice(0, 4);
+  const monthAfter = (month) => { const [y, m] = month.split('-').map(Number); return m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`; };
+  const checkMonths = (rows) => rows.forEach((row, index) => {
+    if (index > 0) assert.equal(row.month, monthAfter(rows[index - 1].month), 'consecutive months');
+    if (index > 0) assert.equal(row.previous, rows[index - 1].amount);
+    assert.equal(Math.round(row.change * 100), Math.round((row.amount - row.previous) * 100));
+    if (row.previous > 0) assert.ok(Math.abs(row.changePercent - ((row.amount - row.previous) / row.previous) * 100) <= 0.05, `${row.month} percent`);
+    else assert.equal(row.changePercent, null, 'no percentage of a month without loans');
+  });
+  const yearRows = (await admin.get(`/api/admin/analytics?from=${year}-01-01&to=${year}-12-31`)).data.loans;
+  assert.equal(yearRows[0].month, `${year}-01`, 'a year shows its own months');
+  assert.equal(yearRows.at(-1).month, thisMonth, 'never past the current month');
+  checkMonths(yearRows);
+  const disbursed = (await pool.query(`SELECT COALESCE(SUM(amount), 0) AS total FROM loans WHERE date_approved BETWEEN $1 AND $2`, [`${year}-01-01`, `${year}-12-31`])).rows[0].total;
+  assert.equal(Math.round(yearRows.reduce((sum, row) => sum + row.amount, 0) * 100), Math.round(Number(disbursed) * 100));
+  assert.ok(yearRows.some((row) => row.amount > 0), 'the loans in these tests were approved this year');
+  const monthRows = (await admin.get(`/api/admin/analytics?from=${thisMonth}-01&to=${thisMonth}-28`)).data.loans;
+  assert.equal(monthRows.length, 12, 'a month shows the 12 months up to it');
+  assert.equal(monthRows.at(-1).month, thisMonth);
+  checkMonths(monthRows);
+  assert.deepEqual((await admin.get(`/api/admin/analytics?from=${Number(year) + 1}-01-01&to=${Number(year) + 1}-12-31`)).data.loans, [], 'nothing for a year still to come');
+
+  // Revenue over time: 30 days, 12 months or 5 years, each source adding up to the Operating revenue figures.
+  const todayDate = todayDateOnly();
+  const trend = {};
+  for (const granularity of ['day', 'month', 'year']) {
+    const response = await admin.get(`/api/admin/analytics/revenue?granularity=${granularity}`);
+    assert.equal(response.status, 200, JSON.stringify(response.data));
+    trend[granularity] = response.data;
+    assert.equal(response.data.rows.length, { day: 30, month: 12, year: 5 }[granularity], `${granularity}: every ${granularity} of the window`);
+    assert.equal(response.data.to, todayDate);
+    for (const row of response.data.rows) assert.equal(Math.round(row.total * 100), Math.round((row.kadiwa + row.machinery + row.loanInterest) * 100));
+  }
+  assert.equal(trend.day.rows.at(-1).start, todayDate);
+  assert.equal(trend.month.rows.at(-1).start, `${thisMonth}-01`);
+  assert.equal(trend.year.rows.at(-1).start, `${year}-01-01`);
+  assert.equal(trend.year.rows[0].start, `${Number(year) - 4}-01-01`);
+  // The same sources as the Operating revenue figure, over the same days.
+  const sameWindow = (await admin.get(`/api/admin/analytics?from=${trend.year.from}&to=${todayDate}`)).data.summary;
+  assert.equal(Math.round(trend.year.totals.kadiwa * 100), Math.round(sameWindow.kadiwaNetSales * 100));
+  assert.equal(Math.round(trend.year.totals.machinery * 100), Math.round(sameWindow.machineryRevenue * 100));
+  assert.equal(Math.round(trend.year.totals.loanInterest * 100), Math.round(sameWindow.interestCollected * 100));
+  assert.equal(Math.round(trend.year.totals.total * 100), Math.round(sameWindow.totalOperatingRevenue * 100));
+  assert.ok(trend.year.totals.total > 0, 'these tests recorded income this year');
+  // An earlier end date moves the window; a later one stops at today.
+  const march = (await admin.get(`/api/admin/analytics/revenue?granularity=month&to=${year}-03-15`)).data;
+  assert.deepEqual([march.rows[0].start, march.rows.at(-1).start, march.rows.at(-1).label], [`${Number(year) - 1}-04-01`, `${year}-03-01`, `Mar ${year}`]);
+  assert.equal((await admin.get(`/api/admin/analytics/revenue?granularity=day&to=${Number(year) + 1}-01-01`)).data.to, todayDate);
+  assert.equal((await admin.get('/api/admin/analytics/revenue?granularity=week')).status, 400);
+  assert.equal((await member.get('/api/admin/analytics/revenue')).status, 403);
 
   // What needs the admin's attention: counts the dashboard turns into links.
   for (const key of ['overdueLoans', 'loansDueThisWeek', 'pendingLoanRequests', 'pendingRentalRequests', 'scheduledOperations', 'lowStockItems']) {

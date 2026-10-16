@@ -4,7 +4,7 @@ import { requireAdmin, requireAuth } from '../middleware/auth.js';
 import { downloadLoanId, downloadLoanRequestId, downloadLoanRequestSignature, downloadLoanSignature, getLoan, listLoanRequests, listLoans, listPayments, recordPayment, restructureLoanRequest, reviewLoanRequest } from '../controllers/loanController.js';
 import { createLoanWithIds } from '../controllers/loanIdController.js';
 import { loanApplicationUpload } from '../middleware/upload.js';
-import { adviseMemberCredit, getAnalytics, getDashboard, getMachineryAnalytics, listShareCapitalBandMembers, recommendMachinery } from '../controllers/analyticsController.js';
+import { adviseMemberCredit, getAnalytics, getDashboard, getMachineryAnalytics, getRevenueTrend, listShareCapitalBandMembers, recommendMachinery } from '../controllers/analyticsController.js';
 
 const router = express.Router();
 
@@ -21,6 +21,7 @@ router.get('/audit-logs', listAuditLogs);
 router.post('/email-test', sendEmailTest);
 router.get('/analytics', getAnalytics);
 router.get('/dashboard/share-capital/:band', listShareCapitalBandMembers);
+router.get('/analytics/revenue', getRevenueTrend);
 router.get('/analytics/machinery', getMachineryAnalytics);
 router.post('/analytics/machinery/recommendations', recommendMachinery);
 // A short AI suggestion on lending to a member again, from how they repaid (Member Credit History).

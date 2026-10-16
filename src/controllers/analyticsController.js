@@ -136,10 +136,32 @@ export async function getAnalytics(req, res) {
         (SELECT COALESCE(SUM(lr.maximum_eligible_amount), 0) FROM loan_requests lr WHERE ${localDate('lr.submitted_at')} BETWEEN $1::date AND $2::date) AS "maximumEligibleAmount",
         (SELECT COALESCE(SUM(lr.total_repayment), 0) FROM loan_requests lr WHERE ${localDate('lr.submitted_at')} BETWEEN $1::date AND $2::date) AS "projectedRepayment"
     `, [from, to]),
+    // Loans disbursed month by month, every month including those without a
+    // loan, with the change from the month before. A period of a year or more
+    // shows its own months; a shorter one shows the 12 months up to its last
+    // month, so there is a trend to compare. Never past the current month.
     query(`
-      SELECT TO_CHAR(DATE_TRUNC('month', l.date_approved), 'Mon YYYY') AS period, COALESCE(SUM(l.amount), 0) AS amount, COUNT(*)::int AS count
-      FROM loans l WHERE l.date_approved BETWEEN $1::date AND $2::date
-      GROUP BY DATE_TRUNC('month', l.date_approved) ORDER BY DATE_TRUNC('month', l.date_approved)
+      WITH bounds AS (
+        SELECT DATE_TRUNC('month', $1::date)::date AS first_month,
+               DATE_TRUNC('month', LEAST($2::date, ${SQL_TODAY}))::date AS last_month,
+               DATE_TRUNC('month', $2::date)::date >= (DATE_TRUNC('month', $1::date) + INTERVAL '11 months')::date AS whole_year
+      ), span AS (
+        SELECT CASE WHEN whole_year THEN first_month ELSE (last_month - INTERVAL '11 months')::date END AS start_month, last_month
+        FROM bounds WHERE last_month >= first_month
+      ), months AS (
+        -- One month more at the start: the first month's change is measured from it.
+        SELECT generate_series((s.start_month - INTERVAL '1 month')::date, s.last_month, INTERVAL '1 month')::date AS month, s.start_month FROM span s
+      ), totals AS (
+        SELECT m.month, m.start_month, COALESCE(SUM(l.amount), 0) AS amount, COUNT(l.id)::int AS count
+        FROM months m LEFT JOIN loans l ON l.date_approved >= m.month AND l.date_approved < (m.month + INTERVAL '1 month')::date
+        GROUP BY m.month, m.start_month
+      ), compared AS (
+        SELECT month, start_month, amount, count, LAG(amount) OVER (ORDER BY month) AS previous FROM totals
+      )
+      SELECT TO_CHAR(month, 'Mon YYYY') AS period, TO_CHAR(month, 'YYYY-MM') AS month, amount, count, previous,
+             amount - previous AS change,
+             CASE WHEN previous > 0 THEN ROUND((amount - previous) / previous * 100, 1) END AS "changePercent"
+      FROM compared WHERE month >= start_month ORDER BY month
     `, [from, to]),
     query(`
       SELECT category, amount FROM (
@@ -270,7 +292,8 @@ export async function getAnalytics(req, res) {
       totalOperatingRevenue: toNumber(totals.interestCollected) + toNumber(totals.machineryRevenue) + toNumber(totals.kadiwaNetSales),
       paymentToOutstandingRate: loanPayments + outstandingBalance > 0 ? Number(((loanPayments / (loanPayments + outstandingBalance)) * 100).toFixed(1)) : 0,
     },
-    loans: mapRows(loans.rows, ['amount', 'count']),
+    // changePercent stays null when the month before had no loans (no percentage of zero).
+    loans: mapRows(loans.rows, ['amount', 'count', 'previous', 'change']).map((row) => ({ ...row, changePercent: row.changePercent === null ? null : Number(row.changePercent) })),
     revenue: mapRows(revenue.rows, ['amount']),
     machinery: mapRows(machinery.rows, ['operations', 'days', 'revenue']),
     sales: mapRows(sales.rows, ['gross', 'costOfGoods', 'sales', 'expenses', 'transactions']),
@@ -278,6 +301,57 @@ export async function getAnalytics(req, res) {
     repaymentRatings: ['Excellent', 'Good', 'Fair', 'Needs Improvement', 'Insufficient data'].map((rating) => ({ rating, members: memberRows.filter((member) => member.repaymentRating === rating).length })),
     loanCapacity: ['Strong', 'Good', 'Moderate', 'Needs Review'].map((assessment) => ({ assessment, members: recommendationCounts[assessment] || 0 })),
     methodology: METHODOLOGY,
+  });
+}
+
+// GET /api/admin/analytics/revenue?granularity=day|month|year&to=YYYY-MM-DD
+// The operating revenue over time, one line per source, as the Operating
+// revenue figure counts it: Kadiwa net sales (by sale date), machinery rentals
+// (by start date) and loan interest (by payment date). Every day, month or year
+// of the window is listed (0 without income), the window ending at `to` (today
+// at the latest): the last 30 days, the last 12 months or the last 5 years.
+const REVENUE_WINDOWS = { day: { count: 30, label: 'Mon FMDD' }, month: { count: 12, label: 'Mon YYYY' }, year: { count: 5, label: 'YYYY' } };
+
+export async function getRevenueTrend(req, res) {
+  const granularity = String(req.query.granularity || 'month');
+  const window = REVENUE_WINDOWS[granularity];
+  if (!window) throw badRequest('Granularity must be day, month or year.');
+  const today = todayDateOnly();
+  const asked = req.query.to === undefined ? today : String(req.query.to);
+  if (!isValidDateOnly(asked)) throw badRequest('The end date must be a valid YYYY-MM-DD date.');
+  const to = asked > today ? today : asked;
+  const rows = (await query(
+    `WITH bounds AS (
+       SELECT $2::date AS last_day,
+              (DATE_TRUNC($1, $2::date) - ($3::int - 1) * ('1 ' || $1)::interval)::date AS first_day
+     ), buckets AS (
+       SELECT generate_series(b.first_day, DATE_TRUNC($1, b.last_day)::date, ('1 ' || $1)::interval)::date AS start FROM bounds b
+     ), kadiwa AS (
+       SELECT DATE_TRUNC($1, ks.sale_date)::date AS start, SUM(ks.net_sales) AS amount
+       FROM kadiwa_sales ks, bounds b WHERE ks.sale_date BETWEEN b.first_day AND b.last_day AND ks.status = 'completed' GROUP BY 1
+     ), machinery AS (
+       SELECT DATE_TRUNC($1, mo.start_date)::date AS start, SUM(mo.rental_fee) AS amount
+       FROM machinery_operations mo, bounds b WHERE mo.start_date BETWEEN b.first_day AND b.last_day GROUP BY 1
+     ), interest AS (
+       SELECT DATE_TRUNC($1, lp.payment_date)::date AS start, SUM(lp.interest_paid) AS amount
+       FROM loan_payments lp, bounds b WHERE lp.payment_date BETWEEN b.first_day AND b.last_day GROUP BY 1
+     )
+     SELECT TO_CHAR(bk.start, 'YYYY-MM-DD') AS start, TO_CHAR(bk.start, $4) AS label,
+            COALESCE(k.amount, 0) AS kadiwa, COALESCE(m.amount, 0) AS machinery, COALESCE(i.amount, 0) AS "loanInterest"
+     FROM buckets bk
+     LEFT JOIN kadiwa k ON k.start = bk.start LEFT JOIN machinery m ON m.start = bk.start LEFT JOIN interest i ON i.start = bk.start
+     ORDER BY bk.start`,
+    [granularity, to, window.count, window.label]
+  )).rows.map((row) => {
+    const kadiwa = toNumber(row.kadiwa);
+    const machinery = toNumber(row.machinery);
+    const loanInterest = toNumber(row.loanInterest);
+    return { start: row.start, label: row.label, kadiwa, machinery, loanInterest, total: Math.round((kadiwa + machinery + loanInterest) * 100) / 100 };
+  });
+  const sum = (key) => Math.round(rows.reduce((total, row) => total + row[key] * 100, 0)) / 100;
+  return res.json({
+    success: true, granularity, from: rows[0]?.start ?? to, to,
+    rows, totals: { kadiwa: sum('kadiwa'), machinery: sum('machinery'), loanInterest: sum('loanInterest'), total: sum('total') },
   });
 }
 

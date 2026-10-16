@@ -8,6 +8,7 @@
     "dev": "node --watch src/server.js",
     "migrate": "node scripts/run-migrations.js",
     "create-admin": "node scripts/create-admin.js",
+    "seed": "node scripts/seed.js",
     "test": "node --test --test-concurrency=1"
   },
   "dependencies": {

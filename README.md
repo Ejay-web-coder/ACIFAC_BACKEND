@@ -36,6 +36,47 @@ ADMIN_USERNAME=admin ADMIN_EMAIL=you@example.com ADMIN_PASSWORD='A-Strong-Pass1!
 npm run dev
 ```
 
+### Sample data (seeder)
+
+```bash
+SUPABASE_DB_URL=postgres://postgres:postgres@localhost:5432/acifac_dev npm run seed            # migrate, then fill an empty database
+SUPABASE_DB_URL=postgres://postgres:postgres@localhost:5432/acifac_dev npm run seed -- --fresh # empty it first, then fill it
+SUPABASE_DB_URL=postgres://postgres:postgres@localhost:5432/acifac_dev npm run seed -- --add-members=500
+```
+
+In PowerShell, set the variable for the command and remove it afterwards, so `npm run dev` in the same
+terminal still uses `.env`:
+
+```powershell
+$env:SUPABASE_DB_URL='postgres://postgres:postgres@localhost:5432/acifac_dev'; npm run seed; Remove-Item Env:SUPABASE_DB_URL
+```
+
+`--add-members=N` adds N more members, each with an active login (`member001`, `member002`, ... /
+`Member@12345`, numbering continues on a second run). On an empty database it comes on top of the full
+sample data; on a database the seeder already filled it adds only these members.
+
+Fills a database with 15 members (share capital, savings), loan applications and loans with on-time,
+late and overdue payments, machinery services, rentals and expenses, ten days of Kadiwa sales,
+activities with attendance, and announcements. Dates are counted from today. It signs in as
+`admin` / `Admin@12345`; every member has an active login, first.lastname (`juan.delacruz`,
+`maria.santos`, ...) / `Member@12345`.
+
+* It only runs against a database on this computer, because `.env` points at the live one (set
+  `SUPABASE_DB_URL` for the command as above; `DATABASE_SSL=disable` is set for you). To fill a Supabase
+  database on purpose, set `SEED_ALLOW_REMOTE=true`, `SEED_ADMIN_PASSWORD` and `SEED_MEMBER_PASSWORD` (a strong
+  one: the sample logins are then on a public site; an existing administrator keeps their own password).
+* It refuses a database that already has members (`--add-members` only adds to one the seeder filled),
+  and `--fresh` (drop and re-migrate everything) is local only.
+* `--alongside-existing` adds the sample next to real members (the live database was filled this way on
+  2026-10-15, with `--add-members=500`). Real records are not touched: no announcements, no activity or rental
+  from today on, no attendance records for real members, and notifications about the sample come already
+  read for the office. Totals, reports and net income do include the sample records.
+* Everything is saved in one transaction, through the app's own code where it holds business rules
+  (`insertKadiwaSale`, `allocatePayment`, loan applications, ...) and a few statements per table for members,
+  share capital and savings, so it takes about 4 minutes against Supabase. Each part of the system is one
+  file in `scripts/seeders/`; to add one, export `async function (ctx)` from a new file and list it in
+  `SEEDERS` in `scripts/seed.js`.
+
 ### Tests
 
 ```bash

@@ -87,15 +87,33 @@ export async function createAnnouncement(req, res) {
   return res.status(201).json({ success: true, data: announcement, message: 'Announcement posted.' });
 }
 
-export async function archiveAnnouncement(req, res) {
+// PATCH /api/announcements/:id/done: the announcement has served its purpose
+// (the meeting took place). It leaves the list and is no longer given to new
+// accounts; it stays on record, and the notifications already sent stay in
+// people's history.
+export async function markAnnouncementDone(req, res) {
   const id = parseId(req.params.id, 'announcement ID');
   const result = await withTransaction(async (client) => {
     const row = (await client.query(`UPDATE announcements SET archived_at = NOW() WHERE id = $1 AND archived_at IS NULL RETURNING id, title`, [id])).rows[0];
     if (!row) throw notFound('Announcement not found.');
-    await createAuditLog({ client, user: req.user, action: 'ANNOUNCEMENT_REMOVED', module: 'Announcements', entityType: 'announcement', entityId: String(id), description: `Removed announcement "${row.title}"`, ...getRequestMeta(req) });
+    await createAuditLog({ client, user: req.user, action: 'ANNOUNCEMENT_DONE', module: 'Announcements', entityType: 'announcement', entityId: String(id), description: `Marked announcement "${row.title}" as done`, ...getRequestMeta(req) });
     return row;
   });
-  return res.json({ success: true, data: result });
+  return res.json({ success: true, data: result, message: 'Announcement marked as done.' });
+}
+
+// DELETE /api/announcements/:id: posted by mistake. The announcement and the
+// notifications it sent are removed for everyone; the audit log keeps its text.
+export async function deleteAnnouncement(req, res) {
+  const id = parseId(req.params.id, 'announcement ID');
+  const result = await withTransaction(async (client) => {
+    const row = (await client.query('DELETE FROM announcements WHERE id = $1 RETURNING id, title, message, audience', [id])).rows[0];
+    if (!row) throw notFound('Announcement not found.');
+    const removed = await client.query(`DELETE FROM notifications WHERE type = 'announcement' AND entity_type = 'announcement' AND entity_id = $1`, [String(id)]);
+    await createAuditLog({ client, user: req.user, action: 'ANNOUNCEMENT_DELETED', module: 'Announcements', entityType: 'announcement', entityId: String(id), description: `Deleted announcement "${row.title}"`, oldValues: { title: row.title, message: row.message, audience: row.audience }, newValues: { notifications_removed: removed.rowCount }, ...getRequestMeta(req) });
+    return { id: row.id, title: row.title, notificationsRemoved: removed.rowCount };
+  });
+  return res.json({ success: true, data: result, message: 'Announcement deleted.' });
 }
 
 // ----- Cooperative legal documents (admin) ---------------------------------

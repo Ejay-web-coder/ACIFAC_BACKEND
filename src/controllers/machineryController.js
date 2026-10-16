@@ -116,6 +116,38 @@ export async function listMachineryData(req, res) {
   });
 }
 
+// GET /api/machinery/day-rentals: the machines rented by the day, for the
+// table under Services. Each booking with the machine's current name and the
+// daily fee it was booked at, filtered like the services (machine, year it
+// started, renter's name), with totals for all that match.
+export async function listDayRentals(req, res) {
+  refreshRentalStatusesInBackground();
+  const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 25, maxLimit: 200 });
+  const where = [];
+  const params = [];
+  const add = (sql, value) => { params.push(value); where.push(sql.replace('?', `$${params.length}`)); };
+  if (req.query.machineryId) add('o.machinery_id = ?', cleanString(req.query.machineryId, 20));
+  if (req.query.year) {
+    const year = Number(req.query.year);
+    if (!Number.isInteger(year) || year < 2000 || year > 2100) throw badRequest('Choose a valid year.');
+    add('EXTRACT(YEAR FROM o.start_date)::int = ?', year);
+  }
+  if (req.query.search) add(`o.member_name ILIKE '%' || ? || '%'`, cleanString(req.query.search, 100));
+  const filter = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const [rows, totals] = await Promise.all([
+    query(
+      `SELECT o.id, o.machinery_id AS "machineryId", COALESCE(mc.name, o.machinery_name) AS "machineryName", o.client_category AS "clientCategory",
+              o.member_name AS "memberName", m.member_number AS "memberNumber", o.purpose, o.start_date AS "startDate", o.end_date AS "endDate",
+              o.duration, ROUND(o.rental_fee / o.duration, 2) AS "dailyFee", o.rental_fee AS "rentalFee", o.status
+       FROM machinery_operations o LEFT JOIN members m ON m.id = o.member_id LEFT JOIN machinery mc ON mc.id = o.machinery_id
+       ${filter} ORDER BY o.start_date DESC, o.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
+    ),
+    query(`SELECT COUNT(*)::int AS count, COALESCE(SUM(o.duration), 0)::int AS days, COALESCE(SUM(o.rental_fee), 0) AS "rentalFees" FROM machinery_operations o ${filter}`, params),
+  ]);
+  return res.json({ success: true, rentals: rows.rows, totals: totals.rows[0], pagination: paginationMeta(page, limit, totals.rows[0].count) });
+}
+
 // Minimal catalogue for members: no member data, only availability. Machines
 // paid per service (per hectare or per 100 bags) are not booked by the day.
 export async function listMachineryCatalog(req, res) {

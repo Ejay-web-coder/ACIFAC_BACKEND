@@ -1,7 +1,7 @@
 import express from 'express';
 import {
-  archiveAnnouncement, createAnnouncement, deleteLegalDocument, downloadLegalDocument, listAnnouncements, listLegalDocuments,
-  listNotifications, markAllNotificationsRead, markNotificationRead, uploadLegalDocument,
+  createAnnouncement, deleteAnnouncement, deleteLegalDocument, downloadLegalDocument, listAnnouncements, listLegalDocuments,
+  listNotifications, markAllNotificationsRead, markAnnouncementDone, markNotificationRead, uploadLegalDocument,
 } from '../controllers/communicationController.js';
 import { requireAdmin, requireAuth } from '../middleware/auth.js';
 import { legalDocumentUpload } from '../middleware/upload.js';
@@ -17,7 +17,8 @@ export const announcementRoutes = express.Router()
   .use(requireAuth)
   .get('/', listAnnouncements)
   .post('/', requireAdmin, createAnnouncement)
-  .delete('/:id', requireAdmin, archiveAnnouncement);
+  .patch('/:id/done', requireAdmin, markAnnouncementDone)
+  .delete('/:id', requireAdmin, deleteAnnouncement);
 
 export const legalDocumentRoutes = express.Router()
   .use(requireAuth, requireAdmin)
