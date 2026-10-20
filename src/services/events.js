@@ -12,6 +12,7 @@ import { getRequestMeta } from '../utils/http.js';
 const ADMIN_ONLY_TABLES = new Set([
   'users', 'kadiwa_inventory', 'kadiwa_sales', 'document_scans',
   'machinery_services', 'machinery_service_payments', 'machinery_service_rates', 'machinery_expenses', 'machinery_period_balances',
+  'machinery_rental_payments',
 ]);
 // Activities (meetings, trainings...) are shown to every member as upcoming
 // activities; attendance rows reach only the member they belong to.

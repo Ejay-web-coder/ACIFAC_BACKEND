@@ -3,7 +3,7 @@ import { SQL_TODAY } from '../config/env.js';
 import { createAuditLog } from '../utils/audit.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { badRequest, cleanString, conflict, currentUserId, forbidden, getRequestMeta, notFound, optionalString, paginationMeta, parseId, parsePagination } from '../utils/http.js';
-import { centsToString, parseMoneyInput } from '../utils/money.js';
+import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import { notifyAdmins, notifyMember } from '../services/notificationService.js';
 import { sendEmailSafely } from '../services/emailService.js';
 import { rentalDecisionEmail, rentalRequestReceivedEmail } from '../services/emailTemplates.js';
@@ -116,10 +116,43 @@ export async function listMachineryData(req, res) {
   });
 }
 
-// GET /api/machinery/day-rentals: the machines rented by the day, for the
-// table under Services. Each booking with the machine's current name and the
-// daily fee it was booked at, filtered like the services (machine, year it
-// started, renter's name), with totals for all that match.
+// A day rental with what has been paid for it: its own payments, or the
+// service's when the rental is also recorded as a service (it is paid there).
+const RENTAL_PAYMENT_STATUSES = ['unpaid', 'partial', 'full'];
+const RENTAL_PAID_SQL = 'COALESCE(svc.amount_paid, pay.amount_paid)';
+const RENTAL_BALANCE_SQL = 'COALESCE(svc.balance, o.rental_fee - pay.amount_paid)';
+const RENTAL_PAYMENT_STATUS_SQL = `COALESCE(svc.payment_status, CASE WHEN pay.amount_paid >= o.rental_fee THEN 'full' WHEN pay.amount_paid > 0 THEN 'partial' ELSE 'unpaid' END)`;
+const dayRentalFrom = `
+  FROM machinery_operations o
+  LEFT JOIN members m ON m.id = o.member_id
+  LEFT JOIN machinery mc ON mc.id = o.machinery_id
+  LEFT JOIN LATERAL (
+    SELECT s.id, s.amount_paid, s.balance, s.payment_status FROM machinery_services s
+    WHERE s.rental_request_id = o.rental_request_id ORDER BY s.id LIMIT 1
+  ) svc ON TRUE
+  CROSS JOIN LATERAL (
+    SELECT COALESCE(SUM(p.amount), 0) AS amount_paid, MAX(p.payment_date) AS last_payment_date
+    FROM machinery_rental_payments p WHERE p.operation_id = o.id
+  ) pay`;
+const dayRentalSelect = `
+  SELECT o.id, o.machinery_id AS "machineryId", COALESCE(mc.name, o.machinery_name) AS "machineryName", o.client_category AS "clientCategory",
+         o.member_name AS "memberName", m.member_number AS "memberNumber", o.purpose, o.start_date AS "startDate", o.end_date AS "endDate",
+         o.duration, ROUND(o.rental_fee / o.duration, 2) AS "dailyFee", o.rental_fee AS "rentalFee", o.status,
+         ${RENTAL_PAID_SQL} AS "amountPaid", ${RENTAL_BALANCE_SQL} AS balance, ${RENTAL_PAYMENT_STATUS_SQL} AS "paymentStatus",
+         svc.id AS "serviceId", pay.last_payment_date AS "lastPaymentDate"
+  ${dayRentalFrom}`;
+const rentalPaymentSelect = `
+  SELECT p.id, p.operation_id AS "rentalId", p.amount, p.payment_date AS "paymentDate", p.notes,
+         u.username AS "recordedBy", p.created_at AS "createdAt"
+  FROM machinery_rental_payments p LEFT JOIN users u ON u.id = p.recorded_by`;
+
+const rentalPayments = (id) => query(`${rentalPaymentSelect} WHERE p.operation_id = $1 ORDER BY p.payment_date, p.id`, [id]).then((result) => result.rows);
+const pesoText = (value) => `₱${Number(value).toLocaleString('en-PH', { minimumFractionDigits: 2 })}`;
+
+// GET /api/machinery/day-rentals: the machines rented by the day, for the Day
+// Rentals tab. Each booking with the machine's current name, the daily fee it
+// was booked at and what has been paid, filtered by machine, year it started,
+// payment status and renter's name, with totals for all that match.
 export async function listDayRentals(req, res) {
   refreshRentalStatusesInBackground();
   const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 25, maxLimit: 200 });
@@ -132,20 +165,74 @@ export async function listDayRentals(req, res) {
     if (!Number.isInteger(year) || year < 2000 || year > 2100) throw badRequest('Choose a valid year.');
     add('EXTRACT(YEAR FROM o.start_date)::int = ?', year);
   }
+  if (req.query.paymentStatus) {
+    if (!RENTAL_PAYMENT_STATUSES.includes(req.query.paymentStatus)) throw badRequest('Payment status must be unpaid, partial or full.');
+    add(`${RENTAL_PAYMENT_STATUS_SQL} = ?`, req.query.paymentStatus);
+  }
   if (req.query.search) add(`o.member_name ILIKE '%' || ? || '%'`, cleanString(req.query.search, 100));
   const filter = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const [rows, totals] = await Promise.all([
+    query(`${dayRentalSelect} ${filter} ORDER BY o.start_date DESC, o.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`, [...params, limit, offset]),
     query(
-      `SELECT o.id, o.machinery_id AS "machineryId", COALESCE(mc.name, o.machinery_name) AS "machineryName", o.client_category AS "clientCategory",
-              o.member_name AS "memberName", m.member_number AS "memberNumber", o.purpose, o.start_date AS "startDate", o.end_date AS "endDate",
-              o.duration, ROUND(o.rental_fee / o.duration, 2) AS "dailyFee", o.rental_fee AS "rentalFee", o.status
-       FROM machinery_operations o LEFT JOIN members m ON m.id = o.member_id LEFT JOIN machinery mc ON mc.id = o.machinery_id
-       ${filter} ORDER BY o.start_date DESC, o.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-      [...params, limit, offset]
+      `SELECT COUNT(*)::int AS count, COALESCE(SUM(o.duration), 0)::int AS days, COALESCE(SUM(o.rental_fee), 0) AS "rentalFees",
+              COALESCE(SUM(${RENTAL_PAID_SQL}), 0) AS "amountPaid", COALESCE(SUM(${RENTAL_BALANCE_SQL}), 0) AS balance
+       ${dayRentalFrom} ${filter}`,
+      params
     ),
-    query(`SELECT COUNT(*)::int AS count, COALESCE(SUM(o.duration), 0)::int AS days, COALESCE(SUM(o.rental_fee), 0) AS "rentalFees" FROM machinery_operations o ${filter}`, params),
   ]);
   return res.json({ success: true, rentals: rows.rows, totals: totals.rows[0], pagination: paginationMeta(page, limit, totals.rows[0].count) });
+}
+
+// GET /api/machinery/day-rentals/:id: one rental with its payments.
+export async function getDayRental(req, res) {
+  const id = parseId(req.params.id, 'rental ID');
+  const rental = (await query(`${dayRentalSelect} WHERE o.id = $1`, [id])).rows[0];
+  if (!rental) throw notFound('Rental not found.');
+  return res.json({ success: true, rental, payments: await rentalPayments(id) });
+}
+
+// POST /api/machinery/day-rentals/:id/payments: money received for a rental,
+// up to its balance. The rental row is locked so two payments cannot both fit.
+export async function receiveRentalPayment(req, res) {
+  const id = parseId(req.params.id, 'rental ID');
+  const amount = parseMoneyInput(req.body?.amount, { allowZero: false });
+  if (amount === null) throw badRequest('Payment must be an amount above zero with at most 2 decimals.');
+  const paymentDate = cleanString(req.body?.paymentDate, 10);
+  if (!isValidDateOnly(paymentDate)) throw badRequest('A valid payment date is required.');
+  if (paymentDate > todayDateOnly()) throw badRequest('The payment date cannot be in the future.');
+  const notes = cleanString(req.body?.notes, 500);
+  const rental = await withTransaction(async (client) => {
+    await client.query('SELECT id FROM machinery_operations WHERE id = $1 FOR UPDATE', [id]);
+    const before = (await client.query(`${dayRentalSelect} WHERE o.id = $1`, [id])).rows[0];
+    if (!before) throw notFound('Rental not found.');
+    if (before.serviceId) throw conflict('This rental is also recorded as a service. Receive its payment under Services.');
+    if (amount > toCents(before.balance)) throw badRequest(`The payment is more than the balance of ${pesoText(before.balance)}.`);
+    const payment = (await client.query(
+      'INSERT INTO machinery_rental_payments (operation_id, amount, payment_date, notes, recorded_by) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+      [id, centsToString(amount), paymentDate, notes, currentUserId(req)]
+    )).rows[0];
+    const after = (await client.query(`${dayRentalSelect} WHERE o.id = $1`, [id])).rows[0];
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_RENTAL_PAYMENT_RECEIVED', module: 'Machinery', entityType: 'machinery_rental_payment', entityId: String(payment.id), description: `Received payment from ${after.memberName} for the ${after.machineryName} rental`, oldValues: { amount_paid: before.amountPaid, balance: before.balance, payment_status: before.paymentStatus }, newValues: { amount: centsToString(amount), payment_date: paymentDate, amount_paid: after.amountPaid, balance: after.balance, payment_status: after.paymentStatus }, ...getRequestMeta(req) });
+    return after;
+  });
+  return res.status(201).json({ success: true, rental, payments: await rentalPayments(id) });
+}
+
+// DELETE /api/machinery/day-rentals/:id/payments/:paymentId: a payment entered
+// by mistake; the balance goes back up and the audit log keeps the payment.
+export async function voidRentalPayment(req, res) {
+  const id = parseId(req.params.id, 'rental ID');
+  const paymentId = parseId(req.params.paymentId, 'payment ID');
+  const rental = await withTransaction(async (client) => {
+    await client.query('SELECT id FROM machinery_operations WHERE id = $1 FOR UPDATE', [id]);
+    const payment = (await client.query('SELECT * FROM machinery_rental_payments WHERE id = $1 AND operation_id = $2', [paymentId, id])).rows[0];
+    if (!payment) throw notFound('Payment not found.');
+    await client.query('DELETE FROM machinery_rental_payments WHERE id = $1', [paymentId]);
+    const after = (await client.query(`${dayRentalSelect} WHERE o.id = $1`, [id])).rows[0];
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_RENTAL_PAYMENT_VOIDED', module: 'Machinery', entityType: 'machinery_rental_payment', entityId: String(paymentId), description: `Voided a payment from ${after.memberName} for the ${after.machineryName} rental`, oldValues: { amount: payment.amount, payment_date: payment.payment_date, notes: payment.notes }, newValues: { amount_paid: after.amountPaid, balance: after.balance, payment_status: after.paymentStatus }, ...getRequestMeta(req) });
+    return after;
+  });
+  return res.json({ success: true, rental, payments: await rentalPayments(id) });
 }
 
 // Minimal catalogue for members: no member data, only availability. Machines

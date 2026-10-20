@@ -8,12 +8,14 @@ import { badRequest, cleanString, conflict, currentUserId, forbidden, getRequest
 import { sendEmailSafely, sendTestEmail } from '../services/emailService.js';
 import { accountCreatedEmail, passwordResetEmail } from '../services/emailTemplates.js';
 import { backfillAnnouncementNotifications, notifyUser } from '../services/notificationService.js';
+import { findAccountsByEmail, findAccountsByPhone } from '../services/accountLookup.js';
+import { maskPhilippineMobile, normalizePhilippineMobile } from '../utils/phone.js';
 
 const ACCOUNT_STATUSES = ['ACTIVE', 'INACTIVE', 'LOCKED'];
 
 export async function listMembersWithoutAccounts(req, res) {
   const result = await query(
-    `SELECT m.id, m.member_number, m.first_name, m.last_name, m.email
+    `SELECT m.id, m.member_number, m.first_name, m.last_name, m.email, m.phone
      FROM members m
      LEFT JOIN users u ON u.member_id = m.id
      WHERE u.id IS NULL AND m.status = 'active'
@@ -26,6 +28,7 @@ export async function listMembersWithoutAccounts(req, res) {
 export async function listAccounts(req, res) {
   const result = await query(
     `SELECT m.id AS member_id, m.member_number, m.first_name, m.last_name, COALESCE(u.email, m.email) AS email, u.id AS user_id,
+            COALESCE(NULLIF(TRIM(m.phone), ''), u.phone) AS phone,
             u.username, u.role, u.account_status, u.must_change_password, u.last_login,
             u.created_at AS account_created_at, u.password_changed_at
      FROM users u
@@ -51,12 +54,21 @@ export async function getAccount(req, res) {
   return res.status(200).json({ success: true, account: result.rows[0] });
 }
 
+// A member signs in with the email and mobile number in their member
+// information, so the office picks no username: one is made from the member
+// number for the places that still show it (audit log, older sign-ins).
+async function usernameFor(client, member) {
+  const base = String(member.member_number || `member-${member.id}`).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90) || `member-${member.id}`;
+  const taken = await client.query(`SELECT 1 FROM users WHERE LOWER(username) = $1`, [base]);
+  return taken.rows[0] ? `${base}-${member.id}` : base;
+}
+
+const nameOf = (row) => row.member_name || row.full_name || row.username;
+
 export async function createMemberAccount(req, res) {
   const { memberId, password, confirmPassword, role = 'MEMBER' } = req.body || {};
-  const username = cleanString(req.body?.username, 100).toLowerCase();
   const numericMemberId = parseId(memberId, 'member ID');
-  if (!username || !password || !confirmPassword) throw badRequest('Member ID, username, and password are required.');
-  if (!/^[a-z0-9._-]{3,100}$/.test(username)) throw badRequest('Username may only contain letters, numbers, dots, dashes and underscores (3-100 characters).');
+  if (!password || !confirmPassword) throw badRequest('Member and password are required.');
   if (password !== confirmPassword) throw badRequest('Passwords do not match.');
   if (role !== 'MEMBER') throw badRequest('Only MEMBER accounts can be created from the admin console.');
   const policy = validatePasswordPolicy(password);
@@ -65,20 +77,31 @@ export async function createMemberAccount(req, res) {
   const passwordHash = await hashPassword(password);
   const setupToken = generateSecureToken(32);
 
-  const { user, member } = await withTransaction(async (client) => {
+  const { user, member, username, warnings } = await withTransaction(async (client) => {
     const memberResult = await client.query(`SELECT * FROM members WHERE id = $1 FOR UPDATE`, [numericMemberId]);
     const memberRow = memberResult.rows[0];
     if (!memberRow) throw notFound('Member record not found.');
     if (memberRow.status !== 'active') throw badRequest('Accounts can only be created for active members.');
 
-    const existingUser = await client.query(`SELECT id FROM users WHERE member_id = $1 OR LOWER(username) = $2`, [numericMemberId, username]);
-    if (existingUser.rows[0]) throw conflict('A login account already exists for this member or username.');
+    const existingUser = await client.query(`SELECT id FROM users WHERE member_id = $1`, [numericMemberId]);
+    if (existingUser.rows[0]) throw conflict('A login account already exists for this member.');
 
-    const email = memberRow.email ? memberRow.email.toLowerCase() : null;
+    // The member signs in with the email and mobile number in their information.
+    const email = memberRow.email?.trim() ? memberRow.email.trim().toLowerCase() : null;
+    const phone = normalizePhilippineMobile(memberRow.phone);
+    if (!email && !phone) throw badRequest('Add the member\'s email or mobile number in their member information first: they sign in with it.');
     if (email) {
-      const emailInUse = await client.query(`SELECT id FROM users WHERE LOWER(email) = $1`, [email]);
-      if (emailInUse.rows[0]) throw conflict('Another account already uses this member\'s email address.');
+      const emailInUse = await findAccountsByEmail(email, client);
+      if (emailInUse.length) throw conflict(`Another account (${nameOf(emailInUse[0])}) already uses this member's email address.`);
     }
+    // A shared number signs in to neither account, so it is only allowed when the member also has an email.
+    const warnings = [];
+    if (phone) {
+      const phoneInUse = await findAccountsByPhone(phone, client);
+      if (phoneInUse.length && !email) throw conflict(`Another account (${nameOf(phoneInUse[0])}) already uses this mobile number. Add the member's email first.`);
+      if (phoneInUse.length) warnings.push(`${maskPhilippineMobile(phone)} is also on ${nameOf(phoneInUse[0])}'s account, so this member signs in with their email.`);
+    }
+    const username = await usernameFor(client, memberRow);
 
     const insertResult = await client.query(
       `INSERT INTO users (member_id, username, email, password_hash, role, account_status, must_change_password, created_at, updated_at)
@@ -100,7 +123,7 @@ export async function createMemberAccount(req, res) {
       entityType: 'user',
       entityId: String(createdUser.id),
       description: `Created account for member ${memberRow.member_number || numericMemberId}`,
-      newValues: { username, role, member_id: numericMemberId },
+      newValues: { username, role, member_id: numericMemberId, email, phone: memberRow.phone || null },
       targetUserId: createdUser.id,
       ...getRequestMeta(req),
     });
@@ -112,15 +135,18 @@ export async function createMemberAccount(req, res) {
       link: '/settings',
       dedupeKey: `account-created-${createdUser.id}`,
     });
-    return { user: createdUser, member: memberRow };
+    return { user: createdUser, member: memberRow, username, warnings };
   });
 
   if (user.email) {
-    const email = accountCreatedEmail({ memberName: `${member.first_name || ''} ${member.last_name || ''}`.trim(), username, token: setupToken });
+    const email = accountCreatedEmail({
+      memberName: `${member.first_name || ''} ${member.last_name || ''}`.trim(), email: user.email,
+      phone: warnings.length ? null : maskPhilippineMobile(member.phone), token: setupToken,
+    });
     void sendEmailSafely({ ...email, to: user.email, relatedUserId: user.id, essential: true });
   }
 
-  return res.status(201).json({ success: true, message: 'Member account created successfully.', user: sanitizeUser(user) });
+  return res.status(201).json({ success: true, message: 'Member account created successfully.', user: sanitizeUser(user), username, warnings });
 }
 
 export async function sendEmailTest(req, res) {
@@ -177,7 +203,10 @@ export async function resetMemberPassword(req, res) {
   const unusablePasswordHash = await hashPassword(generateSecureToken(24));
 
   const targetUser = await withTransaction(async (client) => {
-    const targetResult = await client.query(`SELECT * FROM users WHERE id = $1 FOR UPDATE`, [id]);
+    const targetResult = await client.query(
+      `SELECT u.*, TRIM(CONCAT_WS(' ', m.first_name, m.last_name)) AS member_name FROM users u LEFT JOIN members m ON m.id = u.member_id WHERE u.id = $1 FOR UPDATE OF u`,
+      [id]
+    );
     const target = targetResult.rows[0];
     if (!target) throw notFound('Account not found.');
     if (target.role !== 'MEMBER') throw forbidden('Only member passwords can be reset from the admin console.');
@@ -210,11 +239,16 @@ export async function resetMemberPassword(req, res) {
     return target;
   });
 
-  const email = passwordResetEmail({ username: targetUser.username, token: resetToken, expiresIn: '24 hours' });
+  const email = passwordResetEmail({ name: nameOf(targetUser), token: resetToken, expiresIn: '24 hours' });
   void sendEmailSafely({ ...email, to: targetUser.email, relatedUserId: targetUser.id, essential: true });
   if (process.env.NODE_ENV === 'test') res.setHeader('X-Test-Reset-Token', resetToken);
   return res.status(200).json({ success: true, message: 'Password reset instructions were sent to the member email address.' });
 }
+
+// Who did each action, by full name: the name kept with the entry, else (for
+// entries older than that column) the person's current one.
+const AUDIT_FROM_SQL = 'FROM audit_logs al LEFT JOIN users au ON au.id = al.user_id LEFT JOIN members am ON am.id = au.member_id';
+const AUDIT_FULL_NAME_SQL = `COALESCE(al.user_full_name_snapshot, NULLIF(TRIM(CONCAT_WS(' ', am.first_name, am.last_name)), ''), NULLIF(TRIM(au.full_name), ''))`;
 
 export async function listAuditLogs(req, res) {
   const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 25, maxLimit: 100 });
@@ -234,7 +268,7 @@ export async function listAuditLogs(req, res) {
   const add = (sql, value) => { params.push(value); conditions.push(sql.replaceAll('$?', `$${params.length}`)); };
 
   if (filters.search) {
-    add(`(COALESCE(al.user_name_snapshot, '') ILIKE $? OR COALESCE(al.user_id::text, '') ILIKE $? OR COALESCE(al.entity_id, '') ILIKE $? OR COALESCE(al.description, '') ILIKE $?)`, `%${filters.search}%`);
+    add(`(COALESCE(al.user_name_snapshot, '') ILIKE $? OR COALESCE(${AUDIT_FULL_NAME_SQL}, '') ILIKE $? OR COALESCE(al.user_id::text, '') ILIKE $? OR COALESCE(al.entity_id, '') ILIKE $? OR COALESCE(al.description, '') ILIKE $?)`, `%${filters.search}%`);
   }
   if (filters.action) add('al.action = $?', filters.action);
   if (filters.module) add('al.module = $?', filters.module);
@@ -253,12 +287,12 @@ export async function listAuditLogs(req, res) {
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const [totalResult, logsResult] = await Promise.all([
-    query(`SELECT COUNT(*)::int AS total FROM audit_logs al ${whereClause}`, params),
+    query(`SELECT COUNT(*)::int AS total ${AUDIT_FROM_SQL} ${whereClause}`, params),
     query(
-      `SELECT al.id, al.user_id, al.user_name_snapshot, al.user_role_snapshot, al.action, al.module,
-              al.entity_type, al.entity_id, al.description, al.old_values, al.new_values,
+      `SELECT al.id, al.user_id, al.user_name_snapshot, al.user_role_snapshot, ${AUDIT_FULL_NAME_SQL} AS user_full_name,
+              al.action, al.module, al.entity_type, al.entity_id, al.description, al.old_values, al.new_values,
               al.target_user_id, al.ip_address, al.status, al.created_at
-       FROM audit_logs al
+       ${AUDIT_FROM_SQL}
        ${whereClause}
        ORDER BY al.created_at DESC, al.id DESC
        LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,

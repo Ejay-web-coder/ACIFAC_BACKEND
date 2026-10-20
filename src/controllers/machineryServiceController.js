@@ -171,6 +171,12 @@ async function assertRentalRequest(db, rentalRequestId, machineryId) {
     [rentalRequestId, machineryId]
   )).rows[0];
   if (!row) throw badRequest('That rental request is not for this machine.');
+  // A rental is paid in one place: under Day Rentals, or as this service.
+  const paid = (await db.query(
+    `SELECT 1 FROM machinery_rental_payments p JOIN machinery_operations o ON o.id = p.operation_id WHERE o.rental_request_id = $1 LIMIT 1`,
+    [rentalRequestId]
+  )).rows[0];
+  if (paid) throw badRequest('That rental already has payments under Day Rentals, so it cannot also be recorded as a service.');
 }
 
 const auditService = (row) => ({

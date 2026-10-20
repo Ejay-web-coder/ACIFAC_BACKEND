@@ -14,6 +14,7 @@ import { isSmsConfigured, passwordResetCodeSms, sendSmsSafely } from '../service
 import { maskPhilippineMobile, normalizePhilippineMobile } from '../utils/phone.js';
 import { notifyUser } from '../services/notificationService.js';
 import { clearFailures, findActiveLock, registerFailure, throttleKeys } from '../services/loginThrottle.js';
+import { findAccountsByEmail, findAccountsByPhone } from '../services/accountLookup.js';
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_PATTERN = /^[+0-9()\s.-]{7,30}$/;
@@ -21,7 +22,7 @@ const PHONE_PATTERN = /^[+0-9()\s.-]{7,30}$/;
 let dummyHashPromise = null;
 const getDummyHash = () => (dummyHashPromise ??= hashPassword(generateSecureToken(16)));
 
-const INVALID_CREDENTIALS_MESSAGE = 'Invalid username or password.';
+const INVALID_CREDENTIALS_MESSAGE = 'Invalid email, mobile number or password.';
 const ACCOUNT_LIMITS = { maxAttempts: LOGIN_MAX_FAILED_ATTEMPTS, lockMinutes: LOGIN_LOCK_MINUTES };
 const IP_LIMITS = { maxAttempts: LOGIN_IP_MAX_FAILURES, lockMinutes: LOGIN_LOCK_MINUTES };
 
@@ -38,18 +39,21 @@ function sendLoginLocked(res, lock) {
   });
 }
 
-// Members sign in with their username or member number; email sign-in is kept
-// for administrators only.
+// Members sign in with their email or mobile number (the account's or the one
+// on their member record); a username or member number still works for older
+// accounts, and administrators sign in with their username or email. An email
+// or number on several accounts signs in to none: it cannot say which one.
 async function findUserByIdentifier(identifier) {
-  const result = await query(
+  const named = await query(
     `SELECT u.* FROM users u LEFT JOIN members m ON m.id = u.member_id
-     WHERE LOWER(u.username) = LOWER($1)
-        OR (u.role = 'MEMBER' AND LOWER(m.member_number) = LOWER($1))
-        OR (u.role = 'ADMIN' AND LOWER(u.email) = LOWER($1))
+     WHERE LOWER(u.username) = LOWER($1) OR (u.role = 'MEMBER' AND LOWER(m.member_number) = LOWER($1))
      ORDER BY (LOWER(u.username) = LOWER($1)) DESC LIMIT 1`,
     [identifier]
   );
-  return result.rows[0] || null;
+  if (named.rows[0]) return named.rows[0];
+  const matches = EMAIL_PATTERN.test(identifier) ? await findAccountsByEmail(identifier)
+    : normalizePhilippineMobile(identifier) ? await findAccountsByPhone(identifier) : [];
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function publicUser(row) {
@@ -70,7 +74,7 @@ function publicUser(row) {
 export async function login(req, res) {
   const identifier = cleanString(req.body?.usernameOrEmail, 255);
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
-  if (!identifier || !password) throw badRequest('Username/email and password are required.');
+  if (!identifier || !password) throw badRequest('Email or mobile number and password are required.');
 
   const user = await findUserByIdentifier(identifier);
   // The lockout follows the account whichever name it is signed in with
@@ -281,8 +285,6 @@ export async function updateNotificationPreferences(req, res) {
 // their token. Signed-in users can get a code too (POST /change-password/code)
 // and change their password with it instead of the current one.
 
-const RESET_CODE_SENT_MESSAGE = 'If an account with that email exists, a verification code has been sent.';
-const RESET_CODE_TEXTED_MESSAGE = 'If an account with that mobile number exists, a verification code has been sent.';
 const SMS_UNAVAILABLE_MESSAGE = 'Codes cannot be sent by text message right now. Please use your email address.';
 const resetSessionExpired = () => withCode(badRequest('Your password reset session has expired. Please request a new code.'), 'RESET_SESSION_EXPIRED');
 
@@ -309,35 +311,20 @@ function readResetAddress(body) {
 
 const accountCodeDigest = (userId) => digestToken(`account:${userId}`);
 
-// The active account for an address: its login email, else its member
-// record's (the same address account emails already go to).
-async function findActiveUserByEmail(email) {
-  const result = await query(
-    `SELECT u.id, u.username, u.role, COALESCE(NULLIF(u.email, ''), m.email) AS delivery_email
-     FROM users u LEFT JOIN members m ON m.id = u.member_id
-     WHERE u.account_status = 'ACTIVE' AND LOWER(COALESCE(NULLIF(u.email, ''), m.email)) = $1
-     ORDER BY (LOWER(u.email) = $1) DESC NULLS LAST, u.id
-     LIMIT 1`,
-    [email]
-  );
-  return result.rows[0] || null;
-}
-
-// The one active account whose texts go to this number: the member record's
-// mobile, else the login account's. Numbers are saved in many formats, so SQL
-// narrows the candidates and the match is made on the normalized number. A
-// number is not unique (a family may share one); on several accounts it
-// matches none, since a code could not say which account it resets.
-async function findActiveUserByPhone(phone) {
-  const result = await query(
-    `SELECT u.id, u.username, u.role, COALESCE(NULLIF(TRIM(m.phone), ''), u.phone) AS delivery_phone
-     FROM users u LEFT JOIN members m ON m.id = u.member_id
-     WHERE u.account_status = 'ACTIVE'
-       AND regexp_replace(COALESCE(NULLIF(TRIM(m.phone), ''), u.phone, ''), '\\D', '', 'g') LIKE '%' || $1`,
-    [phone.slice(-10)]
-  );
-  const matches = result.rows.filter((row) => normalizePhilippineMobile(row.delivery_phone) === phone);
-  return matches.length === 1 ? matches[0] : null;
+// Why an address gets no code: it is on no account, on several (a code could
+// not say which account it resets) or on an account that is switched off.
+function resetRefusal(channel, matches) {
+  const what = channel === 'sms' ? 'mobile number' : 'email';
+  if (matches.length === 0) {
+    return [404, 'RESET_ADDRESS_NOT_FOUND', `This ${what} is not registered to any ACIFAC account. Use the ${what} on your account or in your member information.`];
+  }
+  if (matches.length > 1) {
+    return [409, 'RESET_ADDRESS_SHARED', channel === 'sms'
+      ? 'This mobile number is on more than one account. Please use your email instead.'
+      : 'This email is on more than one account. Please contact the ACIFAC office.'];
+  }
+  if (matches[0].account_status !== 'ACTIVE') return [403, 'RESET_ACCOUNT_INACTIVE', 'This account is not active. Please contact the ACIFAC office.'];
+  return null;
 }
 
 // Stores a new code for an address, enforcing the resend cooldown and the
@@ -407,33 +394,41 @@ export async function forgotPassword(req, res) {
   // Decided before any lookup, so it tells nothing about which numbers have accounts.
   if (address.channel === 'sms' && !isSmsConfigured()) throw badRequest(SMS_UNAVAILABLE_MESSAGE);
 
-  // Every address takes the same path, account or not: the same checks, a
-  // stored code (for an unknown address: no account and a code nobody ever
-  // receives) and the same reply. Only the email or text itself differs, and
-  // it is sent after the reply, so neither the answer nor its timing tells
-  // whether the address is registered.
-  const user = address.channel === 'sms' ? await findActiveUserByPhone(address.phone) : await findActiveUserByEmail(address.email);
+  // Only the email or mobile number of an account (or of its member record)
+  // gets a code; any other address is told so. Refusals still use up this
+  // device's hourly allowance (under a one-off digest, so no resend cooldown
+  // applies to them), so the form cannot be used to test addresses in bulk.
+  const matches = address.channel === 'sms' ? await findAccountsByPhone(address.phone) : await findAccountsByEmail(address.email);
+  const refusal = resetRefusal(address.channel, matches);
+  const user = refusal ? null : matches[0];
   const code = generateVerificationCode();
-  const stored = await storeResetCode({ digest: address.digest, userId: user?.id ?? null, code, ip: req.ip || null });
+  const digest = refusal ? digestToken(`refused:${generateSecureToken(16)}`) : address.digest;
+  const stored = await storeResetCode({ digest, userId: user?.id ?? null, code, ip: req.ip || null });
   if (stored.limited) return replyLimited(res, stored.limited);
 
   // Housekeeping: codes older than a day are finished with.
   await query(`DELETE FROM password_reset_codes WHERE created_at < NOW() - INTERVAL '1 day'`)
     .catch((error) => console.error('Reset code cleanup failed:', error.message));
 
-  if (user) {
-    const meta = getRequestMeta(req);
-    const auditUser = { id: user.id, username: user.username, role: user.role };
-    const base = { user: auditUser, module: 'Authentication', entityType: 'user', entityId: String(user.id), ...meta };
-    keepAlive((async () => {
-      await createAuditLog({ ...base, action: 'PASSWORD_RESET_REQUESTED', description: 'Password reset requested' });
-      const delivery = await deliverCode({ channel: address.channel, email: user.delivery_email, phone: user.delivery_phone, code, userId: user.id });
-      await createAuditLog({ ...base, action: 'PASSWORD_RESET_CODE_SENT', ...deliveryAudit('Password reset code', address.channel, delivery) });
-    })());
+  if (refusal) {
+    const [status, errorCode, message] = refusal;
+    return res.status(status).json({ success: false, code: errorCode, message });
   }
+
+  // The code goes to the address that was typed: it belongs to this account.
+  const meta = getRequestMeta(req);
+  const auditUser = { id: user.id, username: user.username, role: user.role };
+  const base = { user: auditUser, module: 'Authentication', entityType: 'user', entityId: String(user.id), ...meta };
+  keepAlive((async () => {
+    await createAuditLog({ ...base, action: 'PASSWORD_RESET_REQUESTED', description: 'Password reset requested' });
+    const delivery = await deliverCode({ channel: address.channel, email: address.email, phone: address.phone, code, userId: user.id });
+    await createAuditLog({ ...base, action: 'PASSWORD_RESET_CODE_SENT', ...deliveryAudit('Password reset code', address.channel, delivery) });
+  })());
   return res.status(200).json({
     success: true,
-    message: address.channel === 'sms' ? RESET_CODE_TEXTED_MESSAGE : RESET_CODE_SENT_MESSAGE,
+    message: address.channel === 'sms'
+      ? `A verification code was texted to ${maskPhilippineMobile(address.phone)}.`
+      : `A verification code was sent to ${maskEmail(address.email)}.`,
     expiresInSeconds: RESET_CODE_TTL_MINUTES * 60,
     resendAvailableInSeconds: RESET_CODE_RESEND_SECONDS,
   });

@@ -18,13 +18,13 @@ function message(subject, text, html) {
   return { subject, text, html: `<div style="font-family:Arial,sans-serif;line-height:1.5">${html}</div>` };
 }
 
-export function passwordResetEmail({ username, token, expiresIn = '15 minutes' }) {
+export function passwordResetEmail({ name, token, expiresIn = '15 minutes' }) {
   const link = buildLink('/reset-password', token);
-  const safeUsername = escapeHtml(username);
+  const safeName = escapeHtml(name);
   return message(
     'Reset your ACIFAC password',
-    `Hello ${username},\n\nUse this link to reset your password: ${link}\n\nThis link expires in ${expiresIn}. If you did not request it, you can ignore this email.`,
-    `<p>Hello ${safeUsername},</p><p>Use the link below to reset your password. It expires in ${escapeHtml(expiresIn)}.</p><p><a href="${escapeHtml(link)}">Reset password</a></p><p>If you did not request this, you can ignore this email.</p>`
+    `Hello ${name},\n\nUse this link to reset your password: ${link}\n\nThis link expires in ${expiresIn}. If you did not request it, you can ignore this email.`,
+    `<p>Hello ${safeName},</p><p>Use the link below to reset your password. It expires in ${escapeHtml(expiresIn)}.</p><p><a href="${escapeHtml(link)}">Reset password</a></p><p>If you did not request this, you can ignore this email.</p>`
   );
 }
 
@@ -38,12 +38,14 @@ export function passwordResetCodeEmail({ code, expiresInMinutes = 10 }) {
   );
 }
 
-export function accountCreatedEmail({ memberName, username, token }) {
+// The member signs in with this email, or the mobile number (masked) when it is theirs alone.
+export function accountCreatedEmail({ memberName, email, phone, token }) {
   const link = buildLink('/reset-password', token);
+  const signIn = phone ? `your email (${email}) or your mobile number (${phone})` : `your email (${email})`;
   return message(
     'Your ACIFAC account is ready',
-    `Hello ${memberName},\n\nYour ACIFAC username is ${username}. Set your password here: ${link}\n\nThis link expires in 24 hours.`,
-    `<p>Hello ${escapeHtml(memberName)},</p><p>Your ACIFAC username is <strong>${escapeHtml(username)}</strong>.</p><p><a href="${escapeHtml(link)}">Set your password</a> (expires in 24 hours)</p>`
+    `Hello ${memberName},\n\nSign in to ACIFAC with ${signIn}. Set your password here: ${link}\n\nThis link expires in 24 hours.`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>Sign in to ACIFAC with ${escapeHtml(signIn)}.</p><p><a href="${escapeHtml(link)}">Set your password</a> (expires in 24 hours)</p>`
   );
 }
 

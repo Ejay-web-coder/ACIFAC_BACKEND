@@ -368,15 +368,34 @@ test('members: create, validate, duplicate, view document, update, archive, rest
 });
 
 test('accounts: create member login, setup link, forced password change', { skip }, async () => {
-  const created = await admin.post('/api/admin/accounts', { memberId: state.memberId, username: 'juan', password: 'TempPass1!', confirmPassword: 'TempPass1!' });
+  // No username to choose: the member signs in with the email and mobile number in their information.
+  const info = (await pool.query('SELECT member_number, email, phone FROM members WHERE id = $1', [state.memberId])).rows[0];
+  const created = await admin.post('/api/admin/accounts', { memberId: state.memberId, username: 'ignored', password: 'TempPass1!', confirmPassword: 'TempPass1!' });
   assert.equal(created.status, 201, JSON.stringify(created.data));
+  assert.deepEqual([created.data.username, created.data.warnings], [info.member_number.toLowerCase(), []]);
   state.memberUserId = created.data.user.id;
+  assert.equal((await admin.post('/api/admin/accounts', { memberId: state.memberId, password: 'TempPass1!', confirmPassword: 'TempPass1!' })).status, 409, 'one account per member');
+  const listed = (await admin.get('/api/admin/accounts')).data.accounts.find((row) => row.user_id === state.memberUserId);
+  assert.deepEqual([listed.email, listed.phone], ['juan@example.com', info.phone]);
   await new Promise((resolve) => setTimeout(resolve, 100));
   const setupMail = sentEmails.find((mail) => mail.to === 'juan@example.com' && /account is ready/i.test(mail.subject));
   assert.ok(setupMail, 'setup email sent');
   assert.match(setupMail.text, /http:\/\/localhost:5173\/reset-password\?token=[a-f0-9]{64}/);
+  assert.match(setupMail.text, /Sign in to ACIFAC with your email \(juan@example\.com\) or your mobile number \(0\d{3} ••• \d{4}\)/);
 
-  const login = await member.post('/api/auth/login', { usernameOrEmail: 'juan', password: 'TempPass1!' });
+  // A member with neither an email nor a mobile number has nothing to sign in with.
+  const bare = await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status, farm_area_ha, date_of_birth)
+     VALUES ('ACIFAC-2026-899', 'Nilo', 'Bautista', NULL, '044 123 4567', 'Purok 3', '2026-01-15', 0, 'active', 1, '1980-01-01') RETURNING id`
+  );
+  const refused = await admin.post('/api/admin/accounts', { memberId: bare.rows[0].id, password: 'TempPass1!', confirmPassword: 'TempPass1!' });
+  assert.equal(refused.status, 400);
+  assert.match(refused.data.message, /email or mobile number/);
+  await pool.query('DELETE FROM members WHERE id = $1', [bare.rows[0].id]);
+
+  const byNumber = await new Client('10.0.1.9').post('/api/auth/login', { usernameOrEmail: `+63 ${info.phone.replace(/\D/g, '').slice(-10)}`, password: 'TempPass1!' });
+  assert.equal(byNumber.status, 200, 'the member information\'s mobile number, in any format');
+  const login = await member.post('/api/auth/login', { usernameOrEmail: 'Juan@Example.com', password: 'TempPass1!' });
   assert.equal(login.data.mustChangePassword, true);
   const blocked = await member.get('/api/members/me');
   assert.equal(blocked.status, 403);
@@ -389,7 +408,7 @@ test('accounts: create member login, setup link, forced password change', { skip
   assert.equal(oldSession.status, 401, 'reset revokes existing sessions');
   const reused = await new Client().post('/api/auth/reset-password', { token, newPassword: 'MemberPass2!', confirmPassword: 'MemberPass2!' });
   assert.equal(reused.status, 400, 'token is single-use');
-  const relogin = await member.post('/api/auth/login', { usernameOrEmail: 'juan', password: 'MemberPass1!' });
+  const relogin = await member.post('/api/auth/login', { usernameOrEmail: 'juan@example.com', password: 'MemberPass1!' });
   assert.equal(relogin.status, 200);
   assert.equal(relogin.data.mustChangePassword, false);
 });
@@ -846,7 +865,7 @@ test('machinery services: dated rates, fees, payments, expenses and the PhilMech
   const catalog = (await member.get('/api/machinery/catalog')).data.machinery;
   assert.ok(catalog.every((row) => row.id !== tractor.id && row.id !== harvester.id && row.id !== 'M-001'));
 
-  // Day rentals (shown under Services): every booking, with the machine's current name and the fee per day.
+  // Day rentals (their own tab): every booking, with the machine's current name and the fee per day.
   assert.equal((await member.get('/api/machinery/day-rentals')).status, 403);
   const dayRentals = (await admin.get('/api/machinery/day-rentals?limit=200')).data;
   const bookings = (await pool.query('SELECT COUNT(*)::int AS count, COALESCE(SUM(duration), 0)::int AS days, COALESCE(SUM(rental_fee), 0) AS fees FROM machinery_operations')).rows[0];
@@ -1012,6 +1031,86 @@ test('machinery: the PhilMech report form is saved per cropping', { skip }, asyn
   assert.equal((await admin.get(`${url}?croppingPeriod=1st&year=2026`)).data.form.fcaName, first.data.form.fcaName, 'other croppings are untouched');
   const audits = await pool.query(`SELECT COUNT(*)::int AS count FROM audit_logs WHERE action = 'MACHINERY_REPORT_FORM_SAVED'`);
   assert.equal(audits.rows[0].count, 2);
+});
+
+test('machinery: day rentals are paid in parts up to the fee; a rental also recorded as a service is paid there', { skip }, async (t) => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const today = todayDateOnly();
+  const plus = (days) => { const d = new Date(`${today}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
+  const fleet = (await admin.get('/api/machinery')).data.machinery;
+  // The rotavator (attached to the tractor, so its rental can become a tractor service)
+  // is bookable for this test only.
+  const rotavator = fleet.find((row) => row.id === 'M-004');
+  await pool.query(`UPDATE machinery SET status = 'available' WHERE id = $1`, [rotavator.id]);
+  t.after(() => pool.query('UPDATE machinery SET status = $2 WHERE id = $1', [rotavator.id, rotavator.status]));
+  const book = async (startDate, endDate, clientName) => {
+    const created = await admin.post('/api/machinery/requests', { machineryId: rotavator.id, clientCategory: 'non_member', clientName, startDate, endDate, purpose: 'Land preparation' });
+    assert.equal(created.status, 201, JSON.stringify(created.data));
+    assert.equal((await admin.patch(`/api/machinery/requests/${created.data.request.id}`, { status: 'approved' })).status, 200);
+    const operation = (await admin.get('/api/machinery?limit=200')).data.operations.find((row) => row.rentalRequestId === created.data.request.id);
+    return { requestId: created.data.request.id, id: operation.id };
+  };
+
+  const rental = await book(plus(70), plus(73), 'Mario Reyes');
+  const path = `/api/machinery/day-rentals/${rental.id}`;
+  assert.equal((await member.get(path)).status, 403);
+  assert.equal((await member.post(`${path}/payments`, { amount: '1', paymentDate: today })).status, 403);
+  assert.equal((await admin.get('/api/machinery/day-rentals/999999')).status, 404);
+  const detail = (await admin.get(path)).data;
+  const fee = Number(detail.rental.rentalFee);
+  assert.ok(fee > 500, 'three days of the rotavator');
+  assert.deepEqual([Number(detail.rental.amountPaid), Number(detail.rental.balance), detail.rental.paymentStatus, detail.rental.serviceId, detail.payments],
+    [0, fee, 'unpaid', null, []], 'a new rental is unpaid');
+
+  // Amounts above zero with 2 decimals at most, never past the balance or dated in the future.
+  for (const bad of [{ amount: '0', paymentDate: today }, { amount: 'abc', paymentDate: today }, { amount: '1.234', paymentDate: today },
+    { amount: String(fee + 1), paymentDate: today }, { amount: '1', paymentDate: plus(1) }, { amount: '1', paymentDate: 'soon' }]) {
+    assert.equal((await admin.post(`${path}/payments`, bad)).status, 400, JSON.stringify(bad));
+  }
+  const first = await admin.post(`${path}/payments`, { amount: '500', paymentDate: today, notes: 'OR 1001' });
+  assert.equal(first.status, 201, JSON.stringify(first.data));
+  assert.deepEqual([Number(first.data.rental.amountPaid), Number(first.data.rental.balance), first.data.rental.paymentStatus], [500, fee - 500, 'partial']);
+  assert.deepEqual(first.data.payments.map((row) => [Number(row.amount), row.paymentDate, row.notes, Boolean(row.recordedBy)]), [[500, today, 'OR 1001', true]]);
+  const partial = (await admin.get('/api/machinery/day-rentals?paymentStatus=partial&limit=200')).data.rentals;
+  assert.ok(partial.some((row) => row.id === rental.id) && partial.every((row) => row.paymentStatus === 'partial'));
+  assert.equal((await admin.get('/api/machinery/day-rentals?paymentStatus=paid')).status, 400);
+
+  const rest = await admin.post(`${path}/payments`, { amount: (fee - 500).toFixed(2), paymentDate: today });
+  assert.equal(rest.status, 201, JSON.stringify(rest.data));
+  assert.deepEqual([Number(rest.data.rental.balance), rest.data.rental.paymentStatus, rest.data.payments.length], [0, 'full', 2]);
+  assert.equal((await admin.post(`${path}/payments`, { amount: '0.01', paymentDate: today })).status, 400, 'nothing is left to pay');
+
+  // Voiding a payment puts the balance back; the audit log keeps both.
+  assert.equal((await admin.request('DELETE', `${path}/payments/999999`)).status, 404);
+  const voided = await admin.request('DELETE', `${path}/payments/${first.data.payments[0].id}`);
+  assert.equal(voided.status, 200, JSON.stringify(voided.data));
+  assert.deepEqual([Number(voided.data.rental.amountPaid), voided.data.rental.paymentStatus, voided.data.payments.length], [fee - 500, 'partial', 1]);
+  const audit = (await pool.query(`SELECT action FROM audit_logs WHERE entity_type = 'machinery_rental_payment' ORDER BY id`)).rows.map((row) => row.action);
+  assert.deepEqual(audit.slice(-3), ['MACHINERY_RENTAL_PAYMENT_RECEIVED', 'MACHINERY_RENTAL_PAYMENT_RECEIVED', 'MACHINERY_RENTAL_PAYMENT_VOIDED']);
+
+  // The totals add up the rows.
+  const all = (await admin.get('/api/machinery/day-rentals?limit=200')).data;
+  assert.equal(all.rentals.length, all.totals.count);
+  const sum = (field) => all.rentals.reduce((total, row) => total + Math.round(Number(row[field]) * 100), 0);
+  assert.equal(Math.round(Number(all.totals.amountPaid) * 100), sum('amountPaid'));
+  assert.equal(Math.round(Number(all.totals.balance) * 100), sum('balance'));
+
+  // A rental is paid in one place: one with payments here cannot become a service,
+  // and one recorded as a service shows and takes the service's payments.
+  const tractor = fleet.find((row) => row.id === rotavator.parentMachineryId);
+  const serviceBase = { machineryId: tractor.id, croppingPeriod: '1st', year: 2026, serviceType: 'Rotavator', serviceDate: '2026-06-10', clientCategory: 'non_member', areaHa: '1' };
+  const refused = await admin.post('/api/machinery/services', { ...serviceBase, clientName: 'Mario Reyes', rentalRequestId: rental.requestId });
+  assert.equal(refused.status, 400);
+  assert.match(refused.data.message, /already has payments under Day Rentals/);
+  const other = await book(plus(80), plus(81), 'Lorna Cruz');
+  const service = await admin.post('/api/machinery/services', { ...serviceBase, clientName: 'Lorna Cruz', rentalRequestId: other.requestId });
+  assert.equal(service.status, 201, JSON.stringify(service.data));
+  const linked = (await admin.get(`/api/machinery/day-rentals/${other.id}`)).data.rental;
+  assert.deepEqual([linked.serviceId, Number(linked.balance), linked.paymentStatus], [service.data.service.id, Number(service.data.service.balance), service.data.service.paymentStatus]);
+  const elsewhere = await admin.post(`/api/machinery/day-rentals/${other.id}/payments`, { amount: '1', paymentDate: today });
+  assert.equal(elsewhere.status, 409);
+  assert.match(elsewhere.data.message, /under Services/);
+  assert.equal((await admin.request('DELETE', `/api/machinery/services/${service.data.service.id}`)).status, 200);
 });
 
 test('machinery analytics: utilization, revenue and cost, alerts, downtime, ROI and recommendations', { skip }, async () => {
@@ -2240,6 +2339,23 @@ test('settings: profile, preferences, legal documents', { skip }, async () => {
   assert.equal((await admin.request('GET', `/api/legal-documents/${uploaded.data.data.id}/file`, { raw: true })).status, 200);
   assert.equal((await admin.request('DELETE', `/api/legal-documents/${uploaded.data.data.id}`)).status, 200);
   assert.equal((await admin.get('/api/legal-documents')).data.data.length, 0);
+
+  // The audit log names whoever did each action by full name: an administrator's
+  // profile name, a member's name from their member record; the username stays too.
+  const adminId = (await admin.get('/api/auth/me')).data.user.id;
+  const logs = (await admin.get('/api/admin/audit-logs?limit=100')).data.data;
+  const byAdmin = logs.find((row) => row.user_id === adminId);
+  assert.equal(byAdmin.user_full_name, 'Coop Admin');
+  assert.ok(byAdmin.user_name_snapshot);
+  const byMember = (await admin.get(`/api/admin/audit-logs?userId=${state.memberUserId}&limit=5`)).data.data[0];
+  assert.equal(byMember.user_full_name, 'Juan Dela Cruz');
+  const found = (await admin.get('/api/admin/audit-logs?search=Coop%20Admin&limit=5')).data.data;
+  assert.ok(found.length > 0 && found.every((row) => row.user_full_name === 'Coop Admin' || /Coop Admin/.test(row.description)), 'searchable by full name');
+  // Entries from before the name was kept with them show the person's current name.
+  await pool.query('UPDATE audit_logs SET user_full_name_snapshot = NULL WHERE id = $1', [byAdmin.id]);
+  assert.equal((await admin.get('/api/admin/audit-logs?limit=100')).data.data.find((row) => row.id === byAdmin.id).user_full_name, 'Coop Admin');
+  const system = logs.find((row) => row.user_id === null);
+  if (system) assert.equal(system.user_full_name, null, 'system actions have no person');
 });
 
 test('member activity log: own actions, office actions, filters, privacy', { skip }, async () => {
@@ -2247,7 +2363,7 @@ test('member activity log: own actions, office actions, filters, privacy', { ski
   assert.equal((await member.request('PATCH', '/api/auth/profile', { body: { phone: '09175550000' } })).status, 200);
   assert.equal((await member.patch('/api/auth/notification-preferences', { emailNotifications: true, loanReminders: false })).status, 200);
   await member.patch('/api/auth/notification-preferences', { emailNotifications: true, loanReminders: true });
-  assert.equal((await new Client().post('/api/auth/login', { usernameOrEmail: 'juan', password: 'Wrong-password-1' })).status, 401);
+  assert.equal((await new Client().post('/api/auth/login', { usernameOrEmail: 'juan@example.com', password: 'Wrong-password-1' })).status, 401);
   // Another member's savings must never show up in Juan's log.
   const second = await admin.get(`/api/members/${state.secondMemberId}`);
   assert.equal((await admin.post('/api/members/savings', { memberId: state.secondMemberId, amount: '77', date: '2026-09-01', paymentMethod: 'Cash', reference: 'OTHER-1' })).status, 201);
@@ -2328,25 +2444,25 @@ test('sessions: forgot password, change password, deactivation, logout', { skip 
   const forgot = await resetter.post('/api/auth/forgot-password', { email: 'JUAN@example.com' });
   assert.equal(forgot.status, 200);
   const unknown = await new Client('10.0.1.2').post('/api/auth/forgot-password', { email: 'nobody@example.com' });
-  assert.equal(unknown.data.message, forgot.data.message, 'no account enumeration');
+  assert.equal(unknown.status, 404, 'an email on no account gets no code');
   const { code } = await nextResetCode('juan@example.com');
   assert.equal((await resetter.post('/api/auth/verify-reset-code', { email: 'juan@example.com', code })).status, 200);
   assert.equal((await resetter.post('/api/auth/reset-password', { newPassword: 'weak', confirmPassword: 'weak' })).status, 400);
   assert.equal((await resetter.post('/api/auth/reset-password', { newPassword: 'ResetPass1!', confirmPassword: 'ResetPass1!' })).status, 200);
-  assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'juan', password: 'ResetPass1!' })).status, 200);
+  assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'juan@example.com', password: 'ResetPass1!' })).status, 200);
 
   const change = await member.post('/api/auth/change-password', { currentPassword: 'ResetPass1!', newPassword: 'ChangedPass1!', confirmPassword: 'ChangedPass1!' });
   assert.equal(change.status, 200);
   assert.equal((await member.get('/api/auth/me')).status, 401, 'change password ends the session');
-  await member.post('/api/auth/login', { usernameOrEmail: 'juan', password: 'ChangedPass1!' });
+  await member.post('/api/auth/login', { usernameOrEmail: 'juan@example.com', password: 'ChangedPass1!' });
   assert.equal((await member.get('/api/members/me')).status, 200);
 
   assert.equal((await admin.patch(`/api/admin/accounts/${state.memberUserId}/status`, { status: 'LOCKED' })).status, 200);
   const afterLock = await member.get('/api/members/me');
   assert.equal(afterLock.status, 401);
-  assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'juan', password: 'ChangedPass1!' })).status, 403);
+  assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'juan@example.com', password: 'ChangedPass1!' })).status, 403);
   await admin.patch(`/api/admin/accounts/${state.memberUserId}/status`, { status: 'ACTIVE' });
-  assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'juan', password: 'ChangedPass1!' })).status, 200);
+  assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'juan@example.com', password: 'ChangedPass1!' })).status, 200);
   const statusAudit = await admin.get('/api/admin/audit-logs?action=ACCOUNT_STATUS_UPDATED');
   assert.equal(statusAudit.data.data.at(-1).old_values.account_status, 'ACTIVE');
   assert.equal(statusAudit.data.data.at(-1).new_values.account_status, 'LOCKED');
@@ -2368,7 +2484,7 @@ test('login lockout: third wrong password locks the account for 20 minutes every
   const first = await browser.post('/api/auth/login', { usernameOrEmail: 'lockme', password: 'Wrong-pass-1' });
   assert.equal(first.status, 401);
   assert.equal(first.data.code, 'INVALID_CREDENTIALS');
-  assert.equal(first.data.message, 'Invalid username or password.');
+  assert.equal(first.data.message, 'Invalid email, mobile number or password.');
   assert.equal(first.data.attemptsRemaining, 2);
   // The same account under another sign-in name shares the count.
   const second = await new Client('10.0.2.2').post('/api/auth/login', { usernameOrEmail: 'LOCKME@acifac.local', password: 'Wrong-pass-2' });
@@ -2443,13 +2559,14 @@ test('password reset: emailed 6-digit code, limits, single use, sessions ended',
 
   assert.equal((await browser.post('/api/auth/forgot-password', { email: 'not-an-email' })).status, 400);
 
-  // Registered and unknown addresses get exactly the same reply.
+  // Only an account's own email gets a code; any other address is told it is not registered.
   const known = await browser.post('/api/auth/forgot-password', { email: 'ResetMe@acifac.local' });
   const unknown = await new Client('10.0.4.2').post('/api/auth/forgot-password', { email: 'ghost@acifac.local' });
   assert.equal(known.status, 200);
-  assert.deepEqual(unknown.data, known.data);
-  assert.equal(known.data.message, 'If an account with that email exists, a verification code has been sent.');
+  assert.equal(known.data.message, 'A verification code was sent to r•••@acifac.local.');
   assert.equal(known.data.resendAvailableInSeconds, 60);
+  assert.deepEqual([unknown.status, unknown.data.code], [404, 'RESET_ADDRESS_NOT_FOUND']);
+  assert.equal(unknown.data.message, 'This email is not registered to any ACIFAC account. Use the email on your account or in your member information.');
   const { code: firstCode, mail } = await nextResetCode(email, seen);
   assert.match(firstCode, /^\d{6}$/);
   assert.match(mail.text, /Your verification code is:/);
@@ -2459,12 +2576,12 @@ test('password reset: emailed 6-digit code, limits, single use, sessions ended',
   const rows = await pool.query('SELECT code_hash FROM password_reset_codes WHERE user_id = $1', [userId]);
   assert.ok(rows.rows[0].code_hash.startsWith('$2') && !rows.rows[0].code_hash.includes(firstCode), 'only a bcrypt hash is stored');
 
-  // Resend cooldown, the same for unknown addresses.
+  // Resend cooldown for a code that was sent; a refused address has none to wait for.
   const tooSoon = await browser.post('/api/auth/forgot-password', { email });
   assert.equal(tooSoon.status, 429);
   assert.equal(tooSoon.data.code, 'RESET_CODE_COOLDOWN');
   assert.ok(tooSoon.data.retryAfterSeconds > 0 && tooSoon.data.retryAfterSeconds <= 60);
-  assert.equal((await new Client('10.0.4.2').post('/api/auth/forgot-password', { email: 'ghost@acifac.local' })).data.code, 'RESET_CODE_COOLDOWN');
+  assert.equal((await new Client('10.0.4.2').post('/api/auth/forgot-password', { email: 'ghost@acifac.local' })).data.code, 'RESET_ADDRESS_NOT_FOUND');
 
   // Wrong, malformed and unknown-address codes.
   const wrongCode = firstCode === '000000' ? '000001' : '000000';
@@ -2539,7 +2656,8 @@ test('password reset: emailed 6-digit code, limits, single use, sessions ended',
   for (const secret of [...seen, grant, 'NewPass1!']) assert.ok(!logged.includes(secret), 'codes, grants and passwords are never logged');
 });
 
-test('password reset: hourly limit per address', { skip }, async () => {
+test('password reset: hourly limits per address and per device', { skip }, async () => {
+  await createLoginUser('flood', 'flood@acifac.local', 'FloodPass1!');
   const client = new Client('10.0.5.1');
   const statuses = [];
   for (let attempt = 0; attempt < 6; attempt += 1) {
@@ -2547,6 +2665,13 @@ test('password reset: hourly limit per address', { skip }, async () => {
     statuses.push((await client.post('/api/auth/forgot-password', { email: 'flood@acifac.local' })).status);
   }
   assert.deepEqual(statuses, [200, 200, 200, 200, 200, 429]);
+
+  // Refused addresses use up the device's allowance too (15 an hour), so the
+  // form cannot be used to find out which addresses have accounts in bulk.
+  const prober = new Client('10.0.5.2');
+  const probes = [];
+  for (let attempt = 0; attempt < 16; attempt += 1) probes.push((await prober.post('/api/auth/forgot-password', { email: `probe${attempt}@acifac.local` })).status);
+  assert.deepEqual(probes, [...Array(15).fill(404), 429]);
 });
 
 test('sessions: 20 minutes without activity ends the session on the server', { skip }, async () => {
@@ -2616,6 +2741,8 @@ test('password reset: members without a login email use the email on their membe
   assert.equal((await browser.post('/api/auth/verify-reset-code', { email: 'rosa@example.com', code })).status, 200);
   assert.equal((await browser.post('/api/auth/reset-password', { newPassword: 'RosaNew1!', confirmPassword: 'RosaNew1!' })).status, 200);
   assert.equal((await new Client('10.0.7.2').post('/api/auth/login', { usernameOrEmail: 'ACIFAC-2026-900', password: 'RosaNew1!' })).status, 200, 'member number sign-in with the new password');
+  assert.equal((await new Client('10.0.7.3').post('/api/auth/login', { usernameOrEmail: 'rosa@example.com', password: 'RosaNew1!' })).status, 200, 'the member information\'s email signs in');
+  assert.equal((await new Client('10.0.7.4').post('/api/auth/login', { usernameOrEmail: '0917 000 0900', password: 'RosaNew1!' })).status, 200, 'and so does its mobile number');
   assert.equal(sentTexts.length, textsBefore, 'a code asked for by email is only emailed');
 });
 
@@ -2623,12 +2750,13 @@ test('password reset: by mobile number, texted to the number on the member recor
   const phoneBrowser = new Client('10.0.8.1');
   assert.equal((await phoneBrowser.post('/api/auth/forgot-password', { phone: '0917-000' })).status, 400);
 
-  // Any format of the number works, and an unknown number gets the same reply.
+  // Any format of the number works; a number on no account is told so.
   const known = await phoneBrowser.post('/api/auth/forgot-password', { phone: '+63 917 000 0900' });
   const unknown = await new Client('10.0.8.2').post('/api/auth/forgot-password', { phone: '09170000999' });
   assert.equal(known.status, 200, JSON.stringify(known.data));
-  assert.deepEqual(unknown.data, known.data);
-  assert.equal(known.data.message, 'If an account with that mobile number exists, a verification code has been sent.');
+  assert.equal(known.data.message, 'A verification code was texted to 0917 ••• 0900.');
+  assert.deepEqual([unknown.status, unknown.data.code], [404, 'RESET_ADDRESS_NOT_FOUND']);
+  assert.match(unknown.data.message, /This mobile number is not registered to any ACIFAC account/);
   const text = await waitForText((entry) => entry.recipients[0] === '+639170000900');
   const code = /code: (\d{6})\./.exec(text.message)[1];
   assert.equal(text.message, `ACIFAC password reset code: ${code}. It expires in 10 minutes. Do not share it. If you did not ask for it, ignore this text.\n- ACIFAC Administrator`);
@@ -2640,7 +2768,7 @@ test('password reset: by mobile number, texted to the number on the member recor
   assert.equal((await phoneBrowser.post('/api/auth/reset-password', { newPassword: 'RosaText1!', confirmPassword: 'RosaText1!' })).status, 200);
   assert.equal((await new Client('10.0.8.3').post('/api/auth/login', { usernameOrEmail: 'rosa', password: 'RosaText1!' })).status, 200);
 
-  // A number shared by two accounts resets neither: the code could not say which.
+  // A number shared by two accounts resets and signs in to neither: it could not say which.
   const { hashPassword } = await import('../src/utils/password.js');
   const sibling = await pool.query(
     `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status, farm_area_ha, date_of_birth)
@@ -2650,9 +2778,17 @@ test('password reset: by mobile number, texted to the number on the member recor
   await pool.query(`UPDATE password_reset_codes SET created_at = created_at - INTERVAL '61 seconds'`);
   const shared = await new Client('10.0.8.4').post('/api/auth/forgot-password', { phone: '09170000900' });
   const textsAfter = sentTexts.length;
-  assert.deepEqual(shared.data, known.data);
+  assert.deepEqual([shared.status, shared.data.code, shared.data.message], [409, 'RESET_ADDRESS_SHARED', 'This mobile number is on more than one account. Please use your email instead.']);
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(sentTexts.length, textsAfter, 'nothing is texted to a shared number');
+  assert.equal((await new Client('10.0.8.5').post('/api/auth/login', { usernameOrEmail: '09170000900', password: 'RosaText1!' })).status, 401);
+  assert.equal((await new Client('10.0.8.6').post('/api/auth/login', { usernameOrEmail: 'ramon@example.com', password: 'RamonPass1!' })).status, 200, 'each still signs in with their email');
+
+  // An account that is switched off gets no code either.
+  await pool.query(`UPDATE users SET account_status = 'INACTIVE' WHERE username = 'ramon'`);
+  const inactive = await new Client('10.0.8.7').post('/api/auth/forgot-password', { email: 'ramon@example.com' });
+  assert.deepEqual([inactive.status, inactive.data.code], [403, 'RESET_ACCOUNT_INACTIVE']);
+  await pool.query(`UPDATE users SET account_status = 'ACTIVE' WHERE username = 'ramon'`);
 });
 
 test('change password in settings: a code by text or email instead of the current password', { skip }, async () => {

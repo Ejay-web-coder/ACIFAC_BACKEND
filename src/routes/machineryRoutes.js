@@ -1,7 +1,8 @@
 import express from 'express';
 import { requireAdmin, requireAuth } from '../middleware/auth.js';
 import {
-  createMachinery, createRentalRequest, listDayRentals, listMachineryCatalog, listMachineryData, reviewRentalRequest, updateMachinery, updateOperationStatus,
+  createMachinery, createRentalRequest, getDayRental, listDayRentals, listMachineryCatalog, listMachineryData, receiveRentalPayment, reviewRentalRequest,
+  updateMachinery, updateOperationStatus, voidRentalPayment,
 } from '../controllers/machineryController.js';
 import {
   createExpense, createRate, createService, deleteExpense, deleteRate, deleteService, getReportForm, getService, listExpenses, listPeriodBalances, listRates,
@@ -17,8 +18,11 @@ router.get('/', requireAdmin, listMachineryData);
 router.post('/', requireAdmin, createMachinery);
 router.patch('/requests/:id', requireAdmin, reviewRentalRequest);
 router.patch('/operations/:id', requireAdmin, updateOperationStatus);
-// Bookings of the machines rented by the day, shown under Services.
+// Bookings of the machines rented by the day and their payments (Day Rentals tab).
 router.get('/day-rentals', requireAdmin, listDayRentals);
+router.get('/day-rentals/:id', requireAdmin, getDayRental);
+router.post('/day-rentals/:id/payments', requireAdmin, receiveRentalPayment);
+router.delete('/day-rentals/:id/payments/:paymentId', requireAdmin, voidRentalPayment);
 
 // Per-service jobs, payments, expenses and the PhilMech report (admin only).
 router.post('/services/quote', requireAdmin, quoteService);
