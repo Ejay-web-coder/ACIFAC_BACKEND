@@ -9,6 +9,7 @@ import { signedSavings } from '../services/savingsLedger.js';
 import { refreshRentalStatusesInBackground } from './machineryController.js';
 import { machineryAnalytics, machineryRecommendations } from '../services/machineryAnalytics.js';
 import { adviseOnCredit, creditFacts } from '../services/creditAdvice.js';
+import { kadiwaProductAnalytics } from '../services/kadiwaProducts.js';
 
 // A member's share capital is at most PHP 20,000 (SHARE_CAPITAL_LIMIT in
 // memberController.js, not imported: the controllers import each other).
@@ -284,11 +285,16 @@ export async function getAnalytics(req, res) {
   const loanPayments = toNumber(totals.loanPayments);
   const outstandingBalance = toNumber(totals.outstandingBalance);
   const summaryNumbers = Object.fromEntries(Object.entries(totals).map(([key, value]) => [key, toNumber(value)]));
+  // Net income for the period, counted as the Dashboard counts it (services/netIncome.js):
+  // machinery is rentals + service fees collected + other income - machinery expenses.
+  const income = await netIncomeCents({ from, to });
 
   return res.json({
     period: { from, to },
     summary: {
       ...summaryNumbers,
+      netIncome: centsToNumber(income.total),
+      machineryNetIncome: centsToNumber(income.parts.machinery),
       totalOperatingRevenue: toNumber(totals.interestCollected) + toNumber(totals.machineryRevenue) + toNumber(totals.kadiwaNetSales),
       paymentToOutstandingRate: loanPayments + outstandingBalance > 0 ? Number(((loanPayments / (loanPayments + outstandingBalance)) * 100).toFixed(1)) : 0,
     },
@@ -305,9 +311,10 @@ export async function getAnalytics(req, res) {
 }
 
 // GET /api/admin/analytics/revenue?granularity=day|month|year&to=YYYY-MM-DD
-// The operating revenue over time, one line per source, as the Operating
-// revenue figure counts it: Kadiwa net sales (by sale date), machinery rentals
-// (by start date) and loan interest (by payment date). Every day, month or year
+// Net income over time, one line per module, as the Dashboard's net income
+// counts it: Kadiwa net sales (by sale date), machinery net income (rentals by
+// start date, service fees by payment date, other income, less expenses by
+// expense date) and loan interest (by payment date). Every day, month or year
 // of the window is listed (0 without income), the window ending at `to` (today
 // at the latest): the last 30 days, the last 12 months or the last 5 years.
 const REVENUE_WINDOWS = { day: { count: 30, label: 'Mon FMDD' }, month: { count: 12, label: 'Mon YYYY' }, year: { count: 5, label: 'YYYY' } };
@@ -330,8 +337,28 @@ export async function getRevenueTrend(req, res) {
        SELECT DATE_TRUNC($1, ks.sale_date)::date AS start, SUM(ks.net_sales) AS amount
        FROM kadiwa_sales ks, bounds b WHERE ks.sale_date BETWEEN b.first_day AND b.last_day AND ks.status = 'completed' GROUP BY 1
      ), machinery AS (
-       SELECT DATE_TRUNC($1, mo.start_date)::date AS start, SUM(mo.rental_fee) AS amount
-       FROM machinery_operations mo, bounds b WHERE mo.start_date BETWEEN b.first_day AND b.last_day GROUP BY 1
+       -- As net income counts it (services/netIncome.js): rentals that have started (one also
+       -- recorded as a service counts once, as the service), service fees collected, other
+       -- income, less machinery expenses. Other income is entered per cropping and year,
+       -- without a date: it is placed at the first month of its cropping's report (January
+       -- if none), kept inside the window when its year is, as net income counts it by year.
+       SELECT start, SUM(amount) AS amount FROM (
+         SELECT DATE_TRUNC($1, mo.start_date)::date AS start, mo.rental_fee AS amount
+         FROM machinery_operations mo, bounds b
+         WHERE mo.start_date BETWEEN b.first_day AND b.last_day
+           AND NOT EXISTS (SELECT 1 FROM machinery_services s WHERE s.rental_request_id = mo.rental_request_id)
+         UNION ALL
+         SELECT DATE_TRUNC($1, p.payment_date)::date, p.amount
+         FROM machinery_service_payments p, bounds b WHERE p.payment_date BETWEEN b.first_day AND b.last_day
+         UNION ALL
+         SELECT DATE_TRUNC($1, LEAST(GREATEST(MAKE_DATE(pb.year, COALESCE(f.from_month, 1), 1), b.first_day), b.last_day))::date, pb.other_income
+         FROM machinery_period_balances pb CROSS JOIN bounds b
+         LEFT JOIN machinery_report_forms f ON f.cropping_period = pb.cropping_period AND f.year = pb.year
+         WHERE pb.other_income <> 0 AND pb.year BETWEEN EXTRACT(YEAR FROM b.first_day) AND EXTRACT(YEAR FROM b.last_day)
+         UNION ALL
+         SELECT DATE_TRUNC($1, e.expense_date)::date, -e.amount
+         FROM machinery_expenses e, bounds b WHERE e.expense_date BETWEEN b.first_day AND b.last_day
+       ) parts GROUP BY 1
      ), interest AS (
        SELECT DATE_TRUNC($1, lp.payment_date)::date AS start, SUM(lp.interest_paid) AS amount
        FROM loan_payments lp, bounds b WHERE lp.payment_date BETWEEN b.first_day AND b.last_day GROUP BY 1
@@ -353,6 +380,13 @@ export async function getRevenueTrend(req, res) {
     success: true, granularity, from: rows[0]?.start ?? to, to,
     rows, totals: { kadiwa: sum('kadiwa'), machinery: sum('machinery'), loanInterest: sum('loanInterest'), total: sum('total') },
   });
+}
+
+// GET /api/admin/analytics/kadiwa-products?from&to
+// Best sellers and items running out (services/kadiwaProducts.js).
+export async function getKadiwaProducts(req, res) {
+  const { from, to } = readPeriod(req.query);
+  return res.json({ success: true, ...(await kadiwaProductAnalytics(from, to)) });
 }
 
 // GET /api/admin/analytics/machinery

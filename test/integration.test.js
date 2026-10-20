@@ -1358,6 +1358,35 @@ test('kadiwa: a sale is the daily form of goods sold, reported per 15 days and p
   assert.equal(current.length, dayNumber);
 });
 
+test('kadiwa analytics: best sellers and items running out', { skip }, async () => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const today = todayDateOnly();
+  const daysAgo = (n) => new Date(Date.parse(`${today}T00:00:00Z`) - n * 86400000).toISOString().slice(0, 10);
+  const product = (name, stock, extra = {}) => ({ name, unit: 'pc', stock: String(stock), price: '20', costPrice: '15', reorderLevel: '2', ...extra });
+  const added = await admin.post('/api/kadiwa/inventory', { items: [product('Zz Fast Soap', 10), product('Zz Slow Vinegar', 20)] });
+  assert.equal(added.status, 201, JSON.stringify(added.data));
+  const id = (name) => added.data.items.find((item) => item.name === name).id;
+  const sell = (saleDate, items, goods = []) => admin.post('/api/kadiwa/sales', { sellerName: 'Tester', saleDate, items, goods, expenses: [{ description: 'None', amount: '0' }] });
+  assert.equal((await sell(daysAgo(8), [{ inventoryId: id('Zz Fast Soap'), quantity: '3' }])).status, 201);
+  assert.equal((await sell(daysAgo(4), [{ inventoryId: id('Zz Fast Soap'), quantity: '3' }, { inventoryId: id('Zz Slow Vinegar'), quantity: '1' }], [{ name: 'Zz Lechon', unit: 'kilo', amount: '95000' }])).status, 201);
+
+  // Ten days, today included: soap sold 6 (0.6 a day) and has 4 left, about 6 days.
+  const url = `/api/admin/analytics/kadiwa-products?from=${daysAgo(9)}&to=${today}`;
+  assert.equal((await member.get(url)).status, 403);
+  const data = (await admin.get(url)).data;
+  assert.equal(data.period.days, 10);
+  assert.deepEqual([data.bestSellers[0].name, data.bestSellers[0].kind, data.bestSellers[0].amount], ['ZZ LECHON', 'goods', 95000], 'goods and store items ranked together by sales');
+  const soap = data.runningOut.find((item) => item.name === 'Zz Fast Soap');
+  assert.deepEqual([soap?.quantity, soap?.stock, soap?.perDay, soap?.daysLeft], [6, 4, 0.6, 6]);
+  assert.ok(!data.runningOut.some((item) => item.name === 'Zz Slow Vinegar'), 'vinegar has 190 days left at its pace');
+  assert.ok(data.summary.totalSales >= 95000 + 6 * 20 + 20);
+  assert.equal(data.noSales, undefined, 'items not selling are not listed');
+  // A period still to come has nothing to judge.
+  const ahead = (await admin.get(`/api/admin/analytics/kadiwa-products?from=2999-01-01&to=2999-01-31`)).data;
+  assert.deepEqual([ahead.period.days, ahead.bestSellers.length, ahead.runningOut.length], [0, 0, 0]);
+  assert.equal((await admin.post('/api/admin/analytics/kadiwa-products/advice', { from: daysAgo(9), to: today })).status, 404, 'no suggestions endpoint');
+});
+
 test('loans: applications typed into the app need the borrower and co-maker IDs with 3 signatures', { skip }, async () => {
   const paper = { loanType: 'agricultural', loanMode: 'cash', cashAmount: '5000', term: 12, farmArea: '2', borrowerPhone: '09171234567', borrowerAddress: 'Purok 1, Amnay', cropsPlanted: 'Palay', certified: true };
   const url = '/api/members/me/loan-requests';
@@ -2060,13 +2089,18 @@ test('dashboard and analytics use real data', { skip }, async () => {
   assert.equal(trend.month.rows.at(-1).start, `${thisMonth}-01`);
   assert.equal(trend.year.rows.at(-1).start, `${year}-01-01`);
   assert.equal(trend.year.rows[0].start, `${Number(year) - 4}-01-01`);
-  // The same sources as the Operating revenue figure, over the same days.
+  // Net income as the Dashboard counts it (machinery: rentals + service fees + other income
+  // - expenses), over the same days as the chart.
   const sameWindow = (await admin.get(`/api/admin/analytics?from=${trend.year.from}&to=${todayDate}`)).data.summary;
   assert.equal(Math.round(trend.year.totals.kadiwa * 100), Math.round(sameWindow.kadiwaNetSales * 100));
-  assert.equal(Math.round(trend.year.totals.machinery * 100), Math.round(sameWindow.machineryRevenue * 100));
+  assert.equal(Math.round(trend.year.totals.machinery * 100), Math.round(sameWindow.machineryNetIncome * 100));
   assert.equal(Math.round(trend.year.totals.loanInterest * 100), Math.round(sameWindow.interestCollected * 100));
-  assert.equal(Math.round(trend.year.totals.total * 100), Math.round(sameWindow.totalOperatingRevenue * 100));
+  assert.equal(Math.round(trend.year.totals.total * 100), Math.round(sameWindow.netIncome * 100));
   assert.ok(trend.year.totals.total > 0, 'these tests recorded income this year');
+  assert.notEqual(Math.round(sameWindow.machineryNetIncome * 100), Math.round(sameWindow.machineryRevenue * 100), 'service fees and expenses count, not only rentals');
+  // Over all time, the Analytics net income is the Dashboard's.
+  const allTime = (await admin.get('/api/admin/analytics?from=2000-01-01&to=2999-12-31')).data.summary;
+  assert.equal(Math.round(allTime.netIncome * 100), Math.round((await admin.get('/api/admin/dashboard')).data.stats.netIncome * 100));
   // An earlier end date moves the window; a later one stops at today.
   const march = (await admin.get(`/api/admin/analytics/revenue?granularity=month&to=${year}-03-15`)).data;
   assert.deepEqual([march.rows[0].start, march.rows.at(-1).start, march.rows.at(-1).label], [`${Number(year) - 1}-04-01`, `${year}-03-01`, `Mar ${year}`]);
