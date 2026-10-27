@@ -53,9 +53,12 @@ async function askOpenAiCompatible(systemPrompt, content, temperature) {
 // Google retires Gemini models over time (gemini-2.5-flash now answers 404
 // "no longer available") and models are sometimes overloaded (503/429). The
 // configured model is tried first, then these, all within one time budget so
-// the request finishes before the 60-second serverless limit.
-const GEMINI_FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash'];
+// the request finishes before the 60-second serverless limit. An overloaded
+// model can also hang without answering, so each try gets at most
+// AI_ATTEMPT_MS and the older, less busy models still get their turn.
+const GEMINI_FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-flash-lite-latest'];
 const AI_TIME_BUDGET_MS = 45000;
+const AI_ATTEMPT_MS = 15000;
 
 // parts: the instruction, then the file (if any) as inlineData. unreadable is
 // the message for a 400 answer (the request itself was refused).
@@ -75,7 +78,7 @@ async function askGemini(apiKey, systemPrompt, parts, { temperature, unreadable 
     let response;
     try {
       response = await fetch(`${process.env.GEMINI_API_BASE || 'https://generativelanguage.googleapis.com/v1beta'}/models/${encodeURIComponent(model)}:generateContent`, {
-        method: 'POST', signal: AbortSignal.timeout(remaining), headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body,
+        method: 'POST', signal: AbortSignal.timeout(Math.min(remaining, AI_ATTEMPT_MS)), headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body,
       });
     } catch (error) {
       lastProblem = error?.name === 'TimeoutError' ? 'timeout' : 'network';
