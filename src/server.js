@@ -3,6 +3,7 @@ import { createApp } from './app.js';
 import { isProduction, validateProductionEnv } from './config/env.js';
 import { startEventListener, stopEventListener } from './services/events.js';
 import { refreshLoanStatuses } from './services/loanService.js';
+import { retryDueScans } from './controllers/ocrController.js';
 import { getPool } from './config/db.js';
 import { applyMigrations, autoMigrateEnabled } from './services/migrations.js';
 
@@ -49,6 +50,8 @@ server.on('error', (error) => {
 });
 
 let loanTimer = null;
+let ocrRetryTimer = null;
+const OCR_RETRY_INTERVAL_MS = 15000;
 
 server.listen(PORT, async () => {
   console.log(`ACIFAC backend: port ${PORT} open, checking the database...`);
@@ -69,11 +72,21 @@ server.listen(PORT, async () => {
   void refreshLoanStatuses({ force: true });
   loanTimer = setInterval(() => void refreshLoanStatuses({ force: true }), 60 * 60 * 1000);
   loanTimer.unref();
+
+  // Scans the AI could not read (it was busy) are read again by themselves.
+  let retrying = false;
+  ocrRetryTimer = setInterval(() => {
+    if (retrying) return;
+    retrying = true;
+    retryDueScans({ limit: 2 }).catch((error) => console.warn('OCR retry queue:', error.message)).finally(() => { retrying = false; });
+  }, OCR_RETRY_INTERVAL_MS);
+  ocrRetryTimer.unref();
 });
 
 async function shutdown(signal) {
   console.log(`${signal} received, shutting down.`);
   clearInterval(loanTimer);
+  clearInterval(ocrRetryTimer);
   await stopEventListener();
   server.close(() => {
     getPool().end().finally(() => process.exit(0));

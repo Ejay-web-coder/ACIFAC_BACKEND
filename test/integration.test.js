@@ -21,6 +21,9 @@ let stubAnalysis = DEFAULT_STUB_ANALYSIS;
 // What the stub AI answers when it is asked to read an applicant's ID or check their 2x2 picture.
 let stubIdReading = {};
 let stubPhotoReading = {};
+// The second, cross-check reading of a form: null = the same answer as the first; secondMode 'fail' = AI busy for it.
+let stubSecondReading = null;
+let secondMode = 'ok';
 // What the stub AI answers for the machinery recommendations, and the figures it was sent.
 let stubRecommendations = {};
 const recommendationRequests = [];
@@ -180,6 +183,8 @@ before(async () => {
     MEMBER_DOCUMENT_DIR: docs, OCR_AI_API_KEY: 'test-key', API_RATE_LIMIT_PER_MINUTE: '100000', EMAIL_FROM: 'test@acifac.local',
     // Small enough for the per-address lockout test to reach.
     LOGIN_IP_MAX_FAILURES: '6',
+    // A failing AI stub answers at once instead of after the 2 s and 5 s waits; the retry queue is tested instead.
+    OCR_AI_RETRY_DELAYS_MS: '', OCR_SERVICE_AREA: '',
   });
   // Blank (not delete): src/config/env.js loads .env with dotenv, which only
   // fills variables that are unset, and .env points at the real services.
@@ -208,7 +213,10 @@ before(async () => {
       if (stubMode === 'fail') { res.writeHead(500); res.end('{}'); return; }
       const prompt = String(JSON.parse(Buffer.concat(chunks).toString() || '{}').messages?.[0]?.content || '');
       if (prompt.startsWith('You advise the officers of ACIFAC')) recommendationRequests.push(JSON.parse(Buffer.concat(chunks).toString()).messages[1].content);
-      const answer = prompt.startsWith('You check the valid ID that') ? stubIdReading : prompt.includes('2x2 ID picture that an applicant submits') ? stubPhotoReading
+      const secondReading = prompt.startsWith('You are a careful data-entry clerk');
+      if (secondReading && secondMode === 'fail') { res.writeHead(503); res.end('{}'); return; }
+      const answer = secondReading && stubSecondReading ? stubSecondReading
+        : prompt.startsWith('You check the valid ID that') ? stubIdReading : prompt.includes('2x2 ID picture that an applicant submits') ? stubPhotoReading
         : prompt.startsWith('You advise the officers of ACIFAC') ? stubRecommendations : stubAnalysis;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(answer) } }] }));
@@ -2077,12 +2085,13 @@ test('ocr: retired or busy Gemini models fall back, and failed readings can be r
     const viaFallback = await admin.request('POST', '/api/ocr/analyze', { form: scanFile([201], 'fallback.png') });
     assert.equal(viaFallback.status, 201, JSON.stringify(viaFallback.data));
     assert.equal(viaFallback.data.data.processingStatus, 'completed');
-    assert.deepEqual(geminiCalls, ['gemini-2.5-flash', 'gemini-3.8-flash', 'gemini-flash-latest']);
+    // The form is read twice at the same time; each reading falls back the same way.
+    assert.deepEqual([...geminiCalls].sort(), ['gemini-2.5-flash', 'gemini-2.5-flash', 'gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-flash-latest', 'gemini-flash-latest']);
 
     // The next scan goes straight to the model that answered; the failed ones are resting.
     const nextScan = await admin.request('POST', '/api/ocr/analyze', { form: scanFile([203], 'next.png') });
     assert.equal(nextScan.status, 201, JSON.stringify(nextScan.data));
-    assert.deepEqual(geminiCalls.slice(3), ['gemini-flash-latest']);
+    assert.deepEqual(geminiCalls.slice(6), ['gemini-flash-latest', 'gemini-flash-latest']);
   } finally {
     Object.assign(process.env, { GEMINI_API_KEY: '', GEMINI_MODEL: '', GEMINI_API_BASE: '' });
   }
@@ -2101,6 +2110,167 @@ test('ocr: retired or busy Gemini models fall back, and failed readings can be r
   assert.equal(retried.data.data.documentType, 'Payment Receipt');
   const again = await admin.post(`/api/ocr/${failed.data.data.id}/retry`);
   assert.equal(again.status, 409);
+});
+
+test('ocr automation: two readings must agree, busy scans are read again by the queue, automatic saves can be undone', { skip }, async () => {
+  const memberNumber = (await admin.get(`/api/members/${state.memberId}`)).data.data.member_number;
+  const genuine = { score: 95, verdict: 'genuine', physicalDocument: true, filledIn: true, signaturePresent: true, photoRecognized: true, issues: [] };
+  const savings = (reference, overrides = {}) => ({
+    documentType: 'Savings Form', confidence: 94, ocrText: 'ACIFAC SAVINGS DEPOSIT', authenticity: genuine,
+    extractedData: { memberNumber, memberName: 'Juan Dela Cruz', amount: '200.00', date: '2026-01-21', paymentMethod: 'cash', referenceNumber: reference, ...overrides },
+  });
+  const upload = async (byte) => {
+    const form = new FormData();
+    form.append('source', 'camera');
+    form.append('document', new Blob([Buffer.concat([PNG, Buffer.from([0xa0, byte])])], { type: 'image/png' }), `auto-${byte}.png`);
+    const response = await admin.request('POST', '/api/ocr/analyze', { form });
+    assert.equal(response.status, 201, JSON.stringify(response.data));
+    return response.data.data;
+  };
+  const makeDue = (id) => pool.query('UPDATE document_scans SET next_retry_at = NOW() - INTERVAL \'1 second\' WHERE id = $1', [id]);
+  const notifications = async (type, id) => (await pool.query('SELECT title FROM notifications WHERE type = $1 AND entity_id = $2', [type, String(id)])).rows;
+
+  try {
+    // The two readings disagree on the amount: the form is held and the amount is flagged.
+    stubAnalysis = savings('SV-AUTO-1');
+    stubSecondReading = savings('SV-AUTO-1', { amount: '2000.00' });
+    const held = await upload(1);
+    assert.equal(held.posted, null);
+    assert.equal(held.verification.status, 'warning');
+    const agreement = held.verification.checks.find((check) => check.id === 'agreement');
+    assert.equal(agreement.status, 'warn', JSON.stringify(held.verification));
+    assert.deepEqual(agreement.fields, ['amount']);
+    // The confidence shown is the share of checks passed, not the AI's 94.
+    assert.ok(held.confidence < 100 && held.confidence > 50, String(held.confidence));
+    assert.equal(held.aiConfidence, 94);
+    // The admin corrects the amount from the paper form: the corrected value counts as checked.
+    const corrected = await admin.patch(`/api/ocr/${held.id}/review`, { documentType: 'Savings Form', extractedData: { ...held.extractedData, amount: '2000.00' } });
+    assert.equal(corrected.data.data.verification.checks.find((check) => check.id === 'agreement').status, 'pass');
+    stubSecondReading = null;
+
+    // Only the second reading failed: the scan is queued, then the queue reads it again and saves it.
+    secondMode = 'fail';
+    stubAnalysis = savings('SV-AUTO-2');
+    const once = await upload(3);
+    assert.equal(once.posted, null);
+    assert.ok(once.retry.nextAt, JSON.stringify(once.retry));
+    assert.equal(once.verification.checks.find((check) => check.id === 'agreement').status, 'warn');
+    secondMode = 'ok';
+    assert.deepEqual((await admin.post('/api/ocr/retry-due')).data.data, []);
+    await makeDue(once.id);
+    const second = await admin.post('/api/ocr/retry-due');
+    assert.equal(second.status, 200, JSON.stringify(second.data));
+    assert.equal(second.data.data[0].id, once.id);
+    assert.equal(second.data.data[0].posted?.automatically, true, JSON.stringify(second.data.data[0].verification));
+    assert.equal(second.data.data[0].retry.nextAt, null);
+
+    // The AI is busy for the whole reading: the scan is kept and read again by the queue, then saved and announced.
+    stubMode = 'fail';
+    stubAnalysis = savings('SV-AUTO-3');
+    const failed = await upload(4);
+    assert.equal(failed.processingStatus, 'failed');
+    assert.equal(failed.retry.count, 1);
+    assert.ok(new Date(failed.retry.nextAt) > new Date());
+    await makeDue(failed.id);
+    const stillBusy = await admin.post('/api/ocr/retry-due');
+    assert.equal(stillBusy.data.data[0].retry.count, 2);
+    assert.ok(stillBusy.data.data[0].retry.nextAt);
+    stubMode = 'ok';
+    await makeDue(failed.id);
+    const reread = (await admin.post('/api/ocr/retry-due')).data.data[0];
+    assert.equal(reread.processingStatus, 'completed');
+    assert.equal(reread.posted?.automatically, true, JSON.stringify(reread.verification));
+    assert.match((await notifications('ocr_auto_posted', failed.id))[0]?.title || '', /Savings deposit auto-recorded/);
+    // A savings deposit is corrected in Savings, not undone here.
+    assert.equal((await admin.post(`/api/ocr/${failed.id}/undo`)).status, 409);
+
+    // After the last automatic try the admins are told and the scan waits for Retry.
+    stubMode = 'fail';
+    stubAnalysis = savings('SV-AUTO-4');
+    const stuck = await upload(5);
+    await pool.query('UPDATE document_scans SET retry_count = 6 WHERE id = $1', [stuck.id]);
+    await makeDue(stuck.id);
+    const gaveUp = (await admin.post('/api/ocr/retry-due')).data.data[0];
+    assert.equal(gaveUp.retry.nextAt, null);
+    assert.equal((await notifications('ocr_failed', stuck.id)).length, 1);
+    stubMode = 'ok';
+
+    // A membership form that passes every check registers the member automatically; the admin can undo it.
+    const applicant = {
+      lastName: 'Villanueva', firstName: 'Lorna', email: 'lorna.auto@example.com', phone: '+63 917 555 0101', dateOfBirth: '1988-06-02',
+      address: 'Purok 1', barangay: 'Barahan', municipality: 'Sta. Cruz', province: 'Occidental Mindoro',
+    };
+    stubAnalysis = { documentType: 'Membership Form', confidence: 96, ocrText: 'ACIFAC ASSOCIATE MEMBERSHIP FORM', extractedData: applicant, authenticity: genuine };
+    const membership = await upload(6);
+    assert.equal(membership.extractedData.phone, '09175550101');
+    stubIdReading = {
+      isId: true, idType: 'PhilSys National ID', idNumber: '5555-0101-2026', name: 'LORNA VILLANUEVA', dateOfBirth: '1988-06-02',
+      frontVisible: true, backVisible: true, photocopy: false, physicalCard: true, screen: false, signatureCount: 0, expired: false, issues: [],
+    };
+    const idForm = new FormData();
+    idForm.append('source', 'camera');
+    idForm.append('idDocument', new Blob([Buffer.concat([PNG, Buffer.from([0xa1, 1])])], { type: 'image/png' }), 'lorna-id.png');
+    const withId = (await admin.request('POST', `/api/ocr/${membership.id}/id-document`, { form: idForm })).data.data;
+    // Barahan, Sta. Cruz is in the service area: Rosa Magsaysay, scanned earlier, lives there.
+    assert.equal(withId.posted?.module, 'members', JSON.stringify(withId.verification.checks.filter((check) => check.status !== 'pass')));
+    assert.ok(withId.verification.checks.some((check) => check.id === 'area' && check.status === 'pass'));
+    assert.ok(withId.posted.undoUntil);
+    assert.match((await notifications('ocr_auto_posted', membership.id))[0]?.title || '', /^New member auto-registered: Lorna Villanueva/);
+    const undone = await admin.post(`/api/ocr/${membership.id}/undo`);
+    assert.equal(undone.status, 200, JSON.stringify(undone.data));
+    assert.equal(undone.data.data.posted, null);
+    assert.equal(undone.data.data.reviewStatus, 'needs_review');
+    assert.equal(undone.data.data.undone.recordId, withId.posted.recordId);
+    assert.equal((await pool.query('SELECT 1 FROM members WHERE member_number = $1', [withId.posted.recordId])).rowCount, 0);
+    assert.equal((await admin.post(`/api/ocr/${membership.id}/undo`)).status, 409);
+    // Checked again it is not saved by itself a second time.
+    const rechecked = await admin.post(`/api/ocr/${membership.id}/verify`);
+    assert.equal(rechecked.data.data.posted, null);
+
+    // A barangay where no member lives yet is flagged, with the closest known one suggested.
+    stubAnalysis = { ...stubAnalysis, extractedData: { ...applicant, firstName: 'Nena', email: 'nena.auto@example.com', barangay: 'Barahn' } };
+    const typo = await upload(8);
+    const area = typo.verification.checks.find((check) => check.id === 'area');
+    assert.equal(area.status, 'warn');
+    assert.match(area.message, /did the form say Barahan/);
+    assert.deepEqual(area.fields, ['barangay']);
+
+    // An applicant under 18 fails, with the birthday highlighted; a CP No. that is not a mobile number fails too.
+    stubAnalysis = { ...stubAnalysis, extractedData: { ...applicant, firstName: 'Mika', email: 'mika.auto@example.com', dateOfBirth: '2015-01-01', phone: '288-1234' } };
+    const child = await upload(7);
+    const adult = child.verification.checks.find((check) => check.id === 'adult');
+    assert.equal(adult.status, 'fail');
+    assert.deepEqual(adult.fields, ['dateOfBirth']);
+    const format = child.verification.checks.find((check) => check.id === 'format');
+    assert.equal(format.status, 'fail');
+    assert.deepEqual(format.fields, ['phone']);
+
+    // Every flagged scan is rejected at once; saved, held-for-warnings and queued scans are left alone.
+    stubMode = 'fail';
+    stubAnalysis = savings('SV-AUTO-5');
+    const queuedScan = await upload(9);
+    stubMode = 'ok';
+    const bulk = await admin.post('/api/ocr/reject-flagged');
+    assert.equal(bulk.status, 200, JSON.stringify(bulk.data));
+    const rejectedIds = bulk.data.data.map((scan) => scan.id);
+    assert.ok(rejectedIds.includes(child.id));
+    assert.ok(bulk.data.data.every((scan) => scan.reviewStatus === 'rejected' && !scan.posted));
+    for (const kept of [held.id, once.id, queuedScan.id, membership.id]) assert.ok(!rejectedIds.includes(kept), String(kept));
+    assert.deepEqual((await admin.post('/api/ocr/reject-flagged')).data.data, []);
+
+    // A scan that is not needed can be deleted with its file; one saved to records cannot.
+    const removed = await admin.request('DELETE', `/api/ocr/${child.id}`);
+    assert.equal(removed.status, 200, JSON.stringify(removed.data));
+    assert.equal((await pool.query('SELECT 1 FROM document_scans WHERE id = $1', [child.id])).rowCount, 0);
+    assert.equal((await admin.request('GET', `/api/ocr/${child.id}/file`, { raw: true })).status, 404);
+    assert.equal((await admin.request('DELETE', `/api/ocr/${once.id}`)).status, 409);
+    assert.equal((await admin.request('DELETE', `/api/ocr/${child.id}`)).status, 404);
+  } finally {
+    stubMode = 'ok';
+    secondMode = 'ok';
+    stubSecondReading = null;
+    stubAnalysis = DEFAULT_STUB_ANALYSIS;
+  }
 });
 
 test('member emails: savings, share capital, loan application, scanned forms, opt-out', { skip }, async () => {

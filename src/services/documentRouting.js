@@ -1,6 +1,6 @@
 import { query, withTransaction } from '../config/db.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
-import { badRequest, toHttpError } from '../utils/http.js';
+import { badRequest, conflict, toHttpError } from '../utils/http.js';
 import { parseMoneyInput } from '../utils/money.js';
 import { insertMemberRecord, nextMemberNumber, parseShareCapital, SAVINGS_METHODS, insertSavingsDeposit, validateMemberInput } from '../controllers/memberController.js';
 import { insertLoanRequest, memberApplicationSelect, prepareApplication } from '../controllers/loanController.js';
@@ -69,16 +69,16 @@ export const FORM_DEFINITIONS = {
     // the ID card itself captured with the live camera (cardCapture).
     idDocuments: [{ slot: 'holder', person: 'applicant', cardCapture: true, checkId: 'idDocument', matchId: 'idMatch' }],
     description: 'ACIFAC associate membership form (one page): name, birthday, age, civil status, gender, CP no., educational attainment, ID type and number, RSBSA no., farm area, permanent address, family members (spouse, mother\'s maiden name, children), sources of income, membership acceptance / separation, the applicant signature, and the "For Cooperative" certification section.',
-    notes: 'Ignore the MEMBERSHIP NO. box at the top: the system gives the membership number. The form has no email; use "" for email unless one is written on it. phone is the CP #. address is only the house, street, sitio or purok written with the permanent address; barangay, municipality and province have their own keys. Mother\'s maiden name goes in motherLastName, motherFirstName and motherMiddleName. Children rows: child1Name/child1Age to child3Name/child3Age. Income rows: income1Source/income1Amount and income2Source/income2Amount (annual income). From the ACCEPTANCE row: membershipDate (its date), bodResolution and membershipType; from the SEPARATION row only separationDate. From FOR COOPERATIVE: membershipFee and dateReceived; the OR no. and certified-by name of the pre-membership education seminar (seminarOrNo, seminarCertifiedBy), the payment of membership fee (membershipFeeOrNo, feeCertifiedBy) and the initial paid-up capital (paidUpCapitalOrNo, capitalCertifiedBy); and shareCapital only when an initial paid-up capital amount is written.',
+    notes: 'The printed blank form from Add Member has the form code ACIFAC-MEM at the top right, the same sections numbered I to VI, and an Email line. Ignore the MEMBERSHIP NO. box at the top: the system gives the membership number. Older forms have no email; use "" for email unless one is written on it. phone is the CP #. address is only the house, street, sitio or purok written with the permanent address; barangay, municipality and province have their own keys. Mother\'s maiden name goes in motherLastName, motherFirstName and motherMiddleName. Children rows: child1Name/child1Age to child3Name/child3Age. Income rows: income1Source/income1Amount and income2Source/income2Amount (annual income). From the ACCEPTANCE row: membershipDate (its date), bodResolution and membershipType; from the SEPARATION row only separationDate. From FOR COOPERATIVE: membershipFee and dateReceived; the OR no. and certified-by name of the pre-membership education seminar (seminarOrNo, seminarCertifiedBy), the payment of membership fee (membershipFeeOrNo, feeCertifiedBy) and the initial paid-up capital (paidUpCapitalOrNo, capitalCertifiedBy); and shareCapital only when an initial paid-up capital amount is written.',
     fields: [
       f('lastName', 'Last Name', { required: true }), f('firstName', 'First Name', { required: true }), f('middleName', 'Middle Name'), f('suffix', 'Suffix (Jr., Sr., III)'),
       f('dateOfBirth', 'Birthday', { kind: 'date', required: true }), f('age', 'Age', { kind: 'integer' }), f('civilStatus', 'Civil Status'), f('gender', 'Gender'),
-      f('phone', 'CP No.', { required: true }), f('email', 'Email (not on the paper form)', { required: true, typedIn: true }),
+      f('phone', 'CP No.', { kind: 'phone', required: true }), f('email', 'Email (not on the paper form)', { required: true, typedIn: true }),
       f('education', 'Highest Educational Attainment'), f('idType', 'ID Type'), f('idNumber', 'ID No.'),
-      f('rsbsaNo', 'RSBSA No.'), f('farmAreaHa', 'Farm Area (ha)', { kind: 'number' }),
+      f('rsbsaNo', 'RSBSA No.', { kind: 'rsbsa' }), f('farmAreaHa', 'Farm Area (ha)', { kind: 'number' }),
       f('address', 'Permanent Address (house, street, sitio or purok)'),
       f('barangay', 'Barangay', { required: true }), f('municipality', 'Municipality', { required: true }), f('province', 'Province', { required: true }),
-      f('spouseName', 'Spouse Name'), f('spouseAge', 'Spouse Age', { kind: 'integer' }), f('spouseContact', 'Spouse Contact No.'),
+      f('spouseName', 'Spouse Name'), f('spouseAge', 'Spouse Age', { kind: 'integer' }), f('spouseContact', 'Spouse Contact No.', { kind: 'phone' }),
       f('motherLastName', 'Mother\'s Maiden Name - Last Name'), f('motherFirstName', 'Mother\'s Maiden Name - First Name'), f('motherMiddleName', 'Mother\'s Maiden Name - Middle Name'),
       ...CHILD_ROWS.flatMap((row) => [f(`child${row}Name`, `Child ${row} - Name`), f(`child${row}Age`, `Child ${row} - Age`, { kind: 'integer' })]),
       ...INCOME_ROWS.flatMap((row) => [f(`income${row}Source`, `Source of Income ${row}`), f(`income${row}Amount`, `Source of Income ${row} - Annual Income`, { kind: 'money' })]),
@@ -99,13 +99,13 @@ export const FORM_DEFINITIONS = {
       { slot: 'coMaker', person: 'co-maker', checkId: 'coMakerId', matchId: 'coMakerMatch' },
     ],
     description: 'ACIFAC "Loan Application Form (Agri)" for an agricultural loan, usually two pages: borrower details, farm details, loan mode with the in-kind farm inputs table, cash amount, co-maker, and collateral with the borrower signature.',
-    notes: 'For the in-kind table use the keys <row>Description, <row>Quantity, <row>Unit, <row>UnitPrice and <row>Total for the rows fertilizer, pesticides, herbicides, insecticides, seeds and plantChemicals (Plant Chemicals for Spray); leave a row empty when it is not filled. loanMode is the ticked box: cash, in-kind or combination. sex is Male or Female. irrigationType is rainfed, irrigated or other. collateralType is the ticked box: Land Title / Property, Harvest, or Savings Deposit / Share Capital. Ignore the office-use approval section (APPROVED / DISAPPROVED / FOR EVALUATION and approved amounts).',
+    notes: 'The printed blank form from New Loan has the form code ACIFAC-LOAN at the top right, sections numbered I to VI, and a Loan Term (months) line (term). For the in-kind table use the keys <row>Description, <row>Quantity, <row>Unit, <row>UnitPrice and <row>Total for the rows fertilizer, pesticides, herbicides, insecticides, seeds and plantChemicals (Plant Chemicals for Spray); leave a row empty when it is not filled. loanMode is the ticked box: cash, in-kind or combination. sex is Male or Female. irrigationType is rainfed, irrigated or other. collateralType is the ticked box: Land Title / Property, Harvest, or Savings Deposit / Share Capital. Ignore the office-use approval section (APPROVED / DISAPPROVED / FOR EVALUATION and approved amounts).',
     fields: [
       f('formNo', 'Form No.'), f('applicationDate', 'Date of Application', { kind: 'date' }),
       f('memberName', 'Borrower Name', { required: true }), f('memberNumber', 'Member No.'),
       f('occupation', 'Occupation'), f('yearsFarming', 'Years of Farming', { kind: 'number' }),
       f('age', 'Age', { kind: 'integer' }), f('civilStatus', 'Civil Status'), f('sex', 'Sex'),
-      f('address', 'Address'), f('contactNo', 'Contact No.'), f('email', 'Email'),
+      f('address', 'Address'), f('contactNo', 'Contact No.', { kind: 'phone' }), f('email', 'Email'),
       f('farmLocation', 'Farm Location / Sitio & Barangay'), f('farmArea', 'Total Farm Area (hectares)', { kind: 'number' }),
       f('cropsPlanted', 'Crops Planted'), f('cropSeason', 'Crop Season / Year'),
       f('irrigationType', 'Irrigation Type (rainfed, irrigated, other)'), f('irrigationOther', 'Irrigation Other'),
@@ -116,7 +116,7 @@ export const FORM_DEFINITIONS = {
         f(`${key}Total`, `${label} - Total Amount`, { kind: 'money' }),
       ]),
       f('grandTotal', 'In-Kind Grand Total', { kind: 'money' }), f('cashAmount', 'Cash Amount Requested (Php)', { kind: 'money' }),
-      f('coMakerName', 'Co-Maker Name', { required: true }), f('coMakerAddress', 'Co-Maker Address'), f('coMakerContact', 'Co-Maker Contact No.'),
+      f('coMakerName', 'Co-Maker Name', { required: true }), f('coMakerAddress', 'Co-Maker Address'), f('coMakerContact', 'Co-Maker Contact No.', { kind: 'phone' }),
       f('coMakerRelationship', 'Relationship to Borrower'),
       f('collateralType', 'Collateral Offered'), f('collateralDetails', 'Description / Details of Collateral'),
       f('term', 'Loan Term (months) - not on the paper form; 12 if blank', { kind: 'integer' }),
@@ -250,7 +250,23 @@ authenticity must be: { "score": number 0-100 (how likely this is a genuine, una
 Look for: altered, overwritten or erased values; mismatched fonts or ink inside a field; pasted or digitally edited areas; totals that do not add up; SAMPLE/SPECIMEN/VOID marks; screen moiré or pixels; missing signatures; a form that is not an ACIFAC/cooperative form. Report every problem found in issues.${captureSource === 'camera' ? '\nThis document was photographed with a phone camera at the office, so normal perspective, shadows and paper texture are expected and are not signs of tampering.' : ''}`;
 }
 
-export const ID_READING_INSTRUCTION = 'Read this identification document: its type, number, name, birthday and address, which sides are shown, and the specimen signatures written around it.';
+// The second, independent reading of a form, asked at the same time as the
+// first with different wording and only the fields (no text dump, no
+// authenticity), so it is quick. Values both readings agree on are trusted;
+// those they disagree on are flagged for the admin (see checkReadingAgreement).
+export function buildCrossCheckPrompt() {
+  const forms = Object.entries(FORM_DEFINITIONS).filter(([, definition]) => !definition.legacy).map(([type, definition]) => (
+    `- "${type}": ${[...definition.fields.filter((field) => !field.tableCell && !field.typedIn).map((field) => field.key), ...(definition.tables || []).map(tableKeysText)].join(', ')}`
+  )).join('\n');
+  return `You are a careful data-entry clerk for ACIFAC, an agricultural cooperative in the Philippines. Transcribe the handwritten and printed entries of this paper form. Return JSON only: { "documentType": string, "extractedData": object of strings }.
+documentType is one of the form names below, or "${UNRECOGNIZED}". Use exactly the keys listed for the form:
+${forms}
+Copy each entry exactly as written, letter by letter and digit by digit. Use "" for a blank, missing or illegible entry; never guess or complete a value. Dates as YYYY-MM-DD. Money and numbers as digits with optional 2 decimals (no currency sign, no commas). A form may have several pages, photographed in any orientation.`;
+}
+
+export const CROSS_CHECK_INSTRUCTION = 'Transcribe every entry of this form into the listed keys.';
+
+export const ID_READING_INSTRUCTION ='Read this identification document: its type, number, name, birthday and address, which sides are shown, and the specimen signatures written around it.';
 
 // A valid ID submitted with a scanned form: a back-to-back copy with the
 // person's specimen signatures (uploaded, or for a loan form also photographed
@@ -332,11 +348,34 @@ function normalizeDate(value) {
   return new Date(parsed).toISOString().slice(0, 10);
 }
 
+// A Philippine mobile number as 09XXXXXXXXX (from +63 9XX..., 63 9XX..., 9XX...).
+export const PH_MOBILE = /^09\d{9}$/;
+export function normalizePhone(value) {
+  const text = String(value ?? '').trim();
+  const digits = text.replace(/\D/g, '');
+  if (!/^[+\d\s().-]+$/.test(text)) return text;
+  if (/^639\d{9}$/.test(digits)) return `0${digits.slice(2)}`;
+  if (/^9\d{9}$/.test(digits)) return `0${digits}`;
+  return PH_MOBILE.test(digits) ? digits : text;
+}
+
+// RSBSA reference numbers: region-province-municipality-barangay-sequence,
+// e.g. 17-51-08-012-000123 (the sequence has 5 or 6 digits).
+export const RSBSA_PATTERN = /^\d{2}-\d{2}-\d{2}-\d{3}-\d{5,6}$/;
+function normalizeRsbsa(value) {
+  const text = String(value ?? '').trim();
+  const digits = text.replace(/\D/g, '');
+  if (!/^[\d\s.-]+$/.test(text) || (digits.length !== 14 && digits.length !== 15)) return text;
+  return `${digits.slice(0, 2)}-${digits.slice(2, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 9)}-${digits.slice(9)}`;
+}
+
 function normalizeValue(field, value) {
   const text = value === null || value === undefined ? '' : String(value).trim().slice(0, 2000);
   if (!text) return '';
   if (field.kind === 'money') return normalizeMoney(text);
   if (field.kind === 'date') return normalizeDate(text);
+  if (field.kind === 'phone') return normalizePhone(text);
+  if (field.kind === 'rsbsa') return normalizeRsbsa(text);
   if (field.kind === 'number' || field.kind === 'integer') return text.replace(/,/g, '').replace(/\s*(ha|hectares?|months?|mos?\.?)$/i, '');
   return text;
 }
@@ -377,13 +416,38 @@ export function normalizeAuthenticity(raw) {
 
 const nameTokens = (name) => String(name || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z\s]/g, ' ').split(/\s+/).filter((token) => token.length > 1);
 
-function nameSimilarity(a, b) {
-  const left = new Set(nameTokens(a));
-  const right = new Set(nameTokens(b));
-  if (!left.size || !right.size) return 0;
-  let shared = 0;
-  for (const token of left) if (right.has(token)) shared += 1;
-  return shared / Math.min(left.size, right.size);
+function editDistance(a, b) {
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j += 1) current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    previous = current;
+  }
+  return previous[b.length];
+}
+
+// 1 for the same text, falling with each letter added, dropped or changed.
+export function textSimilarity(a, b) {
+  const [left, right] = [String(a), String(b)];
+  if (left === right) return 1;
+  if (!left || !right) return 0;
+  if (left.length > 300 || right.length > 300) return 0;
+  return 1 - editDistance(left, right) / Math.max(left.length, right.length);
+}
+
+// A name matches when it is at least this similar (0.9 = 90%).
+export const NAME_MATCH_MIN = 0.9;
+const percent = (score) => `${Math.round(score * 100)}%`;
+
+// How alike two names are, 0 to 1: each word of the shorter name is paired
+// with its closest word in the other, so a missing middle name or a letter
+// misread by the AI ("Dela Crus") still scores high, and word order is ignored.
+export function nameSimilarity(a, b) {
+  const left = [...new Set(nameTokens(a))];
+  const right = [...new Set(nameTokens(b))];
+  if (!left.length || !right.length) return 0;
+  const [shorter, longer] = left.length <= right.length ? [left, right] : [right, left];
+  return shorter.reduce((sum, token) => sum + Math.max(...longer.map((other) => textSimilarity(token, other))), 0) / shorter.length;
 }
 
 // Every word of the shorter name is in the other, and a Jr. or Sr. matches too.
@@ -431,8 +495,8 @@ async function findMember(db, data, { requireActive }) {
   if (!name) return { member, check: ['warn', `The form has no member name to confirm Member ID ${member.member_number} (${member.full_name}).`] };
   const similarity = nameSimilarity(name, member.full_name);
   if (similarity < 0.5) return { member, check: ['fail', `The name on the form ("${name}") does not match the owner of ${member.member_number} (${member.full_name}).`] };
-  if (similarity < 1) return { member, check: ['warn', `The name on the form ("${name}") only partly matches ${member.full_name} (${member.member_number}).`] };
-  return { member, check: ['pass', `${member.full_name} (${member.member_number}) found and the name matches.`] };
+  if (similarity < NAME_MATCH_MIN) return { member, check: ['warn', `The name on the form ("${name}") only partly matches ${member.full_name} (${member.member_number}): ${percent(similarity)} alike, ${percent(NAME_MATCH_MIN)} needed.`] };
+  return { member, check: ['pass', `${member.full_name} (${member.member_number}) found and the name matches${similarity < 1 ? ` (${percent(similarity)} alike)` : ''}.`] };
 }
 
 async function findMachine(db, reference) {
@@ -459,31 +523,101 @@ const FINGERPRINT_KEYS = {
 
 const moneyCents = (value) => (value ? parseMoneyInput(value, { allowZero: true }) : 0);
 
+// One verification check; fields: the form keys it is about, highlighted in the scanner.
+const makeCheck = (id, label, status, message, fields) => ({ id, label, status, message, ...(fields?.length ? { fields: [...new Set(fields)] } : {}) });
+
 function checkFields(definition, data, add) {
   const missing = definition.fields.filter((field) => field.required && !String(data[field.key] || '').trim());
   const names = (fields) => fields.map((field) => field.label.replace(/\s*\(.*\)$/, '')).join(', ');
   const onForm = missing.filter((field) => !field.typedIn);
   const typedIn = missing.filter((field) => field.typedIn);
   if (missing.length) {
-    add('required', 'Required information', 'fail', [onForm.length && `Missing on the form: ${names(onForm)}.`, typedIn.length && `Type in the ${names(typedIn)}; it is not on the paper form.`].filter(Boolean).join(' '));
+    add('required', 'Required information', 'fail', [onForm.length && `Missing on the form: ${names(onForm)}.`, typedIn.length && `Type in the ${names(typedIn)}; it is not on the paper form.`].filter(Boolean).join(' '), missing.map((field) => field.key));
   } else add('required', 'Required information', 'pass', 'All required fields were read from the form.');
 
+  // Invalid values fail; a doubtful one (an optional contact number that is
+  // not a mobile number, an RSBSA No. not in the usual pattern) is a warning.
   const invalid = [];
+  const doubtful = [];
   const today = todayDateOnly();
   for (const field of definition.fields) {
     const value = String(data[field.key] || '').trim();
     if (!value) continue;
-    if (field.kind === 'date' && !isValidDateOnly(value)) invalid.push(`${field.label} is not a valid date`);
-    else if (field.kind === 'date' && !['startDate', 'endDate'].includes(field.key) && value > today) invalid.push(`${field.label} is in the future`);
-    else if (field.kind === 'money' && parseMoneyInput(value, { allowZero: true }) === null) invalid.push(`${field.label} is not a valid amount`);
-    else if (field.kind === 'number' && !/^\d+(\.\d{1,2})?$/.test(value)) invalid.push(`${field.label} is not a valid number`);
-    else if (field.kind === 'integer' && !/^\d+$/.test(value)) invalid.push(`${field.label} must be a whole number`);
+    const problem = (list, message) => list.push([field.key, `${field.label.replace(/\s*\(.*\)$/, '')} ${message}`]);
+    if (field.kind === 'date' && !isValidDateOnly(value)) problem(invalid, 'is not a valid date');
+    else if (field.kind === 'date' && !['startDate', 'endDate'].includes(field.key) && value > today) problem(invalid, 'is in the future');
+    else if (field.kind === 'money' && parseMoneyInput(value, { allowZero: true }) === null) problem(invalid, 'is not a valid amount');
+    else if (field.kind === 'number' && !/^\d+(\.\d{1,2})?$/.test(value)) problem(invalid, 'is not a valid number');
+    else if (field.kind === 'integer' && !/^\d+$/.test(value)) problem(invalid, 'must be a whole number');
+    else if (field.kind === 'phone' && !PH_MOBILE.test(value)) problem(field.required ? invalid : doubtful, `"${value}" is not a Philippine mobile number (09XXXXXXXXX)`);
+    else if (field.kind === 'rsbsa' && !RSBSA_PATTERN.test(value)) problem(doubtful, `"${value}" does not follow the RSBSA pattern (e.g. 17-51-08-012-000123)`);
   }
-  if (invalid.length) add('format', 'Values are valid', 'fail', `${invalid.join('; ')}.`);
-  else add('format', 'Values are valid', 'pass', 'Dates, amounts and numbers are readable and valid.');
+  const listed = (list) => `${list.map(([, message]) => message).join('; ')}.`;
+  if (invalid.length) add('format', 'Values are valid', 'fail', listed([...invalid, ...doubtful]), [...invalid, ...doubtful].map(([key]) => key));
+  else if (doubtful.length) add('format', 'Values are valid', 'warn', listed(doubtful), doubtful.map(([key]) => key));
+  else add('format', 'Values are valid', 'pass', 'Dates, amounts, numbers and mobile numbers are readable and valid.');
 }
 
-function checkAuthenticity(definition, authenticity, confidence, add) {
+// Both AI readings of the form (see buildCrossCheckPrompt), field by field.
+// Numbers must be equal; text may differ only slightly (90% alike, e.g. one
+// letter in a long name), ignoring case, spaces and punctuation.
+function sameReading(field, a, b) {
+  if (!a || !b) return a === b;
+  if (['money', 'number', 'integer'].includes(field.kind)) {
+    const [x, y] = [Number(a.replace(/,/g, '')), Number(b.replace(/,/g, ''))];
+    if (Number.isFinite(x) && Number.isFinite(y)) return Math.abs(x - y) < 0.005;
+  }
+  if (compact(a) === compact(b)) return true;
+  return field.kind === 'text' && textSimilarity(compact(a), compact(b)) >= NAME_MATCH_MIN;
+}
+
+export function compareReadings(documentType, first, second) {
+  const definition = FORM_DEFINITIONS[documentType];
+  if (!definition) return { compared: 0, differing: [] };
+  let compared = 0;
+  const differing = [];
+  for (const field of definition.fields) {
+    if (field.typedIn) continue;
+    const [a, b] = [String(first?.[field.key] ?? '').trim(), String(second?.[field.key] ?? '').trim()];
+    if (!a && !b) continue;
+    compared += 1;
+    if (!sameReading(field, a, b)) differing.push(field.key);
+  }
+  return { compared, differing };
+}
+
+// The two readings must agree. A value the admin has since corrected counts
+// as checked; the others that differ are flagged until the admin looks.
+function checkReadingAgreement(definition, documentType, crossCheck, data, add) {
+  if (!crossCheck || (!crossCheck.error && !crossCheck.first)) return;
+  const label = 'Two AI readings agree';
+  if (crossCheck.error) {
+    add('agreement', label, 'warn', `The form could not be read a second time to double-check the values (${crossCheck.error}). It is tried again automatically; meanwhile compare the values with the paper form.`);
+    return;
+  }
+  if (crossCheck.firstType !== documentType) {
+    add('agreement', label, 'pass', 'The form type was set by an admin, so the values are checked by the admin instead of a second reading.');
+    return;
+  }
+  if (crossCheck.documentType && crossCheck.documentType !== documentType) {
+    add('agreement', label, 'warn', `The second reading took this for a ${crossCheck.documentType}. Check that it is a ${documentType}.`);
+    return;
+  }
+  const { compared, differing } = compareReadings(documentType, crossCheck.first, crossCheck.second);
+  const fieldOf = (key) => definition.fields.find((field) => field.key === key);
+  const flagged = differing.filter((key) => sameReading(fieldOf(key), String(data[key] ?? '').trim(), String(crossCheck.first[key] ?? '').trim()));
+  if (flagged.length) {
+    const shown = flagged.slice(0, 8).map((key) => `${fieldOf(key).label.replace(/\s*\(.*\)$/, '')} ("${crossCheck.first[key] || 'blank'}" or "${crossCheck.second[key] || 'blank'}")`);
+    add('agreement', label, 'warn', `The two readings differ on ${flagged.length} ${flagged.length === 1 ? 'value' : 'values'}: ${shown.join('; ')}${flagged.length > 8 ? '; ...' : ''}. Check ${flagged.length === 1 ? 'it' : 'them'} on the paper form.`, flagged);
+  } else {
+    add('agreement', label, 'pass', `Two independent readings agree on all ${compared} values${differing.length ? ` (${differing.length} corrected by an admin)` : ''}.`);
+  }
+}
+
+// The AI's own confidence score is not a check: it says little about whether
+// the values are right. The second reading (checkReadingAgreement) and the
+// rule checks below decide instead.
+function checkAuthenticity(definition, authenticity, add) {
   const { score, verdict, issues } = authenticity;
   const issueText = issues.length ? ` Issues: ${issues.join('; ')}.` : '';
   if (verdict === 'fake' || (score !== null && score < 50)) add('authenticity', 'Document authenticity', 'fail', `AI judged this document as likely not genuine${score !== null ? ` (${score}/100)` : ''}.${issueText}`);
@@ -495,9 +629,6 @@ function checkAuthenticity(definition, authenticity, confidence, add) {
   if (authenticity.physicalDocument === false) add('physical', 'Original paper form', 'warn', 'This looks like a screen photo, screenshot or digitally made image rather than the paper form.');
   if (definition.signatureExpected && authenticity.signaturePresent === false) add('signature', 'Signature', 'warn', 'No signature was detected on the form.');
   else if (definition.signatureExpected && authenticity.signaturePresent) add('signature', 'Signature', 'pass', 'A signature is present.');
-
-  if (confidence === null || confidence < 85) add('confidence', 'Reading confidence', 'warn', `AI reading confidence is ${confidence === null ? 'unknown' : `${confidence}%`}. Compare each field with the paper form.`);
-  else add('confidence', 'Reading confidence', 'pass', `AI read the form with ${confidence}% confidence.`);
 }
 
 // Whole years between a YYYY-MM-DD birthday and today.
@@ -507,24 +638,89 @@ function ageOn(dateOfBirth, today = todayDateOnly()) {
   return year - birthYear - (month < birthMonth || (month === birthMonth && day < birthDay) ? 1 : 0);
 }
 
+export const MIN_MEMBER_AGE = 18;
+
+// A place name to compare: "Sta. Cruz" = "Santa Cruz" = "STA CRUZ", "Brgy. Barahan" = "Barahan".
+export function placeKey(value) {
+  return String(value || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/\b(brgy|bgy|barangay|municipality of|city of|town of)\b\.?/g, ' ')
+    .replace(/\bsta\b\.?/g, 'santa').replace(/\bsto\b\.?/g, 'santo').replace(/\bpob\b\.?/g, 'poblacion')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+// The cooperative's service area: OCR_SERVICE_AREA when set, as
+// "Municipality: Barangay, Barangay; Municipality" (a municipality without
+// barangays takes any barangay), otherwise the municipalities and barangays
+// where members already live. Map of municipality key -> { name, barangays: Map key -> name }.
+async function serviceArea(db) {
+  const area = new Map();
+  const place = (municipality, barangay) => {
+    const key = placeKey(municipality);
+    if (!key) return;
+    if (!area.has(key)) area.set(key, { name: String(municipality).trim(), barangays: new Map() });
+    if (placeKey(barangay)) area.get(key).barangays.set(placeKey(barangay), String(barangay).trim());
+  };
+  const configured = String(process.env.OCR_SERVICE_AREA || '').trim();
+  if (configured) {
+    for (const part of configured.split(';')) {
+      const [municipality, barangays = ''] = part.split(':');
+      place(municipality, '');
+      for (const barangay of barangays.split(',')) place(municipality, barangay);
+    }
+    return { area, configured: true };
+  }
+  const rows = (await db.query(
+    `SELECT municipality, barangay FROM members WHERE status <> 'archived' AND COALESCE(TRIM(municipality), '') <> '' GROUP BY municipality, barangay`
+  )).rows;
+  for (const row of rows) place(row.municipality, row.barangay || '');
+  return { area, configured: false };
+}
+
+// The closest known name to a misspelt one, when it is close enough to suggest.
+function closestPlace(value, names) {
+  const key = placeKey(value);
+  return [...names.entries()].map(([other, name]) => ({ name, score: textSimilarity(key, other) })).sort((a, b) => b.score - a.score).find(({ score }) => score >= 0.75)?.name || null;
+}
+
+async function checkServiceArea(db, data, add) {
+  const municipality = String(data.municipality || '').trim();
+  const barangay = String(data.barangay || '').trim();
+  if (!municipality || !barangay) return;
+  const { area, configured } = await serviceArea(db);
+  if (!area.size) return;
+  const label = 'Within the service area';
+  const town = area.get(placeKey(municipality));
+  if (!town) {
+    const near = closestPlace(municipality, new Map([...area.entries()].map(([key, value]) => [key, value.name])));
+    add('area', label, 'warn', `${municipality} is not ${configured ? 'in the service area' : 'a municipality where members live'}${near ? `; did the form say ${near}?` : ''}. Check the address on the paper form.`, ['municipality']);
+    return;
+  }
+  if (town.barangays.size && !town.barangays.has(placeKey(barangay))) {
+    const near = closestPlace(barangay, town.barangays);
+    add('area', label, 'warn', `Barangay ${barangay} is not ${configured ? `in the service area of ${town.name}` : `a barangay of ${town.name} where members live`}${near ? `; did the form say ${near}?` : ''}. Check the address on the paper form.`, ['barangay']);
+    return;
+  }
+  add('area', label, 'pass', `Barangay ${barangay}, ${town.name} is in the cooperative's service area.`);
+}
+
 // Who a submitted ID must belong to, from the form (and, for a borrower, the
 // member record): names to compare, and details that should agree with the ID.
 // holderReading: AI's reading of the borrower's ID, which the co-maker's must not be.
 function expectedIdHolder(documentType, requirement, data, member, holderReading) {
   if (documentType === 'Membership Form') {
     const name = [data.firstName, data.middleName, data.lastName, data.suffix].filter(Boolean).join(' ');
-    return { names: [['the applicant on the form', name]], dateOfBirth: [data.dateOfBirth, 'the form'], formIdNumber: data.idNumber };
+    return { names: [['the applicant on the form', name]], dateOfBirth: [data.dateOfBirth, 'the form'], formIdNumber: data.idNumber, fields: ['firstName', 'lastName', 'dateOfBirth', 'idNumber'] };
   }
   const borrowerNames = [data.memberName, member?.full_name].filter(Boolean);
   if (requirement.slot === 'coMaker') {
     return {
-      names: [['the co-maker on the form', data.coMakerName]], address: data.coMakerAddress,
+      names: [['the co-maker on the form', data.coMakerName]], address: data.coMakerAddress, fields: ['coMakerName', 'coMakerAddress'],
       notBorrower: { names: borrowerNames, idNumber: holderReading?.idNumber || '' },
     };
   }
   const names = [['the borrower on the form', data.memberName]];
   if (member && compact(member.full_name) !== compact(data.memberName || '')) names.push([`the member on record (${member.member_number})`, member.full_name]);
-  return { names, dateOfBirth: [member?.date_of_birth || '', 'the member record'], age: data.age, address: data.address || member?.address, recordIdNumber: member?.id_number };
+  return { names, dateOfBirth: [member?.date_of_birth || '', 'the member record'], age: data.age, address: data.address || member?.address, recordIdNumber: member?.id_number, fields: ['memberName', 'age', 'address'] };
 }
 
 // A valid ID submitted with a scanned form: a back-to-back copy (front and back
@@ -587,7 +783,7 @@ export const ID_CHECK_IDS = Object.fromEntries(Object.values(FORM_DEFINITIONS).f
 // coMakerAddress as on the loan form; member: the borrower's member record.
 export function checkLoanIds(ids, data, member) {
   const checks = [];
-  const add = (id, label, status, message) => checks.push({ id, label, status, message });
+  const add = (id, label, status, message, fields) => checks.push(makeCheck(id, label, status, message, fields));
   if (data.coMakerName && member && samePerson(data.coMakerName, member.full_name)) add('coMaker', 'Co-maker', 'fail', `The co-maker (${data.coMakerName}) is the borrower; the co-maker must be another person.`);
   for (const requirement of idRequirements('Loan Form')) {
     checkIdDocument(ids[requirement.slot] || null, requirement, expectedIdHolder('Loan Form', requirement, data, member, ids.holder?.reading), add);
@@ -604,7 +800,7 @@ export const MEMBER_APPLICANT_ID = { slot: 'holder', person: 'applicant', cardCa
 // firstName, middleName, lastName, suffix, dateOfBirth and idNumber as on the form.
 export function checkMemberId(submitted, data) {
   const checks = [];
-  const add = (id, label, status, message) => checks.push({ id, label, status, message });
+  const add = (id, label, status, message, fields) => checks.push(makeCheck(id, label, status, message, fields));
   checkIdDocument(submitted, MEMBER_APPLICANT_ID, expectedIdHolder('Membership Form', MEMBER_APPLICANT_ID, data), add);
   return checks;
 }
@@ -619,7 +815,7 @@ function checkIdMatch(requirement, reading, expected, add) {
     if (!String(name || '').trim()) { mismatches.push(['warn', `There is no name for ${who} to compare with the ID`]); continue; }
     const similarity = nameSimilarity(reading.name, name);
     if (similarity < 0.5) mismatches.push(['fail', `The name on the ID ("${reading.name}") is not ${who} (${name})`]);
-    else if (similarity < 1) mismatches.push(['warn', `The name on the ID ("${reading.name}") only partly matches ${who} (${name})`]);
+    else if (similarity < NAME_MATCH_MIN) mismatches.push(['warn', `The name on the ID ("${reading.name}") only partly matches ${who} (${name}): ${percent(similarity)} alike, ${percent(NAME_MATCH_MIN)} needed`]);
   }
   if (expected.notBorrower) {
     const borrower = expected.notBorrower.names.find((name) => reading.name && samePerson(reading.name, name));
@@ -635,7 +831,7 @@ function checkIdMatch(requirement, reading, expected, add) {
 
   const label = `ID belongs to the ${requirement.person}`;
   if (mismatches.length) {
-    add(requirement.matchId, label, mismatches.some(([status]) => status === 'fail') ? 'fail' : 'warn', `${mismatches.map(([, message]) => message).join('. ')}.`);
+    add(requirement.matchId, label, mismatches.some(([status]) => status === 'fail') ? 'fail' : 'warn', `${mismatches.map(([, message]) => message).join('. ')}.`, expected.fields);
     return;
   }
   const onFile = reading.idNumber && expected.recordIdNumber && compact(reading.idNumber) === compact(expected.recordIdNumber) ? ' (the ID on file)' : '';
@@ -736,18 +932,34 @@ async function checkRecords(db, documentType, data, add, found = {}) {
        LIMIT 1`,
       [data.email || '', data.rsbsaNo || '', isValidDateOnly(data.dateOfBirth) ? data.dateOfBirth : '', data.firstName || '', data.lastName || '']
     )).rows[0];
-    if (duplicate) add('records', 'Not already registered', 'fail', `This applicant appears to be already registered as ${duplicate.member_number}.`);
-    else add('records', 'Not already registered', 'pass', 'No existing member has the same email, RSBSA number, or name and birth date.');
+    // The same birthday and a name at least 90% alike (a misread letter, a
+    // missing middle name) is probably the same person registered before.
+    const applicantName = [data.firstName, data.middleName, data.lastName, data.suffix].filter(Boolean).join(' ');
+    const lookalike = !duplicate && isValidDateOnly(data.dateOfBirth)
+      ? (await db.query(`${memberLookupSelect} WHERE date_of_birth = $1::date AND status <> 'archived'`, [data.dateOfBirth])).rows
+        .map((member) => ({ member, score: nameSimilarity(applicantName, member.full_name) })).sort((a, b) => b.score - a.score)
+        .find(({ score }) => score >= NAME_MATCH_MIN)
+      : null;
+    if (duplicate) add('records', 'Not already registered', 'fail', `This applicant appears to be already registered as ${duplicate.member_number}.`, ['firstName', 'lastName', 'dateOfBirth', 'rsbsaNo', 'email']);
+    else if (lookalike) add('records', 'Not already registered', 'warn', `${lookalike.member.full_name} (${lookalike.member.member_number}) has the same birthday and a name ${percent(lookalike.score)} alike. Check that this is not the same person.`, ['firstName', 'middleName', 'lastName', 'dateOfBirth']);
+    else add('records', 'Not already registered', 'pass', 'No existing member has the same email, RSBSA number, ID number, or a similar name with the same birth date.');
 
     const idNumber = compact(data.idNumber || '');
     if (idNumber.length >= 5) {
       const holder = (await db.query(`SELECT member_number FROM members WHERE regexp_replace(LOWER(COALESCE(id_number, '')), '[^a-z0-9]', '', 'g') = $1 LIMIT 1`, [idNumber])).rows[0];
-      if (holder) add('idRegistered', 'ID not used by another member', 'fail', `ID No. ${data.idNumber} is already registered to member ${holder.member_number}.`);
+      if (holder) add('idRegistered', 'ID not used by another member', 'fail', `ID No. ${data.idNumber} is already registered to member ${holder.member_number}.`, ['idNumber']);
+    }
+    if (isValidDateOnly(data.dateOfBirth)) {
+      const years = ageOn(data.dateOfBirth);
+      if (years < MIN_MEMBER_AGE) add('adult', `Applicant is ${MIN_MEMBER_AGE} or older`, 'fail', `The birthday ${data.dateOfBirth} makes the applicant ${years}; members must be at least ${MIN_MEMBER_AGE}.`, ['dateOfBirth']);
+      else if (years > 110) add('adult', `Applicant is ${MIN_MEMBER_AGE} or older`, 'fail', `The birthday ${data.dateOfBirth} makes the applicant ${years}; check the year.`, ['dateOfBirth']);
+      else add('adult', `Applicant is ${MIN_MEMBER_AGE} or older`, 'pass', `The applicant is ${years}.`);
     }
     const age = String(data.age || '').trim();
     if (isValidDateOnly(data.dateOfBirth) && /^\d+$/.test(age) && Math.abs(ageOn(data.dateOfBirth) - Number(age)) > 1) {
-      add('age', 'Age matches the birthday', 'warn', `The form says age ${age}, but the birthday ${data.dateOfBirth} makes the applicant ${ageOn(data.dateOfBirth)}.`);
+      add('age', 'Age matches the birthday', 'warn', `The form says age ${age}, but the birthday ${data.dateOfBirth} makes the applicant ${ageOn(data.dateOfBirth)}.`, ['age', 'dateOfBirth']);
     }
+    await checkServiceArea(db, data, add);
     if (!String(data.membershipDate || '').trim()) add('acceptance', 'Acceptance date', 'pass', `The form has no acceptance date yet; today (${todayDateOnly()}) will be the membership date.`);
     // The system gives the membership number; shown so it can be written on the paper form.
     return { memberNumber: await nextMemberNumber(db) };
@@ -792,7 +1004,7 @@ async function checkRecords(db, documentType, data, add, found = {}) {
 
   const requireActive = documentType !== 'Savings Form';
   const { member, check } = await findMember(db, data, { requireActive });
-  add('member', 'Member on record', check[0], check[1]);
+  add('member', 'Member on record', check[0], check[1], check[0] === 'pass' ? [] : ['memberNumber', 'memberName']);
   found.member = member || null;
   const target = { memberId: member?.id ? Number(member.id) : null };
 
@@ -826,20 +1038,25 @@ async function findPostedTwin(db, scanId, documentType, data) {
 
 class RehearsalRollback extends Error {}
 
-// Returns { status: passed|warning|failed, canPost, checks[], target, checkedAt }.
-export async function verifyDocument(req, scan, { documentType, extractedData, authenticity, confidence }) {
+// The system's confidence in a scan: the share of its checks that passed (0-100).
+export const checksScore = (checks) => (checks.length ? Math.round((100 * checks.filter((check) => check.status === 'pass').length) / checks.length) : null);
+
+// Returns { status: passed|warning|failed, canPost, checks[], score, target, checkedAt }.
+// A form is saved automatically only when every check passed.
+export async function verifyDocument(req, scan, { documentType, extractedData, authenticity }) {
   const definition = FORM_DEFINITIONS[documentType];
   const checks = [];
-  const add = (id, label, status, message) => checks.push({ id, label, status, message });
+  const add = (id, label, status, message, fields) => checks.push(makeCheck(id, label, status, message, fields));
   if (!definition) {
     add('type', 'Document type', documentType === UNRECOGNIZED ? 'fail' : 'warn', documentType === UNRECOGNIZED
       ? 'The document type was not recognised. Choose the correct form type.'
       : `${documentType} documents are kept for reference and are not posted to a module.`);
-    return { status: documentType === UNRECOGNIZED ? 'failed' : 'warning', canPost: false, checks, target: {}, checkedAt: new Date().toISOString() };
+    return { status: documentType === UNRECOGNIZED ? 'failed' : 'warning', canPost: false, checks, score: null, target: {}, checkedAt: new Date().toISOString() };
   }
 
-  checkAuthenticity(definition, authenticity, confidence, add);
+  checkAuthenticity(definition, authenticity, add);
   checkFields(definition, extractedData, add);
+  checkReadingAgreement(definition, documentType, scan.cross_check, extractedData, add);
   const found = {};
   const target = await checkRecords({ query }, documentType, extractedData, add, found);
   const submitted = (slot) => (scan[ID_SLOTS[slot].path] ? { reading: scan[ID_SLOTS[slot].check] || {}, source: scan[ID_SLOTS[slot].source] } : null);
@@ -870,7 +1087,7 @@ export async function verifyDocument(req, scan, { documentType, extractedData, a
   }
 
   const status = checks.some((check) => check.status === 'fail') ? 'failed' : checks.some((check) => check.status === 'warn') ? 'warning' : 'passed';
-  return { status, canPost: status !== 'failed', checks, target, checkedAt: new Date().toISOString() };
+  return { status, canPost: status !== 'failed', checks, score: checksScore(checks), target, checkedAt: new Date().toISOString() };
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,4 +1278,56 @@ async function saveToModule(client, req, scan, documentType, data, target) {
 
 export async function postDocument(client, req, scan, documentType, data, target) {
   return saveToModule(client, req, scan, documentType, data, target);
+}
+
+// ---------------------------------------------------------------------------
+// Undo of a form saved automatically.
+//
+// For UNDO_WINDOW_HOURS an admin can take back what the scanner saved by
+// itself: a new member (while nothing else has been recorded for them), or a
+// loan application or rental request still waiting for approval. Savings
+// deposits and Kadiwa records are corrected in their own module.
+
+export const UNDO_WINDOW_HOURS = 48;
+const UNDOABLE_MODULES = new Set(['members', 'loans', 'machinery']);
+
+// When the automatic save of this scan can no longer be undone, or null when it cannot be undone at all.
+export function undoDeadline(scan) {
+  if (!scan.posted_at || !scan.posted_automatically || !UNDOABLE_MODULES.has(scan.posted_module)) return null;
+  return new Date(new Date(scan.posted_at).getTime() + UNDO_WINDOW_HOURS * 3600000);
+}
+
+// Removes the record a scan created, in the caller's transaction. Returns a label.
+export async function undoPostedRecord(client, scan) {
+  if (scan.posted_module === 'members') {
+    const member = (await client.query('SELECT id, member_number FROM members WHERE member_number = $1 FOR UPDATE', [scan.posted_record_id])).rows[0];
+    if (!member) throw conflict(`Member ${scan.posted_record_id} no longer exists.`);
+    const initialShare = `INITIAL-${member.member_number}`;
+    // Every table that points at members, so a member with loans, savings,
+    // rentals, attendance, a login account or later share capital is kept.
+    const references = (await client.query(
+      `SELECT con.conrelid::regclass::text AS table_name, quote_ident(a.attname) AS column_name
+       FROM pg_constraint con JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[1]
+       WHERE con.contype = 'f' AND con.confrelid = 'members'::regclass AND array_length(con.conkey, 1) = 1`
+    )).rows;
+    const used = [];
+    for (const { table_name: table, column_name: column } of references) {
+      const initial = table === 'share_contributions' ? ' AND reference_number IS DISTINCT FROM $2' : '';
+      const { count } = (await client.query(`SELECT COUNT(*)::int AS count FROM ${table} WHERE ${column} = $1${initial}`, initial ? [member.id, initialShare] : [member.id])).rows[0];
+      if (count) used.push(table.replace(/^public\./, '').replaceAll('_', ' '));
+    }
+    if (used.length) throw conflict(`Member ${member.member_number} already has other records (${used.join(', ')}), so the registration cannot be undone. Archive the member instead.`);
+    await client.query('DELETE FROM share_contributions WHERE member_id = $1 AND reference_number = $2', [member.id, initialShare]);
+    await client.query('DELETE FROM members WHERE id = $1', [member.id]);
+    return `Member ${member.member_number} removed`;
+  }
+  if (scan.posted_module === 'loans' || scan.posted_module === 'machinery') {
+    const [table, what] = scan.posted_module === 'loans' ? ['loan_requests', 'Loan application'] : ['rental_requests', 'Rental request'];
+    const request = (await client.query(`SELECT id, status FROM ${table} WHERE id = $1 FOR UPDATE`, [Number(scan.posted_record_id)])).rows[0];
+    if (!request) throw conflict(`${what} #${scan.posted_record_id} no longer exists.`);
+    if (request.status !== 'pending') throw conflict(`${what} #${request.id} was already ${request.status}, so it cannot be undone here.`);
+    await client.query(`DELETE FROM ${table} WHERE id = $1`, [request.id]);
+    return `${what} #${request.id} withdrawn`;
+  }
+  throw badRequest('Records of this module are corrected in the module itself.');
 }

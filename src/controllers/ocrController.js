@@ -5,20 +5,27 @@ import { AppError, badRequest, cleanString, conflict, currentUserId, getRequestM
 import { assertValidUpload, BUCKETS, downloadFile, removeFile, safeOriginalName, sendStoredFile, uploadFile } from '../services/storage.js';
 import { IMAGE_TYPES, DOCUMENT_TYPES as UPLOAD_TYPES } from '../middleware/upload.js';
 import {
-  buildAnalysisPrompt, buildIdPrompt, buildPhotoPrompt, DOCUMENT_TYPES, FORM_DEFINITIONS, ID_SLOTS, idRequirement, idRequirements, isPostable, normalizeAuthenticity,
-  normalizeDocumentType, normalizeExtractedData, normalizeIdReading, normalizePhotoReading, photoExpected, postDocument, publicFormDefinitions, publicIdRequirements,
-  ID_READING_INSTRUCTION, REQUIRED_ID_SIGNATURES, requiresIdDocument, UNRECOGNIZED, verifyDocument,
+  buildAnalysisPrompt, buildCrossCheckPrompt, buildIdPrompt, buildPhotoPrompt, CROSS_CHECK_INSTRUCTION, DOCUMENT_TYPES, FORM_DEFINITIONS, ID_SLOTS, idRequirement, idRequirements,
+  isPostable, normalizeAuthenticity, normalizeDocumentType, normalizeExtractedData, normalizeIdReading, normalizePhotoReading, photoExpected, postDocument, publicFormDefinitions,
+  publicIdRequirements, ID_READING_INSTRUCTION, REQUIRED_ID_SIGNATURES, requiresIdDocument, UNDO_WINDOW_HOURS, undoDeadline, undoPostedRecord, UNRECOGNIZED, verifyDocument,
 } from '../services/documentRouting.js';
 import { photoMimeType } from './profilePhotoController.js';
 import { aiFailureReason, askAi } from '../services/aiClient.js';
 import { emailMember } from '../services/memberEmails.js';
+import { notifyAdmins } from '../services/notificationService.js';
 import { todayDateOnly } from '../utils/dates.js';
 
 const SUPPORTED_TYPES = new Set(DOCUMENT_TYPES);
-// Minimum AI reading confidence before a fully verified form is posted
-// without an admin. Set OCR_AUTO_POST=false to always require an admin.
-const AUTO_POST_MIN_CONFIDENCE = 85;
+// A fully verified form (every check passed) is posted without an admin.
+// Set OCR_AUTO_POST=false to always require an admin.
 const autoPostEnabled = () => String(process.env.OCR_AUTO_POST ?? 'true').toLowerCase() !== 'false';
+
+// When a reading the AI could not do is tried again by itself, after the
+// 1st, 2nd... failure. After the last one the admins are told and the scan
+// waits for Retry.
+const RETRY_DELAYS_SECONDS = [15, 60, 5 * 60, 15 * 60, 60 * 60, 3 * 60 * 60];
+// How long a background retry holds a scan so two runs never read it at once.
+const RETRY_LEASE = '3 minutes';
 
 const clean = (value) => cleanString(value, 200000);
 
@@ -30,11 +37,17 @@ function mapIdDocument(row, slot) {
 }
 
 function mapScan(row) {
+  const undoUntil = undoDeadline(row);
   return {
     id: Number(row.id), fileName: row.original_file_name, documentType: row.detected_document_type,
-    confidence: row.confidence === null ? null : Number(row.confidence), ocrText: row.ocr_text,
+    // The share of verification checks passed, worked out by the system; aiConfidence is what the AI reported.
+    confidence: row.confidence === null ? null : Number(row.confidence),
+    aiConfidence: row.ai_confidence === null || row.ai_confidence === undefined ? null : Number(row.ai_confidence), ocrText: row.ocr_text,
     extractedData: row.extracted_data || {}, reviewStatus: row.review_status,
     processingStatus: row.processing_status, processingError: row.processing_error || null,
+    // The automatic retries of a reading the AI could not do (nextAt = null: not queued).
+    retry: { count: Number(row.retry_count || 0), max: RETRY_DELAYS_SECONDS.length, nextAt: row.next_retry_at || null },
+    crossCheck: row.cross_check?.error ? { error: row.cross_check.error } : row.cross_check?.first ? { done: true } : null,
     captureSource: row.capture_source || 'upload', authenticity: row.authenticity || {}, verification: row.verification || {},
     postable: isPostable(row.detected_document_type), targetModule: FORM_DEFINITIONS[row.detected_document_type]?.moduleLabel || null,
     requiresIdDocument: requiresIdDocument(row.detected_document_type), photoExpected: photoExpected(row.detected_document_type),
@@ -43,7 +56,11 @@ function mapScan(row) {
     idRequirements: publicIdRequirements(row.detected_document_type),
     idDocuments: Object.fromEntries(Object.keys(ID_SLOTS).map((slot) => [slot, mapIdDocument(row, slot)])),
     idDocument: mapIdDocument(row, 'holder'),
-    posted: row.posted_at ? { module: row.posted_module, recordId: row.posted_record_id, at: row.posted_at, automatically: row.posted_automatically } : null,
+    posted: row.posted_at ? {
+      module: row.posted_module, recordId: row.posted_record_id, at: row.posted_at, automatically: row.posted_automatically,
+      undoUntil: undoUntil && undoUntil > new Date() ? undoUntil.toISOString() : null,
+    } : null,
+    undone: row.undone_at ? { at: row.undone_at, recordId: row.undone_record_id } : null,
     createdAt: row.created_at, updatedAt: row.updated_at,
   };
 }
@@ -61,9 +78,12 @@ function normalizeConfidence(value) {
   return null;
 }
 
-function parseModelResponse(json) {
+// secondType: the type the second reading found. The AI's own confidence is
+// used only to accept the document type: at least 70, or both readings agree.
+function parseModelResponse(json, secondType) {
   const confidence = normalizeConfidence(json.confidence ?? json.confidenceScore ?? json.confidence_percent);
-  const documentType = confidence >= 70 ? normalizeDocumentType(json.documentType) : UNRECOGNIZED;
+  const readType = normalizeDocumentType(json.documentType);
+  const documentType = (confidence ?? 0) >= 70 || (secondType && secondType === readType && readType !== UNRECOGNIZED) ? readType : UNRECOGNIZED;
   return {
     documentType,
     confidence,
@@ -73,19 +93,54 @@ function parseModelResponse(json) {
   };
 }
 
-const analyzeWithAi = async (file, captureSource) => parseModelResponse(await askAi(file, buildAnalysisPrompt(captureSource),
-  'Read this document including its text, labels, keywords, important fields, and layout. Classify it, extract the fields for its type, and assess whether it is genuine.'));
+const readOnce = (file, captureSource) => askAi(file, buildAnalysisPrompt(captureSource),
+  'Read this document including its text, labels, keywords, important fields, and layout. Classify it, extract the fields for its type, and assess whether it is genuine.');
+const readAgain = (file) => askAi(file, buildCrossCheckPrompt(), CROSS_CHECK_INSTRUCTION);
+
+// The second reading, kept for verification: both readings of the form's fields.
+function crossCheckOf(analysis, secondJson) {
+  return {
+    firstType: analysis.documentType, documentType: normalizeDocumentType(secondJson?.documentType),
+    first: analysis.extractedData, second: normalizeExtractedData(analysis.documentType, secondJson?.extractedData), at: new Date().toISOString(),
+  };
+}
+const withoutStop = (text) => text.replace(/\.$/, '');
+const crossCheckError = (error) => ({ error: aiFailureReason(error), at: new Date().toISOString() });
+
+// The form is read twice at the same time, with different instructions, so it
+// takes no longer than one reading. The first reading must succeed; if only
+// the second fails, the scan goes on and the second reading is tried again later.
+async function analyzeWithAi(file, captureSource) {
+  const [first, second] = await Promise.allSettled([readOnce(file, captureSource), readAgain(file)]);
+  if (first.status === 'rejected') throw first.reason;
+  const secondJson = second.status === 'fulfilled' ? second.value : null;
+  const analysis = parseModelResponse(first.value, secondJson ? normalizeDocumentType(secondJson.documentType) : null);
+  const crossCheck = !isPostable(analysis.documentType) ? {} : secondJson ? crossCheckOf(analysis, secondJson) : crossCheckError(second.reason);
+  return { ...analysis, crossCheck };
+}
 
 const readPhotoWithAi = async (file) => normalizePhotoReading(await askAi(file, buildPhotoPrompt(),
   'Check this 2x2 ID picture: is it one person with a clear, recognizable face?'));
 
 const readIdWithAi = async (file, source, documentType, slot) => normalizeIdReading(await askAi(file, buildIdPrompt(source, documentType, slot), ID_READING_INSTRUCTION));
 
-// Upload/capture -> validate -> store privately -> AI OCR, classification and
-// authenticity check -> save scan -> verify against the database -> post to the
-// form's module when every check passes. A failed AI run is still recorded
-// (processing_status = 'failed') so the upload is auditable, and the same file
-// can be re-processed later.
+// After a failed reading: the next automatic try (null when the AI refused
+// the file itself, or after the last try).
+function nextRetry(error, failures) {
+  if (error?.retryable === false || failures > RETRY_DELAYS_SECONDS.length) return null;
+  return new Date(Date.now() + RETRY_DELAYS_SECONDS[failures - 1] * 1000);
+}
+
+const inWords = (seconds) => (seconds < 60 ? `${seconds} seconds` : seconds < 3600 ? `${Math.round(seconds / 60)} minute${seconds < 120 ? '' : 's'}` : `${Math.round(seconds / 3600)} hour${seconds < 7200 ? '' : 's'}`);
+const retryNote = (scan) => (scan.next_retry_at
+  ? ` It will be read again automatically in about ${inWords(Math.max(1, Math.round((new Date(scan.next_retry_at) - Date.now()) / 1000)))}.`
+  : ' Press Retry to read it again.');
+
+// Upload/capture -> validate -> store privately -> two AI readings (OCR,
+// classification, authenticity) -> save scan -> verify against the database
+// -> post to the form's module when every check passes. A failed AI run is
+// still recorded (processing_status = 'failed') and queued: the same file is
+// read again automatically, or with Retry.
 export async function analyzeDocument(req, res) {
   const file = req.file;
   assertValidUpload(file, UPLOAD_TYPES, 'document');
@@ -98,14 +153,18 @@ export async function analyzeDocument(req, res) {
   let analysis;
   let processingStatus = 'completed';
   let processingError = null;
+  let retryAt = null;
   try {
     analysis = await analyzeWithAi(file, captureSource);
   } catch (error) {
     console.error('OCR analysis error:', error instanceof Error ? error.message : error);
     processingStatus = 'failed';
     processingError = error instanceof Error ? error.message.slice(0, 500) : 'AI analysis failed.';
-    analysis = { documentType: UNRECOGNIZED, confidence: null, ocrText: '', extractedData: {}, authenticity: normalizeAuthenticity(null) };
+    retryAt = nextRetry(error, 1);
+    analysis = { documentType: UNRECOGNIZED, confidence: null, ocrText: '', extractedData: {}, authenticity: normalizeAuthenticity(null), crossCheck: {} };
   }
+  // A second reading that failed is tried again later, like a failed first one.
+  if (!retryAt && analysis.crossCheck?.error) retryAt = nextRetry(null, 1);
 
   const storedRef = existing?.stored_file_path?.includes('://')
     ? existing.stored_file_path
@@ -115,17 +174,19 @@ export async function analyzeDocument(req, res) {
   try {
     scan = await withTransaction(async (client) => {
       const values = [safeOriginalName(file.originalname), storedRef, file.mimetype, file.size, fileHash, analysis.documentType, analysis.confidence, analysis.ocrText,
-        JSON.stringify(analysis.extractedData), processingStatus, processingError, captureSource, JSON.stringify(analysis.authenticity)];
+        JSON.stringify(analysis.extractedData), processingStatus, processingError, captureSource, JSON.stringify(analysis.authenticity),
+        currentUserId(req), retryAt ? 1 : 0, retryAt, JSON.stringify(analysis.crossCheck || {})];
       const result = existing
         ? await client.query(
           `UPDATE document_scans SET original_file_name = $1, stored_file_path = $2, mime_type = $3, file_size = $4, detected_document_type = $6,
-                  confidence = $7, ocr_text = $8, extracted_data = $9, processing_status = $10, processing_error = $11, capture_source = $12,
-                  authenticity = $13, verification = '{}'::jsonb, review_status = 'needs_review', updated_at = NOW()
+                  ai_confidence = $7, confidence = NULL, ocr_text = $8, extracted_data = $9, processing_status = $10, processing_error = $11, capture_source = $12,
+                  authenticity = $13, uploaded_by = $14, retry_count = $15, next_retry_at = $16, cross_check = $17,
+                  verification = '{}'::jsonb, review_status = 'needs_review', updated_at = NOW()
            WHERE file_sha256 = $5 RETURNING *`, values)
         : await client.query(
-          `INSERT INTO document_scans (original_file_name, stored_file_path, mime_type, file_size, file_sha256, detected_document_type, confidence, ocr_text,
-                                       extracted_data, processing_status, processing_error, capture_source, authenticity)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`, values);
+          `INSERT INTO document_scans (original_file_name, stored_file_path, mime_type, file_size, file_sha256, detected_document_type, ai_confidence, ocr_text,
+                                       extracted_data, processing_status, processing_error, capture_source, authenticity, uploaded_by, retry_count, next_retry_at, cross_check)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING *`, values);
       await createAuditLog({
         client,
         user: req.user,
@@ -146,16 +207,24 @@ export async function analyzeDocument(req, res) {
   }
 
   if (processingStatus === 'failed') {
-    return res.status(existing ? 200 : 201).json({ success: false, data: mapScan(scan), message: `The document was saved but could not be read: ${processingError}` });
+    return res.status(existing ? 200 : 201).json({
+      success: false, data: mapScan(scan), message: `The document was saved but could not be read yet: ${withoutStop(aiFailureReason(new Error(processingError)))}.${retryNote(scan)}`,
+    });
   }
 
   const verified = await verifyAndAutoPost(req, scan, 'Document processed.');
   return res.status(existing ? 200 : 201).json({ success: true, data: mapScan(verified.scan), message: verified.message });
 }
 
+// Keeps the verification and its score: the system's confidence in the scan.
 async function saveVerification(id, verification) {
-  return (await query('UPDATE document_scans SET verification = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [JSON.stringify(verification), id])).rows[0];
+  return (await query('UPDATE document_scans SET verification = $1, confidence = $2, updated_at = NOW() WHERE id = $3 RETURNING *',
+    [JSON.stringify(verification), verification.score ?? null, id])).rows[0];
 }
+
+const verifyScan = (req, scan, documentType = scan.detected_document_type, extractedData = scan.extracted_data || {}) => verifyDocument(req, scan, {
+  documentType, extractedData, authenticity: scan.authenticity || {},
+});
 
 // What a scanned form still needs from the admin: the valid IDs (the
 // membership applicant's, or the loan borrower's and co-maker's), and a 2x2
@@ -169,25 +238,39 @@ function missingRequirements(scan) {
 
 const listed = (items) => (items.length > 2 ? `${items.slice(0, -1).join(', ')}, and ${items.at(-1)}` : items.join(' and '));
 
-// Verifies a scan against the records and posts it when every check passes
-// with high confidence. Verification and posting are separate steps: if they
-// fail the scan is still saved and can be reviewed and posted by an admin.
-async function verifyAndAutoPost(req, scan, message) {
-  const confidence = scan.confidence === null ? null : Number(scan.confidence);
+// The person a scanned form is about, for the admins' notifications.
+function formPerson(scan) {
+  const data = scan.extracted_data || {};
+  return [data.firstName, data.middleName, data.lastName, data.suffix].filter(Boolean).join(' ') || data.memberName || data.preparedBy || data.encoderName || '';
+}
+
+// Verifies a scan against the records and posts it when every check passed.
+// Verification and posting are separate steps: if they fail the scan is
+// still saved and can be reviewed and posted by an admin. A scan whose
+// automatic save was undone is never saved again automatically.
+// background: no admin is watching (an automatic retry), so the admins are
+// told when the scan needs them.
+async function verifyAndAutoPost(req, scan, message, { background = false } = {}) {
   let current = scan;
   try {
-    const verification = await verifyDocument(req, current, {
-      documentType: current.detected_document_type, extractedData: current.extracted_data || {}, authenticity: current.authenticity || {}, confidence,
-    });
+    const verification = await verifyScan(req, current);
     current = await saveVerification(current.id, verification);
-    if (autoPostEnabled() && isPostable(current.detected_document_type) && verification.status === 'passed' && (confidence ?? 0) >= AUTO_POST_MIN_CONFIDENCE) {
+    if (autoPostEnabled() && isPostable(current.detected_document_type) && verification.status === 'passed' && !current.undone_at) {
       const posted = await postScan(req, current.id, { automatic: true });
-      return { scan: posted.scan, message: `Verified and saved automatically: ${posted.result.label}.` };
+      return { scan: posted.scan, message: `Every check passed; saved automatically: ${posted.result.label}.` };
+    }
+    if (background && isPostable(current.detected_document_type)) {
+      const flagged = verification.checks.filter((check) => check.status !== 'pass').map((check) => check.label);
+      await notifyAdmins(null, {
+        type: 'ocr_needs_review', title: `Scan needs review: ${current.detected_document_type}${formPerson(current) ? ` of ${formPerson(current)}` : ''}`.slice(0, 200),
+        message: `Scan #${current.id} was read after the AI was busy. ${flagged.length ? `Check: ${flagged.join(', ')}.` : ''}`.trim(),
+        severity: 'warning', link: `/ocr?scan=${current.id}`, entityType: 'document_scan', entityId: current.id, dedupeKey: `ocr-review-${current.id}`,
+      }).catch(() => undefined);
     }
     const missing = missingRequirements(current);
     if (missing.length) return { scan: current, message: `${current.detected_document_type.replace(/ Form$/, ' form')} read. Now submit ${listed(missing)}.` };
     if (isPostable(current.detected_document_type)) {
-      return { scan: current, message: verification.status === 'failed' ? 'Verification found problems. Review the document before it can be posted.' : 'Document verified with warnings. Review and confirm before posting.' };
+      return { scan: current, message: verification.status === 'failed' ? 'Verification found problems. The flagged fields are highlighted for review.' : 'Some checks need a look. The flagged fields are highlighted; confirm them before saving.' };
     }
     return { scan: current, message };
   } catch (error) {
@@ -196,8 +279,22 @@ async function verifyAndAutoPost(req, scan, message) {
   }
 }
 
+// "New member auto-registered: Juan Dela Cruz" and the like.
+function autoPostTitle(scan, result) {
+  const person = formPerson(scan);
+  const titles = {
+    members: `New member auto-registered: ${person || result.recordId}`,
+    loans: `Loan application auto-filed${person ? `: ${person}` : ''} (awaiting approval)`,
+    machinery: `Rental request auto-filed${person ? `: ${person}` : ''} (awaiting approval)`,
+    savings: `Savings deposit auto-recorded${person ? `: ${person}` : ''}`,
+  };
+  return (titles[result.module] || `Form saved automatically: ${result.label}`).slice(0, 200);
+}
+
 // Posts a scan to its module inside one transaction with the scan update, so a
 // form is never recorded twice and never marked posted without its record.
+// An automatic save is logged and announced to the admins, with the time
+// left to undo it.
 async function postScan(req, id, { automatic }) {
   const posted = await withTransaction(async (client) => {
     const scan = (await client.query('SELECT * FROM document_scans WHERE id = $1 FOR UPDATE', [id])).rows[0];
@@ -206,7 +303,7 @@ async function postScan(req, id, { automatic }) {
     const result = await postDocument(client, req, scan, scan.detected_document_type, scan.extracted_data || {}, scan.verification?.target || {});
     const updated = (await client.query(
       `UPDATE document_scans SET review_status = 'posted', posted_module = $1, posted_record_id = $2, posted_at = NOW(), posted_by = $3,
-              posted_automatically = $4, reviewed_by = COALESCE($5, reviewed_by), updated_at = NOW()
+              posted_automatically = $4, reviewed_by = COALESCE($5, reviewed_by), next_retry_at = NULL, updated_at = NOW()
        WHERE id = $6 RETURNING *`,
       [result.module, result.recordId, currentUserId(req), automatic, automatic ? null : currentUserId(req), id]
     )).rows[0];
@@ -217,10 +314,18 @@ async function postScan(req, id, { automatic }) {
       module: 'OCR',
       entityType: 'document_scan',
       entityId: String(id),
-      description: `${automatic ? 'AI posted' : 'Posted'} ${scan.detected_document_type} ${scan.original_file_name}: ${result.label}`,
-      newValues: { document_type: scan.detected_document_type, module: result.module, record_id: result.recordId, automatic },
+      description: `${automatic ? 'AI posted (every check passed)' : 'Posted'} ${scan.detected_document_type} ${scan.original_file_name}: ${result.label}`,
+      newValues: { document_type: scan.detected_document_type, module: result.module, record_id: result.recordId, automatic, checks_passed: scan.confidence === null ? null : Number(scan.confidence) },
       ...getRequestMeta(req),
     });
+    if (automatic) {
+      const undoUntil = undoDeadline(updated);
+      await notifyAdmins(client, {
+        type: 'ocr_auto_posted', title: autoPostTitle(updated, result), severity: 'success',
+        message: `${result.label} from scan #${id}; every check passed.${undoUntil ? ` It can be undone in the OCR Scanner for ${UNDO_WINDOW_HOURS} hours.` : ''}`,
+        link: `/ocr?scan=${id}`, entityType: 'document_scan', entityId: id, dedupeKey: `ocr-posted-${id}`,
+      });
+    }
     return { scan: updated, result };
   });
   // The member hears about the record the scanner created (after commit).
@@ -264,7 +369,8 @@ async function saveCorrections(req, id, { documentType, extractedData, reviewSta
     if (!before) throw notFound('Document scan not found.');
     if (before.posted_at) throw conflict('This document was already posted and can no longer be changed.');
     const result = await client.query(
-      `UPDATE document_scans SET detected_document_type = $1, extracted_data = $2, review_status = $3, reviewed_by = $4, updated_at = NOW()
+      `UPDATE document_scans SET detected_document_type = $1, extracted_data = $2, review_status = $3::varchar, reviewed_by = $4,
+              next_retry_at = CASE WHEN $3::varchar = 'rejected' THEN NULL ELSE next_retry_at END, updated_at = NOW()
        WHERE id = $5 RETURNING *`,
       [documentType, JSON.stringify(extractedData), reviewStatus, req.user.user_id, id]
     );
@@ -283,10 +389,7 @@ async function saveCorrections(req, id, { documentType, extractedData, reviewSta
     return result.rows[0];
   });
   if (reviewStatus === 'rejected') return scan;
-  const verification = await verifyDocument(req, scan, {
-    documentType, extractedData, authenticity: scan.authenticity || {}, confidence: scan.confidence === null ? null : Number(scan.confidence),
-  });
-  return saveVerification(id, verification);
+  return saveVerification(id, await verifyScan(req, scan, documentType, extractedData));
 }
 
 export async function reviewDocument(req, res) {
@@ -324,43 +427,229 @@ export async function reverifyDocument(req, res) {
   const scan = (await query('SELECT * FROM document_scans WHERE id = $1', [id])).rows[0];
   if (!scan) throw notFound('Document scan not found.');
   if (scan.posted_at) return res.status(200).json({ success: true, data: mapScan(scan) });
-  const verification = await verifyDocument(req, scan, {
-    documentType: scan.detected_document_type, extractedData: scan.extracted_data || {}, authenticity: scan.authenticity || {},
-    confidence: scan.confidence === null ? null : Number(scan.confidence),
+  return res.status(200).json({ success: true, data: mapScan(await saveVerification(id, await verifyScan(req, scan))) });
+}
+
+const storedFileOf = async (row) => {
+  const buffer = await downloadFile(row.stored_file_path);
+  return buffer ? { buffer, mimetype: row.mime_type, originalname: row.original_file_name, size: Number(row.file_size) } : null;
+};
+
+// Records a failed try: the next automatic one, or the admins are told that
+// the AI gave up on the scan.
+async function recordFailedTry(row, error, { field = 'processing_error' } = {}) {
+  const failures = Number(row.retry_count || 0) + 1;
+  const retryAt = nextRetry(error, failures);
+  const message = error instanceof Error ? error.message.slice(0, 500) : 'AI analysis failed.';
+  const updated = field === 'processing_error'
+    ? (await query('UPDATE document_scans SET processing_error = $1, retry_count = $2, next_retry_at = $3, updated_at = NOW() WHERE id = $4 RETURNING *', [message, failures, retryAt, row.id])).rows[0]
+    : (await query('UPDATE document_scans SET cross_check = $1, retry_count = $2, next_retry_at = $3, updated_at = NOW() WHERE id = $4 RETURNING *', [JSON.stringify(crossCheckError(error)), failures, retryAt, row.id])).rows[0];
+  if (!retryAt && row.next_retry_at) {
+    await notifyAdmins(null, {
+      type: 'ocr_failed', title: `AI could not read scan #${row.id}`, severity: 'warning', link: `/ocr?scan=${row.id}`,
+      message: `${row.original_file_name} was tried ${failures} times: ${withoutStop(aiFailureReason(error))}. Open it and press Retry, or upload a clearer copy.`,
+      entityType: 'document_scan', entityId: row.id, dedupeKey: `ocr-failed-${row.id}-${failures}`,
+    }).catch(() => undefined);
+  }
+  return updated;
+}
+
+// Reads the stored file of a scan whose reading failed, then verifies it and
+// posts it when every check passed, exactly like a new upload. Returns
+// { scan, message } or throws the AI error after recording the failed try.
+async function rereadScan(req, row, { background = false } = {}) {
+  const file = await storedFileOf(row);
+  if (!file) {
+    await query('UPDATE document_scans SET next_retry_at = NULL WHERE id = $1', [row.id]);
+    throw notFound('The stored file is no longer available. Upload the document again.');
+  }
+  let analysis;
+  try {
+    analysis = await analyzeWithAi(file, row.capture_source);
+  } catch (error) {
+    const updated = await recordFailedTry(row, error);
+    error.scan = updated;
+    throw error;
+  }
+  const crossRetry = analysis.crossCheck?.error ? nextRetry(null, 1) : null;
+  const scan = (await query(
+    `UPDATE document_scans SET detected_document_type = $1, ai_confidence = $2, ocr_text = $3, extracted_data = $4, authenticity = $5, cross_check = $6,
+            processing_status = 'completed', processing_error = NULL, retry_count = $7, next_retry_at = $8,
+            verification = '{}'::jsonb, review_status = 'needs_review', updated_at = NOW()
+     WHERE id = $9 RETURNING *`,
+    [analysis.documentType, analysis.confidence, analysis.ocrText, JSON.stringify(analysis.extractedData), JSON.stringify(analysis.authenticity),
+      JSON.stringify(analysis.crossCheck || {}), crossRetry ? 1 : 0, crossRetry, row.id]
+  )).rows[0];
+  await createAuditLog({
+    user: req.user, action: 'OCR_RETRIED', module: 'OCR', entityType: 'document_scan', entityId: String(row.id),
+    description: `${background ? 'Automatically re-read' : 'Re-read'} ${row.original_file_name}`, newValues: { document_type: analysis.documentType, attempt: Number(row.retry_count || 0) + 1 }, ...getRequestMeta(req),
   });
-  return res.status(200).json({ success: true, data: mapScan(await saveVerification(id, verification)) });
+  return verifyAndAutoPost(req, scan, 'Document read.', { background });
+}
+
+// Runs only the second reading again, for a scan read once while the AI was
+// busy, then verifies it again (and posts it when every check passed).
+async function rereadCrossCheck(req, row, { background = false } = {}) {
+  const file = await storedFileOf(row);
+  if (!file) {
+    await query('UPDATE document_scans SET next_retry_at = NULL WHERE id = $1', [row.id]);
+    return { scan: row, message: 'The stored file is no longer available.' };
+  }
+  let secondJson;
+  try {
+    secondJson = await readAgain(file);
+  } catch (error) {
+    return { scan: await recordFailedTry(row, error, { field: 'cross_check' }), message: 'The second reading is still not possible.' };
+  }
+  const crossCheck = crossCheckOf({ documentType: row.detected_document_type, extractedData: row.cross_check?.first || row.extracted_data || {} }, secondJson);
+  const scan = (await query('UPDATE document_scans SET cross_check = $1, retry_count = 0, next_retry_at = NULL, updated_at = NOW() WHERE id = $2 RETURNING *',
+    [JSON.stringify(crossCheck), row.id])).rows[0];
+  return verifyAndAutoPost(req, scan, 'Second reading done.', { background });
 }
 
 // POST /api/ocr/:id/retry — runs the AI again on the stored file of a scan
-// whose reading failed (e.g. the AI service was busy), then verifies it and
-// posts it when every check passes, exactly like a new upload.
+// whose reading failed (e.g. the AI service was busy), without waiting for
+// the next automatic try.
 export async function retryDocument(req, res) {
   const id = parseId(req.params.id, 'document ID');
   const row = (await query('SELECT * FROM document_scans WHERE id = $1', [id])).rows[0];
   if (!row) throw notFound('Document scan not found.');
   if (row.processing_status !== 'failed') throw conflict('This document was already read. Use Check again to re-verify it.');
-  const buffer = await downloadFile(row.stored_file_path);
-  if (!buffer) throw notFound('The stored file is no longer available. Upload the document again.');
-
-  let analysis;
   try {
-    analysis = await analyzeWithAi({ buffer, mimetype: row.mime_type, originalname: row.original_file_name, size: Number(row.file_size) }, row.capture_source);
+    const verified = await rereadScan(req, row);
+    return res.status(200).json({ success: true, data: mapScan(verified.scan), message: verified.message });
   } catch (error) {
-    const message = error instanceof Error ? error.message.slice(0, 500) : 'AI analysis failed.';
-    await query('UPDATE document_scans SET processing_error = $1, updated_at = NOW() WHERE id = $2', [message, id]);
-    throw new AppError(503, message);
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, `${withoutStop(aiFailureReason(error))}.${error.scan ? retryNote(error.scan) : ''}`);
   }
+}
 
-  const scan = (await query(
-    `UPDATE document_scans SET detected_document_type = $1, confidence = $2, ocr_text = $3, extracted_data = $4, authenticity = $5,
-            processing_status = 'completed', processing_error = NULL, verification = '{}'::jsonb, review_status = 'needs_review', updated_at = NOW()
-     WHERE id = $6 RETURNING *`,
-    [analysis.documentType, analysis.confidence, analysis.ocrText, JSON.stringify(analysis.extractedData), JSON.stringify(analysis.authenticity), id]
-  )).rows[0];
-  await createAuditLog({ user: req.user, action: 'OCR_RETRIED', module: 'OCR', entityType: 'document_scan', entityId: String(id), description: `Re-read ${row.original_file_name}`, newValues: { document_type: analysis.documentType }, ...getRequestMeta(req) });
+// The admin a background retry acts for: the one who uploaded the scan.
+async function backgroundRequest(userId) {
+  const user = userId ? (await query('SELECT id, id AS user_id, username, role, email FROM users WHERE id = $1', [userId])).rows[0] : null;
+  return { user: user || null, ip: null, headers: { 'user-agent': 'ACIFAC OCR automatic retry' }, get: () => undefined };
+}
 
-  const verified = await verifyAndAutoPost(req, scan, 'Document read.');
-  return res.status(200).json({ success: true, data: mapScan(verified.scan), message: verified.message });
+// The retry queue: reads again the scans whose next try is due, one or a few
+// at a time. Each scan is held for a few minutes while it is read, so the
+// server timer, the cron job and an open OCR Scanner page never read the same
+// scan twice. Returns the scans processed.
+export async function retryDueScans({ limit = 1 } = {}) {
+  const claimed = (await query(
+    `UPDATE document_scans SET next_retry_at = NOW() + INTERVAL '${RETRY_LEASE}'
+     WHERE id IN (SELECT id FROM document_scans
+                  WHERE next_retry_at <= NOW() AND posted_at IS NULL AND review_status <> 'rejected'
+                  ORDER BY next_retry_at LIMIT $1 FOR UPDATE SKIP LOCKED)
+     RETURNING *`, [limit]
+  )).rows;
+  const processed = [];
+  for (const row of claimed) {
+    // The row as it was before it was held: its retry count and when it was due.
+    const due = { ...row, next_retry_at: new Date() };
+    try {
+      const req = await backgroundRequest(row.uploaded_by);
+      const result = row.processing_status === 'failed' ? await rereadScan(req, due, { background: true }) : await rereadCrossCheck(req, due, { background: true });
+      processed.push(result.scan);
+    } catch (error) {
+      console.warn(`OCR automatic retry of scan #${row.id}:`, error instanceof Error ? error.message : error);
+      if (error?.scan) processed.push(error.scan);
+    }
+  }
+  return processed;
+}
+
+// POST /api/ocr/retry-due — called by the open OCR Scanner page every few
+// seconds while scans are queued (serverless hosting has no timers), so a
+// busy AI never leaves a scan waiting for someone to press Retry.
+export async function retryDue(req, res) {
+  const processed = await retryDueScans({ limit: 1 });
+  const queued = (await query('SELECT COUNT(*)::int AS count, MIN(next_retry_at) AS next FROM document_scans WHERE next_retry_at IS NOT NULL')).rows[0];
+  return res.status(200).json({ success: true, data: processed.map(mapScan), queued: queued.count, nextAt: queued.next });
+}
+
+// POST /api/ocr/reject-flagged — rejects, in one go, every scan that is
+// flagged: not saved, not already rejected, and either failed verification or
+// could not be read. Scans still queued for another automatic reading are
+// left alone. Nothing is deleted; the scans stay in the records as Rejected.
+export async function rejectFlagged(req, res) {
+  const rejected = await withTransaction(async (client) => {
+    const rows = (await client.query(
+      `UPDATE document_scans SET review_status = 'rejected', reviewed_by = $1, next_retry_at = NULL, updated_at = NOW()
+       WHERE posted_at IS NULL AND review_status <> 'rejected' AND next_retry_at IS NULL
+         AND (processing_status = 'failed' OR verification->>'status' = 'failed')
+       RETURNING *`,
+      [currentUserId(req)]
+    )).rows;
+    if (rows.length) {
+      await createAuditLog({
+        client, user: req.user, action: 'OCR_FLAGGED_REJECTED', module: 'OCR', entityType: 'document_scan',
+        description: `Rejected ${rows.length} flagged ${rows.length === 1 ? 'scan' : 'scans'}`, newValues: { scan_ids: rows.map((row) => Number(row.id)) }, ...getRequestMeta(req),
+      });
+    }
+    return rows;
+  });
+  return res.status(200).json({
+    success: true, data: rejected.map(mapScan),
+    message: rejected.length ? `${rejected.length} flagged ${rejected.length === 1 ? 'scan was' : 'scans were'} rejected. They will not be saved to any module.` : 'There are no flagged scans.',
+  });
+}
+
+// DELETE /api/ocr/:id — deletes a scan that is not needed (a wrong or test
+// upload, a rejected form) with its stored file, IDs and 2x2 picture. A scan
+// saved to records cannot be deleted: the member or loan it created uses its
+// files. The deletion is kept in the audit log.
+export async function deleteScan(req, res) {
+  const id = parseId(req.params.id, 'document ID');
+  const deleted = await withTransaction(async (client) => {
+    const row = (await client.query('SELECT * FROM document_scans WHERE id = $1 FOR UPDATE', [id])).rows[0];
+    if (!row) throw notFound('Document scan not found.');
+    if (row.posted_at) throw conflict(`This scan was saved to records (${row.posted_module} ${row.posted_record_id}) and cannot be deleted.`);
+    await client.query('DELETE FROM document_scans WHERE id = $1', [id]);
+    await createAuditLog({
+      client, user: req.user, action: 'OCR_SCAN_DELETED', module: 'OCR', entityType: 'document_scan', entityId: String(id),
+      description: `Deleted scan #${id} ${row.original_file_name} (${row.detected_document_type}, ${row.review_status})`,
+      oldValues: { file_name: row.original_file_name, document_type: row.detected_document_type, review_status: row.review_status, extracted_data: row.extracted_data },
+      ...getRequestMeta(req),
+    });
+    return row;
+  });
+  // The files go after the commit, so a failed delete never loses them.
+  for (const reference of [deleted.stored_file_path, deleted.photo_path, ...Object.values(ID_SLOTS).map((columns) => deleted[columns.path])]) {
+    if (reference) await removeFile(reference);
+  }
+  return res.status(200).json({ success: true, message: `Scan ${deleted.original_file_name} deleted.` });
+}
+
+// POST /api/ocr/:id/undo — takes back a form the scanner saved by itself,
+// within UNDO_WINDOW_HOURS: the new member, or the loan application or rental
+// request still waiting for approval, is removed and the scan goes back to
+// review, where it is only saved again by an admin.
+export async function undoAutoPost(req, res) {
+  const id = parseId(req.params.id, 'document ID');
+  const scan = await withTransaction(async (client) => {
+    const before = (await client.query('SELECT * FROM document_scans WHERE id = $1 FOR UPDATE', [id])).rows[0];
+    if (!before) throw notFound('Document scan not found.');
+    if (!before.posted_at) throw conflict('This document has not been saved to a module.');
+    if (!before.posted_automatically) throw conflict('Only forms saved automatically can be undone here. Correct this record in its module.');
+    const deadline = undoDeadline(before);
+    if (!deadline) throw conflict(`${before.posted_module} records are corrected in their own module.`);
+    if (deadline < new Date()) throw conflict(`The ${UNDO_WINDOW_HOURS}-hour undo period has passed. Correct the record in its module.`);
+    const label = await undoPostedRecord(client, before);
+    const updated = (await client.query(
+      `UPDATE document_scans SET review_status = 'needs_review', posted_module = NULL, posted_record_id = NULL, posted_at = NULL, posted_by = NULL,
+              posted_automatically = FALSE, undone_at = NOW(), undone_by = $1, undone_record_id = $2, updated_at = NOW()
+       WHERE id = $3 RETURNING *`,
+      [currentUserId(req), before.posted_record_id, id]
+    )).rows[0];
+    await createAuditLog({
+      client, user: req.user, action: 'OCR_AUTO_POST_UNDONE', module: 'OCR', entityType: 'document_scan', entityId: String(id),
+      description: `Undid the automatic save of ${before.detected_document_type} ${before.original_file_name}: ${label}`,
+      oldValues: { module: before.posted_module, record_id: before.posted_record_id, posted_at: before.posted_at }, ...getRequestMeta(req),
+    });
+    return { updated, label };
+  });
+  const verified = await saveVerification(id, await verifyScan(req, scan.updated)).catch(() => scan.updated);
+  return res.status(200).json({ success: true, data: mapScan(verified), message: `${scan.label}. The scan is back in review; it is saved again only when you save it.` });
 }
 
 // slot: the ID being submitted (holder or coMaker); photo: the 2x2 picture.
@@ -538,7 +827,7 @@ export const downloadCoMakerId = downloadIdFrom('coMaker');
 
 export function listFormDefinitions(req, res) {
   return res.status(200).json({
-    success: true, data: publicFormDefinitions(), autoPost: autoPostEnabled(), autoPostMinConfidence: AUTO_POST_MIN_CONFIDENCE, requiredIdSignatures: REQUIRED_ID_SIGNATURES,
+    success: true, data: publicFormDefinitions(), autoPost: autoPostEnabled(), requiredIdSignatures: REQUIRED_ID_SIGNATURES, undoWindowHours: UNDO_WINDOW_HOURS,
   });
 }
 
@@ -551,7 +840,8 @@ export async function listDocuments(req, res) {
                   COUNT(*) FILTER (WHERE review_status = 'needs_review')::int AS "needsReview",
                   COUNT(*) FILTER (WHERE processing_status = 'failed')::int AS failed,
                   COUNT(*) FILTER (WHERE posted_at IS NOT NULL)::int AS posted,
-                  COUNT(*) FILTER (WHERE posted_automatically)::int AS "autoPosted"
+                  COUNT(*) FILTER (WHERE posted_automatically)::int AS "autoPosted",
+                  COUNT(*) FILTER (WHERE next_retry_at IS NOT NULL)::int AS queued
            FROM document_scans`),
   ]);
   return res.status(200).json({ success: true, data: result.rows.map(mapScan), pagination: paginationMeta(page, limit, count.rows[0].total), summary: stats.rows[0] });

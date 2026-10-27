@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   buildAnalysisPrompt, buildIdPrompt, buildPhotoPrompt, checkMemberId, isPostable, MEMBER_APPLICANT_ID, normalizeAuthenticity, normalizeDocumentType, normalizeExtractedData,
   normalizeIdReading, normalizePhotoReading, photoExpected, publicFormDefinitions, publicIdRequirements, requiresIdDocument, UNRECOGNIZED,
+  buildCrossCheckPrompt, checksScore, compareReadings, nameSimilarity, normalizePhone, placeKey, undoDeadline,
 } from '../src/services/documentRouting.js';
 
 test('document types: postable forms, legacy names and unknown values', () => {
@@ -63,7 +64,7 @@ test('the membership form follows the paper form and needs the applicant ID', ()
   assert.deepEqual(publicFormDefinitions().filter((form) => form.requiresIdDocument).map((form) => form.type), ['Membership Form', 'Loan Form']);
 
   const data = normalizeExtractedData('Membership Form', { 'CP No.': '0917 123 4567', Birthday: '03/15/1990', child1Age: '7 ', income1Amount: '₱60,000' });
-  assert.equal(data.phone, '0917 123 4567');
+  assert.equal(data.phone, '09171234567');
   assert.equal(data.dateOfBirth, '1990-03-15');
   assert.equal(data.child1Age, '7');
   assert.equal(data.income1Amount, '60000');
@@ -143,4 +144,47 @@ test('the membership form 2x2 picture is checked on the form, or uploaded and ch
   assert.match(buildPhotoPrompt(), /faceVisible/);
   assert.deepEqual(normalizePhotoReading({ portrait: true, faceVisible: 'yes', screen: false, issues: ['dark'] }), { portrait: true, faceVisible: null, screen: false, issues: ['dark'] });
   assert.deepEqual(normalizePhotoReading(null), { portrait: null, faceVisible: null, screen: null, issues: [] });
+});
+
+test('mobile and RSBSA numbers are normalized as they are read', () => {
+  for (const written of ['0917 123 4567', '+63 917 123 4567', '63-917-123-4567', '9171234567']) assert.equal(normalizePhone(written), '09171234567', written);
+  assert.equal(normalizePhone('(043) 288-1234'), '(043) 288-1234');
+  assert.equal(normalizePhone('none'), 'none');
+  const data = normalizeExtractedData('Membership Form', { rsbsaNo: '17 51 08 012 000123', phone: '+639181234567' });
+  assert.equal(data.rsbsaNo, '17-51-08-012-000123');
+  assert.equal(data.phone, '09181234567');
+});
+
+test('names match when at least 90% alike, ignoring order and a missing middle name', () => {
+  assert.equal(nameSimilarity('Juan Dela Cruz', 'DELA CRUZ, JUAN'), 1);
+  assert.equal(nameSimilarity('Juan Dela Cruz', 'Juan Santos Dela Cruz'), 1);
+  assert.ok(nameSimilarity('Juan Dela Cruz', 'Juan Dela Crus') >= 0.9);
+  assert.ok(nameSimilarity('Juan Dela Cruz', 'Pedro Penduko') < 0.5);
+  assert.ok(nameSimilarity('Maria Santos', 'Marta Santos') < 1);
+});
+
+test('the second reading flags the values the two readings disagree on', () => {
+  assert.match(buildCrossCheckPrompt(), /data-entry clerk/);
+  assert.ok(!buildCrossCheckPrompt().includes('authenticity'));
+  const first = { lastName: 'Dela Cruz', firstName: 'Juan', dateOfBirth: '1990-03-15', phone: '09171234567', farmAreaHa: '1.50' };
+  const same = compareReadings('Membership Form', first, { ...first, lastName: 'DELA CRUZ', farmAreaHa: '1.5' });
+  assert.deepEqual(same.differing, []);
+  assert.equal(same.compared, 5);
+  const differ = compareReadings('Membership Form', first, { ...first, dateOfBirth: '1990-03-16', phone: '' });
+  assert.deepEqual(differ.differing, ['dateOfBirth', 'phone']);
+});
+
+test('confidence is the share of checks passed, and places compare loosely', () => {
+  assert.equal(checksScore([{ status: 'pass' }, { status: 'pass' }, { status: 'warn' }, { status: 'fail' }]), 50);
+  assert.equal(checksScore([]), null);
+  assert.equal(placeKey('Sta. Cruz'), placeKey('Santa Cruz'));
+  assert.equal(placeKey('Brgy. Barahan'), placeKey('BARAHAN'));
+});
+
+test('only members, loan applications and rental requests saved automatically can be undone, for 48 hours', () => {
+  const at = '2026-10-01T00:00:00.000Z';
+  assert.equal(undoDeadline({ posted_at: at, posted_automatically: true, posted_module: 'members' }).toISOString(), '2026-10-03T00:00:00.000Z');
+  assert.ok(undoDeadline({ posted_at: at, posted_automatically: true, posted_module: 'loans' }));
+  assert.equal(undoDeadline({ posted_at: at, posted_automatically: false, posted_module: 'members' }), null);
+  assert.equal(undoDeadline({ posted_at: at, posted_automatically: true, posted_module: 'savings' }), null);
 });

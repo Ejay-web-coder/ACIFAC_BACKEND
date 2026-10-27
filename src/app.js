@@ -18,6 +18,7 @@ import { announcementRoutes, eventRoutes, legalDocumentRoutes, notificationRoute
 import { isListening } from './services/events.js';
 import { refreshLoanStatuses } from './services/loanService.js';
 import { refreshRentalStatuses } from './controllers/machineryController.js';
+import { retryDueScans } from './controllers/ocrController.js';
 import { flushSmsOutbox } from './services/smsService.js';
 
 export function createApp() {
@@ -62,6 +63,8 @@ export function createApp() {
     }
     await Promise.all([refreshLoanStatuses({ force: true }), refreshRentalStatuses()]);
     await flushSmsOutbox();
+    // Scans still queued for another AI reading (the OCR Scanner page also reads them while it is open).
+    await retryDueScans({ limit: 1 }).catch((error) => console.warn('OCR retry queue:', error.message));
     return res.status(200).json({ ok: true });
   });
 
