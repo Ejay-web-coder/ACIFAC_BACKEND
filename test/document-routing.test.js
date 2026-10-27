@@ -11,9 +11,9 @@ test('document types: postable forms, legacy names and unknown values', () => {
   assert.equal(normalizeDocumentType('Loan Application'), 'Loan Form');
   assert.equal(normalizeDocumentType('Grocery list'), UNRECOGNIZED);
   assert.equal(normalizeDocumentType(undefined), UNRECOGNIZED);
-  for (const type of ['Membership Form', 'Loan Form', 'Savings Form', 'Machinery Form', 'Kadiwa Sales Form']) assert.ok(isPostable(type), type);
+  for (const type of ['Membership Form', 'Loan Form', 'Savings Form', 'Machinery Form', 'Kadiwa Sales Form', 'Add Inventory Form', 'Kadiwa Daily Sales Form']) assert.ok(isPostable(type), type);
   assert.equal(isPostable('Payment Receipt'), false);
-  assert.equal(publicFormDefinitions().length, 5);
+  assert.equal(publicFormDefinitions().length, 7);
 });
 
 test('extracted data is mapped onto the form keys and normalised', () => {
@@ -48,7 +48,7 @@ test('authenticity assessment is sanitised', () => {
 
 test('analysis prompt lists every form key and adapts to camera captures', () => {
   const prompt = buildAnalysisPrompt('upload');
-  for (const key of ['memberNumber', 'encoderName', 'machinery', 'membershipDate', 'referenceNumber']) assert.ok(prompt.includes(key), key);
+  for (const key of ['memberNumber', 'grandTotal', 'machinery', 'membershipDate', 'referenceNumber']) assert.ok(prompt.includes(key), key);
   assert.ok(prompt.includes('authenticity'));
   assert.ok(!prompt.includes('phone camera'));
   assert.ok(buildAnalysisPrompt('camera').includes('phone camera'));

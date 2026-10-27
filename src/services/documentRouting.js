@@ -5,7 +5,9 @@ import { parseMoneyInput } from '../utils/money.js';
 import { insertMemberRecord, nextMemberNumber, parseShareCapital, SAVINGS_METHODS, insertSavingsDeposit, validateMemberInput } from '../controllers/memberController.js';
 import { insertLoanRequest, memberApplicationSelect, prepareApplication } from '../controllers/loanController.js';
 import { insertRentalRequest } from '../controllers/machineryController.js';
-import { insertKadiwaSale } from '../controllers/kadiwaController.js';
+import { insertInventoryItems, insertKadiwaSale } from '../controllers/kadiwaController.js';
+import { goodsForForm, parseExpenseLines, parseGoodsLines } from './kadiwaGoods.js';
+import { readInventoryForm, readSalesForm } from './kadiwaFormReading.js';
 import { loanApplicationReceivedEmail, rentalRequestReceivedEmail, savingsDepositEmail, welcomeMemberEmail } from './emailTemplates.js';
 
 // Scanned cooperative forms: what each one contains, how the AI must report
@@ -41,6 +43,24 @@ export const ID_SLOTS = {
   holder: { path: 'id_document_path', name: 'id_document_name', type: 'id_document_type', size: 'id_document_size', source: 'id_document_source', check: 'id_document_check' },
   coMaker: { path: 'co_maker_id_path', name: 'co_maker_id_name', type: 'co_maker_id_type', size: 'co_maker_id_size', source: 'co_maker_id_source', check: 'co_maker_id_check' },
 };
+
+// The line tables of the printed Kadiwa forms (Kadiwa Store > Blank form):
+// row n of table `id` is the fields <id><n><Column>, e.g. line3CostPrice.
+// Only lines with something written are read, numbered 1, 2, 3... in order.
+const table = (id, label, rows, columns) => ({ id, label, rows, columns: columns.map(([key, columnLabel, kind = 'text']) => ({ key, label: columnLabel, kind })) });
+const KADIWA_INVENTORY_LINES = table('line', 'Products', 60, [
+  ['Product', 'Product'], ['Size', 'Size (e.g. 150 g)'], ['Quantity', 'Quantity', 'number'], ['Unit', 'Counted In'],
+  ['SellingPrice', 'Selling Price', 'money'], ['CostPrice', 'Cost Price', 'money'], ['Total', 'Total (Qty x Cost)', 'money'],
+]);
+const KADIWA_GOODS_LINES = table('good', 'A. Goods Sold', 60, [['Name', 'Goods Sold'], ['Unit', 'Unit'], ['Price', 'Price', 'money'], ['Quantity', 'Quantity', 'number'], ['Amount', 'Total Amount', 'money']]);
+const KADIWA_STORE_LINES = table('store', 'B. Store Items Sold', 60, [['Code', 'Code'], ['Product', 'Product'], ['Quantity', 'Quantity Sold', 'number'], ['Amount', 'Amount', 'money']]);
+const KADIWA_EXPENSE_LINES = table('expense', 'C. Expenses', 10, [['Description', 'What It Was For'], ['Amount', 'Amount', 'money']]);
+const tableFields = (lines) => Array.from({ length: lines.rows }, (_, index) => lines.columns.map((column) => f(`${lines.id}${index + 1}${column.key}`, `${lines.label} ${index + 1} - ${column.label}`, { kind: column.kind, tableCell: true }))).flat();
+// The filled-in rows of a table, as { line, <Column>: value }.
+const tableRows = (data, lines) => Array.from({ length: lines.rows }, (_, index) => ({
+  line: index + 1, ...Object.fromEntries(lines.columns.map((column) => [column.key, String(data[`${lines.id}${index + 1}${column.key}`] || '').trim()])),
+})).filter((row) => lines.columns.some((column) => row[column.key]));
+const tableKeysText = (lines) => `${lines.columns.map((column) => `${lines.id}<n>${column.key}`).join(', ')} for each filled-in line of "${lines.label}" (n = 1, 2, 3... in order, at most ${lines.rows})`;
 
 export const FORM_DEFINITIONS = {
   'Membership Form': {
@@ -120,8 +140,32 @@ export const FORM_DEFINITIONS = {
       f('startDate', 'Start Date', { kind: 'date', required: true }), f('endDate', 'End Date', { kind: 'date', required: true }), f('notes', 'Notes'),
     ],
   },
+  'Add Inventory Form': {
+    module: 'kadiwa', moduleLabel: 'Kadiwa Store inventory', signatureExpected: true,
+    description: 'ACIFAC Kadiwa Store "ADD INVENTORY FORM" (form code KADIWA-INV printed at the top right): date, low stock at, a ticked category, and numbered lines of product, size, quantity, counted in, selling price, cost price and total, with the TOTAL and the prepared-by signature.',
+    notes: 'category is the ticked box: Groceries, Vegetables, Meat or Other. Size as written, e.g. "150 g" or "1.5 L". Unit is what the quantity is counted in (pc, pack, bottle, can, sachet, box or kg). Quantity is the number only. grandTotal is the TOTAL at the bottom of the table. A form may have several pages: number the lines on from page to page.',
+    tables: [KADIWA_INVENTORY_LINES],
+    fields: [
+      f('date', 'Date', { kind: 'date' }), f('preparedBy', 'Prepared By'), f('category', 'Category (Groceries, Vegetables, Meat or Other)'),
+      f('lowStockAt', 'Low Stock At', { kind: 'number' }), f('grandTotal', 'TOTAL written on the form', { kind: 'money' }),
+      ...tableFields(KADIWA_INVENTORY_LINES),
+    ],
+  },
+  'Kadiwa Daily Sales Form': {
+    module: 'kadiwa', moduleLabel: 'Kadiwa Store sales', signatureExpected: true,
+    description: 'ACIFAC "DAILY SALES FORM" of the Kadiwa ng Pangulo store (form code KADIWA-SALES printed at the top right): date, prepared by / seller, A. GOODS SOLD (goods printed with unit and price, plus blank lines for other goods), B. STORE ITEMS SOLD (products printed with a code such as INV-0012), C. EXPENSES, and the TOTALS box.',
+    notes: 'For goods and store items, only include the lines with a quantity or amount written; a dash or 0 means nothing was sold. Copy the printed name, unit and price of each good (or the price written over it). For store items copy the printed code into store<n>Code. totalGoodsSold, totalExpenses and netIncome are from the TOTALS box. The form usually has two pages.',
+    tables: [KADIWA_GOODS_LINES, KADIWA_STORE_LINES, KADIWA_EXPENSE_LINES],
+    fields: [
+      f('saleDate', 'Date of the Sales', { kind: 'date', required: true }), f('preparedBy', 'Prepared By / Seller'),
+      f('totalGoodsSold', 'TOTAL GOODS SOLD written on the form', { kind: 'money' }), f('totalExpenses', 'TOTAL EXPENSES written on the form', { kind: 'money' }),
+      f('netIncome', 'NET INCOME written on the form', { kind: 'money' }),
+      ...tableFields(KADIWA_GOODS_LINES), ...tableFields(KADIWA_STORE_LINES), ...tableFields(KADIWA_EXPENSE_LINES),
+    ],
+  },
+  // Scans read before the Kadiwa forms were itemized; no longer offered to the AI.
   'Kadiwa Sales Form': {
-    module: 'kadiwa', moduleLabel: 'Kadiwa Store sales', signatureExpected: false,
+    module: 'kadiwa', moduleLabel: 'Kadiwa Store sales', signatureExpected: false, legacy: true,
     description: 'Kadiwa store daily / new sales form with sales per category.',
     fields: [
       f('encoderName', 'Encoder / Prepared By', { required: true }), f('saleDate', 'Sale Date', { kind: 'date' }),
@@ -169,6 +213,8 @@ export function publicFormDefinitions() {
   return Object.entries(FORM_DEFINITIONS).map(([type, definition]) => ({
     type, module: definition.module, moduleLabel: definition.moduleLabel, description: definition.description,
     requiresIdDocument: requiresIdDocument(type), idDocuments: publicIdRequirements(type), photoExpected: Boolean(definition.photoExpected),
+    legacy: Boolean(definition.legacy),
+    tables: (definition.tables || []).map(({ id, label, rows, columns }) => ({ id, label, rows, columns })),
     fields: definition.fields.map(({ key, label, kind, required }) => ({ key, label, kind, required })),
   }));
 }
@@ -182,8 +228,12 @@ export function photoExpected(documentType) {
 }
 
 export function buildAnalysisPrompt(captureSource) {
-  const forms = Object.entries(FORM_DEFINITIONS).map(([type, definition]) => (
-    `- "${type}": ${definition.description} extractedData keys: ${definition.fields.map((field) => `${field.key}${field.required ? ' (required)' : ''}`).join(', ')}.${definition.notes ? ` ${definition.notes}` : ''}`
+  const keys = (definition) => [
+    ...definition.fields.filter((field) => !field.tableCell).map((field) => `${field.key}${field.required ? ' (required)' : ''}`),
+    ...(definition.tables || []).map(tableKeysText),
+  ].join(', ');
+  const forms = Object.entries(FORM_DEFINITIONS).filter(([, definition]) => !definition.legacy).map(([type, definition]) => (
+    `- "${type}": ${definition.description} extractedData keys: ${keys(definition)}.${definition.notes ? ` ${definition.notes}` : ''}`
   )).join('\n');
   return `You read paper forms of ACIFAC, an agricultural cooperative in the Philippines. Return JSON only with exactly these fields:
 documentType (string), confidence (number 0-100, required), ocrText (string, all readable text), extractedData (object of strings), authenticity (object).
@@ -194,7 +244,7 @@ ${forms}
 - "${UNRECOGNIZED}": anything else, or when confidence is below 70.
 
 A form may span several pages (one PDF or image per page); read every page. Pages may be photographed sideways or upside down; read them in any orientation.
-Extraction rules: use exactly the listed keys for the five forms. Copy values as written; never invent, complete or guess a value — use "" when a field is blank, missing or illegible. Dates as YYYY-MM-DD. Money and numbers as plain digits with optional 2 decimals (no currency sign, no commas).
+Extraction rules: use exactly the listed keys for these forms. Copy values as written; never invent, complete or guess a value — use "" when a field is blank, missing or illegible. Dates as YYYY-MM-DD. Money and numbers as plain digits with optional 2 decimals (no currency sign, no commas).
 
 authenticity must be: { "score": number 0-100 (how likely this is a genuine, unaltered, actually filled-in cooperative form), "verdict": "genuine" | "suspicious" | "fake", "physicalDocument": boolean (true if this is a photo or scan of real paper; false for a photo of a screen, a screenshot, or a digitally generated/edited image), "filledIn": boolean (false if the form is blank or only a template/sample), "signaturePresent": boolean, "photoRecognized": boolean or null (Membership Form only: true when a 2x2 ID picture is attached in the photo box at the top right and the person's face is clearly recognizable; false when the box is empty or the face cannot be made out; null for other forms), "issues": [short strings] }.
 Look for: altered, overwritten or erased values; mismatched fonts or ink inside a field; pasted or digitally edited areas; totals that do not add up; SAMPLE/SPECIMEN/VOID marks; screen moiré or pixels; missing signatures; a form that is not an ACIFAC/cooperative form. Report every problem found in issues.${captureSource === 'camera' ? '\nThis document was photographed with a phone camera at the office, so normal perspective, shadows and paper texture are expected and are not signs of tampering.' : ''}`;
@@ -299,10 +349,11 @@ export function normalizeExtractedData(documentType, raw) {
     return Object.fromEntries(Object.entries(source).filter(([key]) => key).slice(0, 60).map(([key, value]) => [String(key).slice(0, 100), value === null || value === undefined ? '' : String(value).slice(0, 2000)]));
   }
   const byCompactKey = new Map(Object.entries(source).map(([key, value]) => [compact(key), value]));
+  // Empty cells of a line table are left out: a form has room for far more lines than are written.
   return Object.fromEntries(definition.fields.map((field) => {
-    const value = byCompactKey.get(compact(field.key)) ?? byCompactKey.get(compact(field.label.replace(/\(.*\)/, '')));
+    const value = byCompactKey.get(compact(field.key)) ?? (field.tableCell ? undefined : byCompactKey.get(compact(field.label.replace(/\(.*\)/, ''))));
     return [field.key, normalizeValue(field, value)];
-  }));
+  }).filter(([key, value]) => value || !definition.fields.find((field) => field.key === key)?.tableCell));
 }
 
 export function normalizeAuthenticity(raw) {
@@ -402,6 +453,8 @@ const FINGERPRINT_KEYS = {
   'Savings Form': ['memberNumber', 'amount', 'date', 'referenceNumber'],
   'Machinery Form': ['memberNumber', 'machinery', 'startDate', 'endDate'],
   'Kadiwa Sales Form': ['encoderName', 'saleDate', 'groceriesPrice', 'vegetablesPrice', 'meatPrice', 'totalExpenses'],
+  'Add Inventory Form': ['date', 'line1Product', 'line1Quantity', 'line1CostPrice', 'line2Product', 'line2Quantity', 'grandTotal'],
+  'Kadiwa Daily Sales Form': ['saleDate', 'preparedBy', 'good1Name', 'good1Amount', 'good2Name', 'good2Amount', 'store1Code', 'store1Quantity', 'totalGoodsSold'],
 };
 
 const moneyCents = (value) => (value ? parseMoneyInput(value, { allowZero: true }) : 0);
@@ -648,6 +701,30 @@ function checkLoanAmounts(data, add) {
   if (!String(data.term || '').trim()) add('term', 'Loan term', 'pass', `The paper form has no loan term; the standard ${DEFAULT_LOAN_TERM} months will be used. Change it above if the member agreed another term.`);
 }
 
+// The printed Kadiwa forms, as Add Inventory and New Sale would save them.
+const inventoryProducts = async (db) => (await db.query(
+  `SELECT id, name, size_value AS "sizeValue", size_unit AS "sizeUnit", price, stock, cost_price AS "costPrice"
+     FROM kadiwa_inventory WHERE deleted_at IS NULL ORDER BY LOWER(name), size_value NULLS FIRST, id`
+)).rows.map((product) => ({ ...product, label: product.sizeValue === null || !product.sizeUnit ? product.name : `${product.name} ${Number(product.sizeValue)} ${product.sizeUnit}` }));
+
+async function readKadiwaInventory(db, data) {
+  const rows = tableRows(data, KADIWA_INVENTORY_LINES).map((row) => ({
+    line: row.line, product: row.Product, sizeValue: row.Size, quantity: row.Quantity, unit: row.Unit, sellingPrice: row.SellingPrice, costPrice: row.CostPrice, total: row.Total,
+  }));
+  return readInventoryForm({ rows, grandTotal: data.grandTotal, category: data.category, lowStockAt: data.lowStockAt }, await inventoryProducts(db));
+}
+
+async function readKadiwaSales(db, data) {
+  const raw = {
+    saleDate: data.saleDate,
+    goods: tableRows(data, KADIWA_GOODS_LINES).map((row) => ({ name: row.Name, unit: row.Unit, price: row.Price, quantity: row.Quantity, amount: row.Amount })),
+    storeItems: tableRows(data, KADIWA_STORE_LINES).map((row) => ({ inventoryId: row.Code, product: row.Product, quantity: row.Quantity, amount: row.Amount })),
+    expenses: tableRows(data, KADIWA_EXPENSE_LINES).map((row) => ({ description: row.Description, amount: row.Amount })),
+    totals: { goodsSold: data.totalGoodsSold, expenses: data.totalExpenses, netIncome: data.netIncome },
+  };
+  return readSalesForm(raw, await goodsForForm(db), await inventoryProducts(db));
+}
+
 // `found` receives the member the form is for, for the ID checks that follow.
 async function checkRecords(db, documentType, data, add, found = {}) {
   if (documentType === 'Membership Form') {
@@ -674,6 +751,29 @@ async function checkRecords(db, documentType, data, add, found = {}) {
     if (!String(data.membershipDate || '').trim()) add('acceptance', 'Acceptance date', 'pass', `The form has no acceptance date yet; today (${todayDateOnly()}) will be the membership date.`);
     // The system gives the membership number; shown so it can be written on the paper form.
     return { memberNumber: await nextMemberNumber(db) };
+  }
+
+  if (documentType === 'Add Inventory Form') {
+    const reading = await readKadiwaInventory(db, data);
+    if (!reading.rows.length) add('lines', 'Products on the form', 'fail', 'No product lines were read from the form.');
+    else add('lines', 'Products on the form', 'pass', `${reading.rows.length} ${reading.rows.length === 1 ? 'product' : 'products'} read.`);
+    if (reading.rows.some((row) => !row.unit)) add('units', 'Counted in', 'warn', 'What some quantities are counted in was not read; pc will be used. Check the Counted In column.');
+    const warnings = reading.warnings.filter((warning) => !warning.startsWith('No product lines'));
+    if (warnings.length) add('totals', 'Lines and totals', 'warn', warnings.join(' '));
+    else if (reading.rows.length) add('totals', 'Lines and totals', 'pass', 'Every line total is quantity x cost price, and the lines add up to the TOTAL.');
+    return {};
+  }
+
+  if (documentType === 'Kadiwa Daily Sales Form') {
+    const reading = await readKadiwaSales(db, data);
+    if (!reading.goods.length && !reading.items.length) add('lines', 'Goods sold', 'fail', 'No goods or store items sold were read from the form.');
+    else add('lines', 'Goods sold', 'pass', `${reading.goods.length} ${reading.goods.length === 1 ? 'good' : 'goods'} and ${reading.items.length} store ${reading.items.length === 1 ? 'item' : 'items'} read.`);
+    if (reading.unmatched.length) add('storeItems', 'Store items in the inventory', 'fail', `Not in the inventory: ${reading.unmatched.join(', ')}. Correct the code from the paper form, or add the product with Add Inventory first.`);
+    if (!reading.expenses.length) add('expenses', 'Expenses', 'warn', 'No expenses were written on the form; the sale will be saved with no expenses (0).');
+    const warnings = reading.warnings.filter((warning) => !/^(No goods or store items|Store item ")|could not be read; enter it\.$/.test(warning));
+    if (warnings.length) add('totals', 'Lines and totals', 'warn', warnings.join(' '));
+    else if (reading.goods.length || reading.items.length) add('totals', 'Lines and totals', 'pass', 'Every line and the TOTALS box add up.');
+    return {};
   }
 
   if (documentType === 'Kadiwa Sales Form') {
@@ -919,6 +1019,33 @@ async function saveToModule(client, req, scan, documentType, data, target) {
       module: 'machinery', recordId: String(request.id), label: `Rental request #${request.id} submitted for approval`,
       memberId: target.memberId, email: (recipient) => rentalRequestReceivedEmail({ memberName: recipient.full_name, machineryName: request.machineryName, startDate: request.startDate, endDate: request.endDate, rentalFee: request.rentalFee, fromPaperForm: true }),
     };
+  }
+
+  if (documentType === 'Add Inventory Form') {
+    const reading = await readKadiwaInventory(client, data);
+    if (!reading.rows.length) throw badRequest('No product lines were read from the form.');
+    const category = ['Groceries', 'Vegetables', 'Meat', 'Other'].find((option) => option.toLowerCase() === String(data.category || '').trim().toLowerCase()) || 'Groceries';
+    const created = await insertInventoryItems(client, req, reading.rows.map((row) => ({
+      name: row.name, category, sizeValue: row.sizeValue, sizeUnit: row.sizeUnit, unit: row.unit || 'pc', stock: row.stock,
+      price: row.price, costPrice: row.costPrice, reorderLevel: reading.lowStockAt || '5',
+    })), { source: `from scanned Add Inventory form #${scan.id}` });
+    const ids = created.map((item) => item.id).sort();
+    return { module: 'kadiwa', recordId: ids.length === 1 ? ids[0] : `${ids[0]} to ${ids[ids.length - 1]}`, label: `${ids.length} ${ids.length === 1 ? 'product' : 'products'} added to the Kadiwa Store inventory` };
+  }
+
+  if (documentType === 'Kadiwa Daily Sales Form') {
+    if (!isValidDateOnly(data.saleDate) || data.saleDate > todayDateOnly()) throw badRequest('Enter the date of the sales from the form (not a future date).');
+    const reading = await readKadiwaSales(client, data);
+    if (reading.unmatched.length) throw badRequest(`Not in the inventory: ${reading.unmatched.join(', ')}.`);
+    if (!reading.goods.length && !reading.items.length) throw badRequest('No goods or store items sold were read from the form.');
+    const goods = parseGoodsLines(reading.goods.map(({ name, unit, category, price, quantity, amount }) => ({ name, unit, category, price, quantity, amount })));
+    const expenseLines = parseExpenseLines(reading.expenses.length ? reading.expenses : [{ description: 'None', amount: '0' }]);
+    const encoderName = String(data.preparedBy || req.user?.full_name || req.user?.username || 'Administrator').trim().slice(0, 200);
+    const saleId = await insertKadiwaSale(client, req, {
+      encoderName, saleDate: data.saleDate, manual: { Groceries: 0, Vegetables: 0, Meat: 0 },
+      expensesCents: expenseLines.reduce((sum, line) => sum + line.cents, 0), items: reading.items.map(({ inventoryId, quantity }) => ({ inventoryId, quantity })), goods, expenseLines,
+    });
+    return { module: 'kadiwa', recordId: saleId, label: `Kadiwa sale ${saleId} recorded` };
   }
 
   if (documentType === 'Kadiwa Sales Form') {

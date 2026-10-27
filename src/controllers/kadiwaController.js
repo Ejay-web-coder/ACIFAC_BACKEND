@@ -285,6 +285,14 @@ async function findExisting(client, items, exceptId = null) {
 export async function createInventoryItem(req, res) {
   const body = req.body || {};
   const rows = Array.isArray(body.items) ? body.items : [body];
+  const created = await withTransaction((client) => insertInventoryItems(client, req, rows));
+  return res.status(201).json({ success: true, items: created, item: created[0] });
+}
+
+// Checks and adds the rows of an inventory sheet inside the caller's
+// transaction, and returns the products added. Shared by Add Inventory and by
+// OCR-posted Add Inventory forms. `source` is added to the audit description.
+export async function insertInventoryItems(client, req, rows, { source = '' } = {}) {
   if (!rows.length) throw badRequest('Add at least one product.');
   if (rows.length > MAX_SHEET_ROWS) throw badRequest(`Save at most ${MAX_SHEET_ROWS} products at a time.`);
   const rowLabel = (index) => (rows.length > 1 ? `Row ${index + 1}: ` : '');
@@ -296,31 +304,28 @@ export async function createInventoryItem(req, res) {
     seen.set(key, index);
   });
 
-  const created = await withTransaction(async (client) => {
-    // One add or edit at a time, so two admins cannot add the same product together.
-    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [INVENTORY_LOCK]);
-    const existing = await findExisting(client, items);
-    if (existing) {
-      const item = items[existing.index];
-      throw conflict(`${rowLabel(existing.index)}${productLabel(item.name, item.sizeValue, item.sizeUnit)} (${item.unit}) is already in the inventory as ${existing.id}. Use Restock or Edit instead.`);
-    }
-    const column = (key) => items.map((item) => item[key]);
-    const ids = (await client.query(
-      `INSERT INTO kadiwa_inventory (id, name, category, size_value, size_unit, unit, stock, price, cost_price, reorder_level)
-       SELECT 'INV-' || LPAD(nextval('kadiwa_inventory_seq')::text, 4, '0'), r.name, r.category, r.size_value, r.size_unit, r.unit, r.stock, r.price, r.cost_price, r.reorder_level
-         FROM unnest($1::text[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::numeric[], $7::numeric[], $8::numeric[], $9::numeric[])
-              WITH ORDINALITY AS r(name, category, size_value, size_unit, unit, stock, price, cost_price, reorder_level, ord)
-        ORDER BY r.ord
-       RETURNING id`,
-      [column('name'), column('category'), column('sizeValue'), column('sizeUnit'), column('unit'), column('stock'), column('price'), column('costPrice'), column('reorderLevel')]
-    )).rows.map((row) => row.id);
-    const description = items.length === 1
-      ? `Added inventory item ${productLabel(items[0].name, items[0].sizeValue, items[0].sizeUnit)}`
-      : `Added ${items.length} inventory items`;
-    await createAuditLog({ client, user: req.user, action: 'INVENTORY_CREATED', module: 'Kadiwa', entityType: 'kadiwa_inventory', entityId: ids.length === 1 ? ids[0] : null, description, newValues: items.length === 1 ? { id: ids[0], ...items[0] } : { items: items.map((item, index) => ({ id: ids[index], ...item })) }, ...getRequestMeta(req) });
-    return (await client.query(`${inventorySelect} WHERE id = ANY($1::varchar[]) ORDER BY ${inventoryOrder}`, [ids])).rows;
-  });
-  return res.status(201).json({ success: true, items: created, item: created[0] });
+  // One add or edit at a time, so two admins cannot add the same product together.
+  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [INVENTORY_LOCK]);
+  const existing = await findExisting(client, items);
+  if (existing) {
+    const item = items[existing.index];
+    throw conflict(`${rowLabel(existing.index)}${productLabel(item.name, item.sizeValue, item.sizeUnit)} (${item.unit}) is already in the inventory as ${existing.id}. Use Restock or Edit instead.`);
+  }
+  const column = (key) => items.map((item) => item[key]);
+  const ids = (await client.query(
+    `INSERT INTO kadiwa_inventory (id, name, category, size_value, size_unit, unit, stock, price, cost_price, reorder_level)
+     SELECT 'INV-' || LPAD(nextval('kadiwa_inventory_seq')::text, 4, '0'), r.name, r.category, r.size_value, r.size_unit, r.unit, r.stock, r.price, r.cost_price, r.reorder_level
+       FROM unnest($1::text[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::numeric[], $7::numeric[], $8::numeric[], $9::numeric[])
+            WITH ORDINALITY AS r(name, category, size_value, size_unit, unit, stock, price, cost_price, reorder_level, ord)
+      ORDER BY r.ord
+     RETURNING id`,
+    [column('name'), column('category'), column('sizeValue'), column('sizeUnit'), column('unit'), column('stock'), column('price'), column('costPrice'), column('reorderLevel')]
+  )).rows.map((row) => row.id);
+  const description = `${items.length === 1
+    ? `Added inventory item ${productLabel(items[0].name, items[0].sizeValue, items[0].sizeUnit)}`
+    : `Added ${items.length} inventory items`}${source ? ` ${source}` : ''}`;
+  await createAuditLog({ client, user: req.user, action: 'INVENTORY_CREATED', module: 'Kadiwa', entityType: 'kadiwa_inventory', entityId: ids.length === 1 ? ids[0] : null, description, newValues: items.length === 1 ? { id: ids[0], ...items[0] } : { items: items.map((item, index) => ({ id: ids[index], ...item })) }, ...getRequestMeta(req) });
+  return (await client.query(`${inventorySelect} WHERE id = ANY($1::varchar[]) ORDER BY ${inventoryOrder}`, [ids])).rows;
 }
 
 // Edits a product. The quantity on hand changes here only to record a physical

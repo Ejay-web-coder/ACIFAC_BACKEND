@@ -1694,7 +1694,7 @@ test('ocr: scanned forms are verified, posted to their module, and fakes are blo
   });
 
   const forms = await admin.get('/api/ocr/forms');
-  assert.deepEqual(forms.data.data.map((form) => form.type), ['Membership Form', 'Loan Form', 'Savings Form', 'Machinery Form', 'Kadiwa Sales Form']);
+  assert.deepEqual(forms.data.data.map((form) => form.type), ['Membership Form', 'Loan Form', 'Savings Form', 'Machinery Form', 'Add Inventory Form', 'Kadiwa Daily Sales Form', 'Kadiwa Sales Form']);
 
   // A genuine, complete savings form is verified and posted automatically.
   const posted = await scan(savingsForm());
@@ -1864,6 +1864,84 @@ test('ocr: scanned forms are verified, posted to their module, and fakes are blo
   assert.equal((await uploadPhoto({ portrait: true, faceVisible: true }, 8)).status, 409);
   assert.equal((await submitId(fake.id, 'upload', idCopy, 5)).status, 400);
 
+  stubAnalysis = DEFAULT_STUB_ANALYSIS;
+});
+
+test('ocr: the printed Kadiwa forms add products to the inventory and record a sale', { skip }, async () => {
+  const genuine = { score: 95, verdict: 'genuine', physicalDocument: true, filledIn: true, signaturePresent: true, issues: [] };
+  let counter = 200;
+  const scan = async (analysis) => {
+    stubAnalysis = analysis;
+    counter += 1;
+    const form = new FormData();
+    form.append('source', 'camera');
+    form.append('document', new Blob([Buffer.concat([PNG, Buffer.from([counter % 256, counter >> 8])])], { type: 'image/png' }), `kadiwa-${counter}.png`);
+    const response = await admin.request('POST', '/api/ocr/analyze', { form });
+    assert.equal(response.status, 201, JSON.stringify(response.data));
+    return response.data.data;
+  };
+  const check = (scanned, id) => scanned.verification.checks.find((item) => item.id === id);
+  const inventoryForm = (extractedData) => ({
+    documentType: 'Add Inventory Form', confidence: 95, ocrText: 'ADD INVENTORY FORM KADIWA-INV', authenticity: genuine,
+    extractedData: { date: '2026-01-20', preparedBy: 'Maria', category: 'groceries', lowStockAt: '4', ...extractedData },
+  });
+  const inventory = async () => (await admin.get('/api/kadiwa')).data.inventory;
+
+  // A form whose lines and total add up is saved to the inventory on its own.
+  const added = await scan(inventoryForm({
+    line1Product: 'OCR Corned Beef', line1Size: '150g', line1Quantity: '12', line1Unit: 'cans', line1SellingPrice: '45', line1CostPrice: '40', line1Total: '480',
+    line2Product: 'OCR Coffee 3in1', line2Quantity: '50', line2Unit: 'sachet', line2SellingPrice: '8', line2CostPrice: '6.50', line2Total: '325', grandTotal: '805',
+  }));
+  assert.equal(added.posted?.module, 'kadiwa', JSON.stringify(added.verification));
+  const beef = (await inventory()).find((item) => item.name === 'OCR Corned Beef');
+  assert.equal(Number(beef.sizeValue), 150);
+  assert.equal(beef.sizeUnit, 'g');
+  assert.equal(beef.unit, 'can');
+  assert.equal(Number(beef.stock), 12);
+  assert.equal(Number(beef.costPrice), 40);
+  assert.equal(Number(beef.reorderLevel), 4);
+  assert.equal(beef.category, 'Groceries');
+  assert.ok((await inventory()).some((item) => item.name === 'OCR Coffee 3in1' && item.unit === 'sachet' && Number(item.stock) === 50));
+
+  // A total that does not add up holds the form for review; the admin can still save it.
+  const held = await scan(inventoryForm({ line1Product: 'OCR Rice', line1Size: '1 kg', line1Quantity: '10', line1Unit: 'pack', line1SellingPrice: '60', line1CostPrice: '52', line1Total: '500' }));
+  assert.equal(held.posted, null);
+  assert.equal(check(held, 'totals').status, 'warn');
+  assert.match(check(held, 'totals').message, /10 × PHP 52\.00 = PHP 520\.00, but the form says PHP 500\.00/);
+  const saved = await admin.post(`/api/ocr/${held.id}/post`, { documentType: 'Add Inventory Form', extractedData: held.extractedData, acknowledgeWarnings: true });
+  assert.equal(saved.status, 200, JSON.stringify(saved.data));
+  assert.ok((await inventory()).some((item) => item.name === 'OCR Rice' && Number(item.stock) === 10));
+
+  // A product already in the inventory is refused by the inventory's own rules.
+  const again = await scan(inventoryForm({ date: '2026-01-21', line1Product: 'OCR Corned Beef', line1Size: '150 g', line1Quantity: '5', line1Unit: 'can', line1SellingPrice: '45', line1CostPrice: '40', line1Total: '200' }));
+  assert.equal(again.posted, null);
+  assert.equal(again.verification.status, 'failed');
+  assert.match(check(again, 'rules').message, /already in the inventory/);
+
+  // The daily sales form: goods, a store item by its printed code, and the expenses.
+  const salesForm = (extractedData) => ({
+    documentType: 'Kadiwa Daily Sales Form', confidence: 94, ocrText: 'DAILY SALES FORM KADIWA-SALES', authenticity: genuine,
+    extractedData: { saleDate: '2026-01-21', preparedBy: 'Maria Santos', ...extractedData },
+  });
+  const sold = await scan(salesForm({
+    good1Name: 'PORK', good1Unit: 'KILO', good1Price: '400', good1Quantity: '1.5', good1Amount: '600',
+    store1Code: beef.id, store1Product: 'OCR Corned Beef 150 g (can)', store1Quantity: '2', store1Amount: '90',
+    expense1Description: 'Ice', expense1Amount: '20', totalGoodsSold: '690', totalExpenses: '20', netIncome: '670',
+  }));
+  assert.equal(sold.posted?.module, 'kadiwa', JSON.stringify(sold.verification));
+  const day = (await admin.get('/api/kadiwa/sales?from=2026-01-21&to=2026-01-21')).data.sales;
+  const sale = day.find((entry) => entry.id === sold.posted.recordId);
+  assert.equal(sale.seller, 'Maria Santos');
+  assert.deepEqual(sale.goods.map((good) => [good.name, Number(good.amount)]), [['PORK', 600]]);
+  assert.deepEqual(sale.items.map((item) => [item.inventoryId, Number(item.quantity)]), [[beef.id, 2]]);
+  assert.deepEqual(sale.expenses.map((line) => [line.description, Number(line.amount)]), [['Ice', 20]]);
+  assert.equal(Number(sale.netSales), 690 - 20 - 80);
+  assert.equal(Number((await inventory()).find((item) => item.id === beef.id).stock), 10);
+
+  // A store item that is not in the inventory cannot be saved.
+  const unknown = await scan(salesForm({ saleDate: '2026-01-22', good1Name: 'TALONG', good1Amount: '100', store1Code: 'INV-9999', store1Product: 'Mystery Soap', store1Quantity: '1' }));
+  assert.equal(unknown.posted, null);
+  assert.equal(check(unknown, 'storeItems').status, 'fail');
   stubAnalysis = DEFAULT_STUB_ANALYSIS;
 });
 
