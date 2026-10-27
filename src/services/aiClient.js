@@ -56,14 +56,36 @@ async function askOpenAiCompatible(systemPrompt, content, temperature) {
 // the request finishes before the 60-second serverless limit. An overloaded
 // model can also hang without answering, so each try gets at most
 // AI_ATTEMPT_MS and the older, less busy models still get their turn.
-const GEMINI_FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-flash-lite-latest'];
+const GEMINI_FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash',
+  'gemini-flash-lite-latest', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
 const AI_TIME_BUDGET_MS = 45000;
 const AI_ATTEMPT_MS = 15000;
+
+// A model that just failed is rested so the next scans do not wait on it
+// again: busy or hanging models for a few minutes, retired ones for a day.
+// The model that answered last is tried first. Rested models still come last
+// in the list, so a scan is never refused only because all of them are resting.
+const REST_MS = { busy: 5 * 60000, timeout: 5 * 60000, unavailable: 5 * 60000, network: 60000, unreadable: 60000, retired: 24 * 3600000 };
+const restingUntil = new Map();
+let lastWorkingModel = null;
+
+function modelsToTry() {
+  const now = Date.now();
+  const all = [...new Set([lastWorkingModel, process.env.GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS].filter(Boolean))];
+  const resting = (model) => (restingUntil.get(model) || 0) > now;
+  return [...all.filter((model) => !resting(model)),
+    ...all.filter(resting).sort((a, b) => restingUntil.get(a) - restingUntil.get(b))];
+}
+
+function rest(model, problem) {
+  restingUntil.set(model, Date.now() + REST_MS[problem]);
+  if (lastWorkingModel === model) lastWorkingModel = null;
+}
 
 // parts: the instruction, then the file (if any) as inlineData. unreadable is
 // the message for a 400 answer (the request itself was refused).
 async function askGemini(apiKey, systemPrompt, parts, { temperature, unreadable }) {
-  const models = [...new Set([process.env.GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS].filter(Boolean))];
+  const models = modelsToTry();
   const deadline = Date.now() + AI_TIME_BUDGET_MS;
   const body = JSON.stringify({
     generationConfig: { temperature, responseMimeType: 'application/json' },
@@ -83,17 +105,30 @@ async function askGemini(apiKey, systemPrompt, parts, { temperature, unreadable 
     } catch (error) {
       lastProblem = error?.name === 'TimeoutError' ? 'timeout' : 'network';
       console.warn(`Gemini ${model} ${lastProblem}:`, error instanceof Error ? error.message : error);
+      rest(model, lastProblem);
       continue;
     }
     if (response.ok) {
-      const payload = await response.json();
-      return parseJson(payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join(''));
+      // A model that answers with broken JSON is skipped like a busy one.
+      try {
+        const payload = await response.json();
+        const answer = parseJson(payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join(''));
+        lastWorkingModel = model;
+        restingUntil.delete(model);
+        return answer;
+      } catch (error) {
+        console.warn(`Gemini ${model} gave an unreadable answer:`, error instanceof Error ? error.message : error);
+        lastProblem = 'unavailable';
+        rest(model, 'unreadable');
+        continue;
+      }
     }
     const detail = (await response.json().catch(() => ({})))?.error?.message || '';
     console.warn(`Gemini ${model} returned ${response.status}: ${String(detail).slice(0, 200)}`);
     if (response.status === 401 || response.status === 403) throw new Error('The AI service rejected the API key. Check GEMINI_API_KEY on the server.');
     if (response.status === 400) throw new Error(unreadable);
     lastProblem = response.status === 404 ? 'retired' : response.status === 429 ? 'busy' : 'unavailable';
+    rest(model, lastProblem);
   }
   throw new Error(lastProblem === 'busy' || lastProblem === 'unavailable' || lastProblem === 'timeout'
     ? 'The AI service (Google Gemini) is busy right now. The document was saved; press Retry in a minute.'

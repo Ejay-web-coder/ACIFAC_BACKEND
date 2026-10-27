@@ -2000,6 +2000,11 @@ test('ocr: retired or busy Gemini models fall back, and failed readings can be r
     assert.equal(viaFallback.status, 201, JSON.stringify(viaFallback.data));
     assert.equal(viaFallback.data.data.processingStatus, 'completed');
     assert.deepEqual(geminiCalls, ['gemini-2.5-flash', 'gemini-3.8-flash', 'gemini-flash-latest']);
+
+    // The next scan goes straight to the model that answered; the failed ones are resting.
+    const nextScan = await admin.request('POST', '/api/ocr/analyze', { form: scanFile([203], 'next.png') });
+    assert.equal(nextScan.status, 201, JSON.stringify(nextScan.data));
+    assert.deepEqual(geminiCalls.slice(3), ['gemini-flash-latest']);
   } finally {
     Object.assign(process.env, { GEMINI_API_KEY: '', GEMINI_MODEL: '', GEMINI_API_BASE: '' });
   }
