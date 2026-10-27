@@ -1,5 +1,6 @@
 import express from 'express';
 import { createMemberAccount, getAccount, listAccounts, listAuditLogs, listMembersWithoutAccounts, resetMemberPassword, sendEmailTest, updateAccountStatus } from '../controllers/adminController.js';
+import { checkAdminContact, confirmAdminContactCode, createAdminAccount, sendAdminContactCode } from '../controllers/adminAccountController.js';
 import { requireAdmin, requireAuth } from '../middleware/auth.js';
 import { downloadLoanId, downloadLoanRequestId, downloadLoanRequestSignature, downloadLoanSignature, getLoan, listLoanRequests, listLoans, listPayments, recordPayment, restructureLoanRequest, reviewLoanRequest } from '../controllers/loanController.js';
 import { createLoanWithIds } from '../controllers/loanIdController.js';
@@ -13,6 +14,11 @@ router.use(requireAuth, requireAdmin);
 router.get('/dashboard', getDashboard);
 router.get('/members/available', listMembersWithoutAccounts);
 router.get('/accounts', listAccounts);
+// Administrator accounts: conflict checks as the form is filled in, the email and mobile codes, and the account.
+router.get('/accounts/admin-check', checkAdminContact);
+router.post('/accounts/admin-verifications', sendAdminContactCode);
+router.post('/accounts/admin-verifications/:id/confirm', confirmAdminContactCode);
+router.post('/accounts/admins', createAdminAccount);
 router.get('/accounts/:id', getAccount);
 router.post('/accounts', createMemberAccount);
 router.patch('/accounts/:id/status', updateAccountStatus);

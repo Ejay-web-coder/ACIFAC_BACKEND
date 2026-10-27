@@ -1,15 +1,21 @@
-import { nextMemberNumber, parseShareCapital, validateMemberInput } from '../../src/controllers/memberController.js';
+import { nextMemberNumber, parseShareCapital, readAdditionalInfo, validateMemberInput } from '../../src/controllers/memberController.js';
 import { centsToString } from '../../src/utils/money.js';
-import { createMemberLogins, loginName } from './accounts.js';
+import { createMemberLogins } from './accounts.js';
 import { addDays, addMonths, stampSql } from './support.js';
 
-// Sample members of the cooperative, checked by the Add Member form's validation
-// and registered as it registers them (numbers ACIFAC-YYYY-NNN, initial share
-// capital, audit entry), a few statements for all of them. `joined` is
-// how many months ago they became members; `more` lists later share capital
-// contributions as [months ago, amount] (at most PHP 20,000 in all). Every
-// member gets an active sign-in of their own: first.lastname (juan.delacruz).
-const MEMBERS = [
+// The sample members of the cooperative: SAMPLE_MEMBER_COUNT (100) members
+// with every field of the Add Member form filled in (ID, RSBSA No., family,
+// mother's maiden name, income sources, membership fee and seminar records),
+// checked by the Add Member form's validation and registered as it registers
+// them (numbers ACIFAC-YYYY-NNN, initial share capital, audit entry). The 15
+// named below come first (the other seeders give them their loans, savings,
+// services and rentals); the rest are generated. `joined` is how many months
+// ago they became members; `more` lists later share capital contributions as
+// [months ago, amount] (at most PHP 20,000 in all). Every member gets an
+// active login of their own: member001, member002, ...
+export const SAMPLE_MEMBER_COUNT = 100;
+
+const NAMED = [
   { key: 'juan', first: 'Juan', middle: 'Santos', last: 'Dela Cruz', gender: 'Male', born: '1974-03-14', civil: 'Married', spouse: 'Lorna Dela Cruz', education: 'High School', palay: '2.5', income: '180000', joined: 34, share: '5000', more: [[24, '3000'], [12, '3000'], [5, '2000']] },
   { key: 'maria', first: 'Maria', middle: 'Reyes', last: 'Santos', gender: 'Female', born: '1980-07-02', civil: 'Married', spouse: 'Ramon Santos', education: 'College', palay: '2', income: '165000', joined: 30, share: '5000', more: [[18, '5000'], [6, '10000']] },
   { key: 'pedro', first: 'Pedro', middle: 'Garcia', last: 'Reyes', gender: 'Male', born: '1968-11-20', civil: 'Married', spouse: 'Nena Reyes', education: 'Elementary', palay: '1.5', corn: '0.5', income: '140000', joined: 28, share: '3000', more: [[10, '2000']] },
@@ -27,29 +33,103 @@ const MEMBERS = [
   { key: 'manuel', first: 'Manuel', middle: 'Jimenez', last: 'Rivera', suffix: 'Jr.', gender: 'Male', born: '1995-11-11', civil: 'Single', education: 'College', palay: '0.6', income: '55000', joined: 1, share: '1000' },
 ];
 
+const MALE = ['Jose', 'Mario', 'Rogelio', 'Eduardo', 'Renato', 'Rolando', 'Arnel', 'Benjamin', 'Romeo', 'Alfredo', 'Reynaldo', 'Felipe', 'Rodel', 'Jonathan', 'Michael', 'Mark', 'Christian', 'Joel', 'Ramil', 'Noel', 'Wilfredo', 'Nestor', 'Ariel', 'Dennis'];
+const FEMALE = ['Maricel', 'Rowena', 'Erlinda', 'Josefina', 'Marites', 'Cristina', 'Nenita', 'Analyn', 'Lorna', 'Evelyn', 'Remedios', 'Imelda', 'Jocelyn', 'Marilou', 'Rosalie', 'Mary Ann', 'Divina', 'Shirley', 'Jennifer', 'Aileen', 'Leonora', 'Perla'];
+const SURNAMES = ['Abad', 'Agustin', 'Alvarez', 'Bernardo', 'Cabrera', 'Concepcion', 'David', 'De Guzman', 'De Leon', 'Del Rosario', 'Dizon', 'Enriquez', 'Esguerra', 'Francisco', 'Galang', 'Gutierrez',
+  'Hernandez', 'Ignacio', 'Lim', 'Lozada', 'Macaraeg', 'Magbanua', 'Manalo', 'Marquez', 'Medina', 'Miranda', 'Natividad', 'Ocampo', 'Padilla', 'Panganiban', 'Perez', 'Quiambao', 'Robles', 'Rosales',
+  'Samonte', 'Santiago', 'Soriano', 'Tolentino', 'Valenzuela', 'Velasco', 'Yap', 'Zamora', 'Sison', 'Tabios', 'Gatdula'];
+const CIVIL = ['Married', 'Married', 'Married', 'Single', 'Widowed', 'Married', 'Separated'];
+const EDUCATION = ['Elementary', 'High School', 'High School', 'Vocational', 'College', 'High School'];
+const SHARE = ['1000', '1500', '2000', '2500', '3000', '5000'];
+// Where the members live: the barangays of Santa Cruz, Occidental Mindoro the cooperative serves.
+const BARANGAYS = ['Amnay', 'Cabagan', 'Barahan', 'Lumangbayan', 'Pinagturilan'];
+const ID_TYPES = ['PhilSys National ID', 'PhilSys National ID', "Driver's License", "Voter's ID", 'UMID', 'Postal ID', 'Senior Citizen ID'];
+const INCOME_EXTRA = [['Hog raising', '25000'], ['Sari-sari store', '36000'], ['Tricycle driving', '48000'], ['Vegetable garden', '18000'], ['Poultry', '15000'], ['Carpentry', '30000']];
+const OFFICERS = ['Lorna Cruz', 'Ramon Bautista', 'Elvira Santos'];
+
+const pick = (list, n) => list[n % list.length];
+const digits = (seed, length) => String((seed * 7919 + 104729) % 10 ** length).padStart(length, '0');
+
+// The 85 generated members, oldest members first, with a varied but repeatable mix.
+function generated(count, today) {
+  return Array.from({ length: count }, (_, index) => {
+    const seq = index + NAMED.length + 1;
+    const female = seq % 2 === 0;
+    const first = pick(female ? FEMALE : MALE, seq * 7 + Math.floor(seq / 3));
+    const last = pick(SURNAMES, seq * 5 + 1);
+    const corn = seq % 6 === 0;
+    const area = (0.5 + (seq % 7) * 0.35).toFixed(2);
+    const civil = pick(CIVIL, seq);
+    return {
+      key: `m${String(seq).padStart(3, '0')}`, first, middle: pick(SURNAMES, seq * 11 + 4) === last ? pick(SURNAMES, seq + 2) : pick(SURNAMES, seq * 11 + 4), last,
+      suffix: !female && seq % 17 === 0 ? 'Jr.' : null, gender: female ? 'Female' : 'Male',
+      born: addDays('1958-01-01', (seq * 211) % 15000), civil,
+      spouse: civil === 'Married' ? `${pick(female ? MALE : FEMALE, seq * 3)} ${last}` : null,
+      education: pick(EDUCATION, seq * 3), livelihood: corn ? 'Corn farming' : seq % 9 === 0 ? 'Rice and vegetable farming' : 'Rice farming',
+      palay: corn ? null : area, corn: corn ? area : null, income: String(48000 + (seq % 16) * 9000),
+      // Spread over the last three years, oldest first; a few joined this month.
+      joinedOn: addDays(today, -Math.max(2, Math.round(((count - index) / count) * 3 * 365) - 5)),
+      share: pick(SHARE, seq), more: seq % 3 === 0 ? [[Math.max(1, (seq % 10) + 1), pick(['500', '1000', '1500', '2000'], seq)]] : [],
+    };
+  });
+}
+
+// Every field of the Add Member form, from a person above.
+function memberBody(person, index, today) {
+  const seq = index + 1;
+  const barangay = pick(BARANGAYS, seq * 3 + 1);
+  const farmArea = String(Number(person.palay || 0) + Number(person.corn || 0));
+  const membershipDate = person.joinedOn ?? addDays(addMonths(today, -person.joined), -(index % 5));
+  const children = person.civil === 'Single' ? [] : Array.from({ length: seq % 4 }, (_, n) => ({
+    name: `${pick(n % 2 ? MALE : FEMALE, seq + n * 5)} ${person.last}`, age: String(3 + ((seq + n * 4) % 20)),
+  }));
+  const extra = seq % 3 === 0 ? pick(INCOME_EXTRA, seq) : null;
+  const farmIncome = String(Number(person.income) - (extra ? Number(extra[1]) : 0));
+  const idType = pick(ID_TYPES, seq * 5);
+  const idNumber = idType === 'PhilSys National ID' ? `${digits(seq, 4)}-${digits(seq + 1, 4)}-${digits(seq + 2, 4)}-${digits(seq + 3, 4)}`
+    : idType === "Driver's License" ? `D${digits(seq, 2)}-${digits(seq + 5, 2)}-${digits(seq + 9, 6)}`
+      : idType === 'UMID' ? `CRN-${digits(seq, 4)}-${digits(seq + 3, 7)}-${seq % 10}` : `${idType.slice(0, 3).toUpperCase()}-${digits(seq, 8)}`;
+  const year = membershipDate.slice(0, 4);
+  const officer = pick(OFFICERS, seq);
+  return {
+    first_name: person.first, middle_name: person.middle, last_name: person.last, suffix: person.suffix ?? null,
+    // Made-up addresses and numbers: sample logins also have emails and texts switched off.
+    email: `member${String(seq).padStart(3, '0')}@example.com`,
+    phone: `0900 ${String(Math.floor(seq / 10000)).padStart(3, '0')} ${String(seq).padStart(4, '0')}`,
+    address: `Purok ${(seq % 7) + 1}, ${barangay}, Santa Cruz, Occidental Mindoro`,
+    barangay, municipality: 'Santa Cruz', province: 'Occidental Mindoro',
+    date_of_birth: person.born, gender: person.gender, civil_status: person.civil, education: person.education,
+    id_type: idType, id_number: idNumber, rsbsa_no: `17-51-08-0${String(10 + BARANGAYS.indexOf(barangay)).padStart(2, '0')}-${String(1000 + seq * 13).padStart(6, '0')}`,
+    livelihood: person.livelihood || 'Rice farming', farm_area_ha: farmArea, palay_area_ha: person.palay ?? null, corn_area_ha: person.corn ?? null,
+    yearly_income: person.income,
+    spouse_name: person.spouse ?? null, spouse_age: person.spouse ? String(Math.max(20, Number(today.slice(0, 4)) - Number(person.born.slice(0, 4)) + ((seq % 7) - 3))) : null,
+    spouse_contact: person.spouse ? `0900 001 ${String(seq).padStart(4, '0')}` : null,
+    children: children.map((child) => `${child.name} (${child.age})`).join('; '),
+    emergency_contact: person.spouse ? `${person.spouse} (spouse), 0900 001 ${String(seq).padStart(4, '0')}` : `${pick(FEMALE, seq + 9)} ${person.last} (sibling), 0900 002 ${String(seq).padStart(4, '0')}`,
+    membership_date: membershipDate, status: 'active', share_capital: person.share,
+    additional_info: {
+      motherLastName: pick(SURNAMES, seq * 13 + 7), motherFirstName: pick(FEMALE, seq * 3 + 2), motherMiddleName: pick(SURNAMES, seq * 17 + 1),
+      motherMaidenName: `${pick(FEMALE, seq * 3 + 2)} ${pick(SURNAMES, seq * 17 + 1)} ${pick(SURNAMES, seq * 13 + 7)}`,
+      children, incomeSources: [{ source: person.livelihood || 'Rice farming', amount: farmIncome }, ...(extra ? [{ source: extra[0], amount: extra[1] }] : [])],
+      membershipType: seq % 8 === 0 ? 'Associate' : 'Regular', bodResolution: `BOD Res. No. ${year}-${String((seq % 40) + 1).padStart(3, '0')}`,
+      membershipFee: '500', dateReceived: membershipDate,
+      preMembershipSeminar: 'Yes', seminarOrNumber: `OR-${year}-${String(seq * 3).padStart(4, '0')}`, seminarCertifiedBy: officer,
+      paymentOfMembershipFee: 'Yes', orNumber: `OR-${year}-${String(seq * 3 + 1).padStart(4, '0')}`, feeCertifiedBy: officer,
+      initialPaidUpCapital: person.share, capitalOrNumber: `OR-${year}-${String(seq * 3 + 2).padStart(4, '0')}`, capitalCertifiedBy: officer,
+    },
+  };
+}
+
 export default async function seedMembers(ctx) {
   const { client, today, admin } = ctx;
-  const people = MEMBERS.map((person, index) => {
-    const purok = (index % 7) + 1;
-    const farmArea = String(Number(person.palay || 0) + Number(person.corn || 0));
-    const body = {
-      first_name: person.first, middle_name: person.middle, last_name: person.last, suffix: person.suffix ?? null,
-      email: `${person.first}.${person.last}`.toLowerCase().replace(/\s+/g, '') + '@example.com',
-      // Made-up numbers; sample logins also have texts switched off.
-      phone: `0900 000 ${String(index + 1).padStart(4, '0')}`,
-      address: `Purok ${purok}, Barahan, Santa Cruz, Occidental Mindoro`,
-      barangay: 'Barahan', municipality: 'Santa Cruz', province: 'Occidental Mindoro',
-      date_of_birth: person.born, gender: person.gender, civil_status: person.civil, education: person.education,
-      livelihood: person.livelihood || 'Rice farming', farm_area_ha: farmArea, palay_area_ha: person.palay ?? null, corn_area_ha: person.corn ?? null,
-      yearly_income: person.income, spouse_name: person.spouse ?? null,
-      membership_date: addDays(addMonths(today, -person.joined), -(index % 5)),
-      status: 'active', share_capital: person.share,
-    };
+  const persons = [...NAMED, ...generated(SAMPLE_MEMBER_COUNT - NAMED.length, today)];
+  const people = persons.map((person, index) => {
+    const body = memberBody(person, index, today);
     // The Add Member form's own checks.
     const { errors, values } = validateMemberInput(body);
     const shareCapitalCents = parseShareCapital(body, errors);
     if (errors.length) throw new Error(`Sample member ${person.first} ${person.last}: ${errors.join(' ')}`);
-    return { person, body, values, share: centsToString(shareCapitalCents), farmArea };
+    return { person, body, values, info: readAdditionalInfo(body.additional_info), share: centsToString(shareCapitalCents), farmArea: body.farm_area_ha };
   });
 
   // Registration refuses a member already registered (same email, or same name and birthday).
@@ -61,38 +141,46 @@ export default async function seedMembers(ctx) {
   )).rows[0];
   if (duplicate) throw new Error(`A sample member is already registered here (${duplicate.member_number}).`);
 
-  // The next ACIFAC-YYYY-NNN numbers, under the same lock as the Add Member form. All
-  // members are written a few statements at a time: the seeder may run across the internet.
+  // Member numbers in the order they joined, as if each had been registered on the day.
+  const order = people.map((p, index) => index).sort((a, b) => people[a].values.membershipDate.localeCompare(people[b].values.membershipDate) || a - b);
   await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['acifac-member-number']);
   const [prefix, firstNumber] = (await nextMemberNumber(client)).match(/^(ACIFAC-\d{4}-)(\d+)$/).slice(1);
-  people.forEach((p, index) => { p.memberNumber = `${prefix}${String(Number(firstNumber) + index).padStart(3, '0')}`; });
+  order.forEach((index, position) => { people[index].memberNumber = `${prefix}${String(Number(firstNumber) + position).padStart(3, '0')}`; });
+
   const column = (pick) => people.map(pick);
   const ids = (await client.query(
     `INSERT INTO members (member_number, first_name, middle_name, last_name, suffix, email, phone, address, barangay, municipality, province,
-                          date_of_birth, gender, civil_status, education, livelihood, farm_area_ha, corn_area_ha, palay_area_ha, yearly_income,
-                          spouse_name, membership_date, share_capital, status, created_at, updated_at)
+                          date_of_birth, gender, civil_status, education, id_type, id_number, rsbsa_no, livelihood, farm_area_ha, corn_area_ha, palay_area_ha,
+                          yearly_income, spouse_name, spouse_age, spouse_contact, children, emergency_contact, membership_date, share_capital, status,
+                          additional_info, created_at, updated_at)
      SELECT r.member_number, r.first_name, r.middle_name, r.last_name, r.suffix, r.email, r.phone, r.address, r.barangay, r.municipality, r.province,
-            r.born, r.gender, r.civil_status, r.education, r.livelihood, r.farm_area, r.corn_area, r.palay_area, r.income,
-            r.spouse, r.joined, r.share, 'active', ${stampSql('r.joined')}, ${stampSql('r.joined')}
+            r.born, r.gender, r.civil_status, r.education, r.id_type, r.id_number, r.rsbsa_no, r.livelihood, r.farm_area, r.corn_area, r.palay_area,
+            r.income, r.spouse, r.spouse_age, r.spouse_contact, r.children, r.emergency, r.joined, r.share, 'active',
+            r.info, ${stampSql('r.joined')}, ${stampSql('r.joined')}
      FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[],
-                 $12::date[], $13::text[], $14::text[], $15::text[], $16::text[], $17::numeric[], $18::numeric[], $19::numeric[], $20::numeric[],
-                 $21::text[], $22::date[], $23::numeric[]) WITH ORDINALITY
+                 $12::date[], $13::text[], $14::text[], $15::text[], $16::text[], $17::text[], $18::text[], $19::text[], $20::numeric[], $21::numeric[], $22::numeric[],
+                 $23::numeric[], $24::text[], $25::int[], $26::text[], $27::text[], $28::text[], $29::date[], $30::numeric[], $31::jsonb[]) WITH ORDINALITY
           AS r(member_number, first_name, middle_name, last_name, suffix, email, phone, address, barangay, municipality, province,
-               born, gender, civil_status, education, livelihood, farm_area, corn_area, palay_area, income, spouse, joined, share, ord)
+               born, gender, civil_status, education, id_type, id_number, rsbsa_no, livelihood, farm_area, corn_area, palay_area,
+               income, spouse, spouse_age, spouse_contact, children, emergency, joined, share, info, ord)
      ORDER BY r.ord
      RETURNING id`,
     [column((p) => p.memberNumber), column((p) => p.values.firstName), column((p) => p.body.middle_name), column((p) => p.values.lastName), column((p) => p.body.suffix),
       column((p) => p.values.email), column((p) => p.values.phone), column((p) => p.values.address), column((p) => p.body.barangay), column((p) => p.body.municipality),
       column((p) => p.body.province), column((p) => p.body.date_of_birth), column((p) => p.body.gender), column((p) => p.body.civil_status), column((p) => p.body.education),
-      column((p) => p.body.livelihood), column((p) => p.body.farm_area_ha), column((p) => p.body.corn_area_ha), column((p) => p.body.palay_area_ha),
-      column((p) => p.body.yearly_income), column((p) => p.body.spouse_name), column((p) => p.values.membershipDate), column((p) => p.share)]
+      column((p) => p.body.id_type), column((p) => p.body.id_number), column((p) => p.body.rsbsa_no), column((p) => p.body.livelihood),
+      column((p) => p.body.farm_area_ha), column((p) => p.body.corn_area_ha), column((p) => p.body.palay_area_ha), column((p) => p.body.yearly_income),
+      column((p) => p.body.spouse_name), column((p) => (p.body.spouse_age === null ? null : Number(p.body.spouse_age))), column((p) => p.body.spouse_contact),
+      column((p) => p.body.children || null), column((p) => p.body.emergency_contact), column((p) => p.values.membershipDate), column((p) => p.share),
+      column((p) => JSON.stringify(p.info))]
   )).rows.map((row) => row.id);
   people.forEach((p, index) => { p.id = ids[index]; });
 
   // Share capital: the initial amount recorded with the registration, then later contributions.
   const contributions = people.flatMap((p) => [
     ...(Number(p.share) > 0 ? [{ id: p.id, amount: p.share, date: p.values.membershipDate, method: 'Initial', reference: `INITIAL-${p.memberNumber}`, notes: 'Initial share capital recorded with member registration.' }] : []),
-    ...(p.person.more || []).map(([monthsAgo, amount]) => ({ id: p.id, amount, date: addMonths(today, -monthsAgo), method: 'Cash', reference: null, notes: 'Additional share capital' })),
+    ...(p.person.more || []).map(([monthsAgo, amount]) => ({ id: p.id, amount, date: addMonths(today, -monthsAgo), method: 'Cash', reference: null, notes: 'Additional share capital' }))
+      .filter((contribution) => contribution.date > p.values.membershipDate),
   ]);
   await client.query(
     `INSERT INTO share_contributions (member_id, amount, contribution_date, payment_method, reference_number, notes, recorded_by, created_at, updated_at)
@@ -116,10 +204,12 @@ export default async function seedMembers(ctx) {
     ctx.members.push({
       id: p.id, key: p.person.key, memberNumber: p.memberNumber, email: p.values.email, phone: p.values.phone, address: p.values.address,
       fullName: [p.person.first, p.person.middle, p.person.last, p.person.suffix].filter(Boolean).join(' '),
-      farmArea: p.farmArea, membershipDate: p.values.membershipDate,
+      farmArea: p.farmArea, membershipDate: p.values.membershipDate, barangay: p.body.barangay, gender: p.body.gender,
+      civilStatus: p.body.civil_status, born: p.body.date_of_birth, livelihood: p.body.livelihood, crop: p.person.corn && !p.person.palay ? 'Corn' : 'Rice',
     });
   }
   ctx.count('members', people.length);
-  await createMemberLogins(ctx, ctx.members.map((member, index) => ({ member, username: loginName(people[index].person.first, people[index].person.last) })));
-  ctx.logins.push(['Members', 'juan.delacruz, maria.santos, ... (first.lastname of each)', ctx.passwords.member]);
+  const logins = ctx.members.map((member, index) => ({ member, username: `member${String(index + 1).padStart(3, '0')}` }));
+  await createMemberLogins(ctx, logins);
+  ctx.logins.push(['Members', `${logins[0].username} ... ${logins.at(-1).username}`, ctx.passwords.member]);
 }

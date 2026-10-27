@@ -6,6 +6,7 @@ import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import { notifyAdmins } from '../services/notificationService.js';
 import { goodsForForm, parseExpenseLines, parseGoodsLines, presentSaleLines, salesReport } from '../services/kadiwaGoods.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
+import { PESOS_PER_BUSINESS_POINT } from '../services/patronage.js';
 
 const CATEGORIES = ['Groceries', 'Vegetables', 'Meat', 'Other'];
 const CATEGORY_COLUMN = { Groceries: 'groceries', Vegetables: 'vegetables', Meat: 'meat', Other: null };
@@ -38,7 +39,11 @@ const salesSelect = `
                    'unit', i.unit, 'unitPrice', i.unit_price, 'lineTotal', i.line_total, 'unitCost', i.unit_cost, 'lineCost', i.line_cost) ORDER BY i.id)
                    FROM kadiwa_sale_items i WHERE i.sale_id = s.id), '[]'::json) AS items,
          COALESCE((SELECT json_agg(json_build_object('description', e.description, 'amount', e.amount) ORDER BY e.line_no)
-                   FROM kadiwa_sale_expenses e WHERE e.sale_id = s.id), '[]'::json) AS expenses
+                   FROM kadiwa_sale_expenses e WHERE e.sale_id = s.id), '[]'::json) AS expenses,
+         -- The members who bought that day, and their patronage points (1 per PHP 100).
+         COALESCE((SELECT json_agg(json_build_object('memberId', p.member_id, 'memberNumber', p.member_number, 'name', p.member_name, 'amount', p.amount,
+                   'points', ROUND(p.amount / ${PESOS_PER_BUSINESS_POINT}, 2)) ORDER BY p.line_no)
+                   FROM kadiwa_sale_members p WHERE p.sale_id = s.id), '[]'::json) AS "memberPurchases"
   FROM kadiwa_sales s`;
 const salesOrder = 's.sale_date DESC, s.created_at DESC, s.id DESC';
 const TODAY = `sale_date = ${SQL_TODAY} AND status = 'completed'`;
@@ -85,7 +90,9 @@ export async function listKadiwaSales(req, res) {
 // the daily form, locks and decrements the inventory for store items sold,
 // and keeps the groceries, vegetables and meat totals that net income and the
 // reports read. Shared by the sale form and by OCR-posted Kadiwa sales forms.
-export async function insertKadiwaSale(client, req, { encoderName, saleDate = null, manual, expensesCents, items, goods = [], expenseLines = [] }) {
+// memberPurchases: [{ memberId, amountCents }], the members who bought that day
+// and for how much (their patronage business); together never more than the day's sales.
+export async function insertKadiwaSale(client, req, { encoderName, saleDate = null, manual, expensesCents, items, goods = [], expenseLines = [], memberPurchases = [] }) {
   const totals = { ...manual };
   for (const good of goods) totals[good.category] = (totals[good.category] || 0) + toCents(good.amount);
   const lines = [];
@@ -122,6 +129,25 @@ export async function insertKadiwaSale(client, req, { encoderName, saleDate = nu
   // Net income of the sale: what was sold, less the expenses and the cost of the store items sold.
   const net = groceries + (totals.Vegetables || 0) + (totals.Meat || 0) - expensesCents - costCents;
 
+  // The members who bought: active members, each once, buying no more than the day's sales together.
+  const buyers = memberPurchases.length
+    ? (await client.query(
+      `SELECT id, member_number, TRIM(CONCAT_WS(' ', first_name, middle_name, last_name, suffix)) AS name, status
+       FROM members WHERE id = ANY($1::int[])`, [memberPurchases.map((purchase) => purchase.memberId)]
+    )).rows
+    : [];
+  const buyerById = new Map(buyers.map((member) => [Number(member.id), member]));
+  for (const purchase of memberPurchases) {
+    const member = buyerById.get(purchase.memberId);
+    if (!member) throw badRequest('A member in the member purchases no longer exists.');
+    if (member.status !== 'active') throw badRequest(`${member.name} (${member.member_number}) is not an active member, so the purchase earns no patronage points.`);
+  }
+  const purchasedCents = memberPurchases.reduce((sum, purchase) => sum + purchase.amountCents, 0);
+  const grossCents = groceries + (totals.Vegetables || 0) + (totals.Meat || 0);
+  if (purchasedCents > grossCents) {
+    throw badRequest(`The member purchases (PHP ${centsToString(purchasedCents)}) are more than the day's total sales (PHP ${centsToString(grossCents)}).`);
+  }
+
   const id = (await client.query(
     `WITH day AS (SELECT COALESCE($8::date, ${SQL_TODAY}) AS sale_date)
      INSERT INTO kadiwa_sales (id, sale_date, encoder_name, groceries, vegetables, meat, total_expenses, cost_of_goods, net_sales, created_by)
@@ -157,6 +183,15 @@ export async function insertKadiwaSale(client, req, { encoderName, saleDate = nu
       [id, line.product.id, line.product.label.slice(0, 200), line.product.category, line.product.unit, line.quantity, line.product.price, line.lineTotal, line.product.cost_price, line.lineCost]
     );
   }
+  if (memberPurchases.length) {
+    await client.query(
+      `INSERT INTO kadiwa_sale_members (sale_id, line_no, member_id, member_number, member_name, amount)
+       SELECT $1, r.line_no, r.member_id, r.member_number, r.member_name, r.amount
+       FROM unnest($2::int[], $3::text[], $4::text[], $5::numeric[]) WITH ORDINALITY AS r(member_id, member_number, member_name, amount, line_no)`,
+      [id, memberPurchases.map((purchase) => purchase.memberId), memberPurchases.map((purchase) => buyerById.get(purchase.memberId).member_number),
+        memberPurchases.map((purchase) => buyerById.get(purchase.memberId).name.slice(0, 200)), memberPurchases.map((purchase) => centsToString(purchase.amountCents))]
+    );
+  }
   const lowStock = [];
   for (const [productId, quantityCents] of requested) {
     const updated = await client.query(
@@ -180,6 +215,7 @@ export async function insertKadiwaSale(client, req, { encoderName, saleDate = nu
       goods: goods.map((good) => ({ name: good.name, amount: good.amount })),
       expenses: expenseLines.map((line) => ({ description: line.description, amount: line.amount })),
       items: lines.map((line) => ({ id: line.product.id, name: line.product.label, quantity: line.quantity, unit_price: line.product.price, unit_cost: line.product.cost_price, line_total: line.lineTotal, line_cost: line.lineCost })),
+      member_purchases: memberPurchases.map((purchase) => ({ member_number: buyerById.get(purchase.memberId).member_number, name: buyerById.get(purchase.memberId).name, amount: centsToString(purchase.amountCents) })),
     },
     ...getRequestMeta(req),
   });
@@ -187,6 +223,44 @@ export async function insertKadiwaSale(client, req, { encoderName, saleDate = nu
     await notifyAdmins(client, { type: 'low_stock', title: 'Kadiwa stock is low', message: `${lowStock.join(', ')} ${lowStock.length === 1 ? 'is' : 'are'} at or below the reorder level.`, severity: 'warning', link: '/kadiwa', entityType: 'kadiwa_sale', entityId: id, dedupeKey: `low-stock-${id}` });
   }
   return id;
+}
+
+const MAX_MEMBER_PURCHASES = 200;
+
+// The members who bought that day: [{ memberId, amount }], each member once.
+function parseMemberPurchases(lines) {
+  if (lines === undefined || lines === null) return [];
+  if (!Array.isArray(lines)) throw badRequest('Member purchases must be a list.');
+  if (lines.length > MAX_MEMBER_PURCHASES) throw badRequest(`Enter at most ${MAX_MEMBER_PURCHASES} member purchases on one sale.`);
+  const seen = new Set();
+  return lines.map((line, index) => {
+    const memberId = Number(line?.memberId);
+    if (!Number.isInteger(memberId) || memberId <= 0) throw badRequest(`Member purchase ${index + 1}: choose the member.`);
+    if (seen.has(memberId)) throw badRequest(`Member purchase ${index + 1}: this member is already listed. Put their purchases on one line.`);
+    seen.add(memberId);
+    const amountCents = parseMoneyInput(String(line?.amount ?? '').trim());
+    if (amountCents === null) throw badRequest(`Member purchase ${index + 1}: enter the amount bought, more than zero with at most two decimals.`);
+    return { memberId, amountCents };
+  });
+}
+
+// GET /api/kadiwa/members?search=  Active members for the New Sale's member
+// purchases, found by member ID (number) or name.
+export async function searchKadiwaMembers(req, res) {
+  const search = cleanString(req.query.search, 100);
+  if (search.length < 2) return res.json({ success: true, members: [] });
+  const result = await query(
+    `SELECT id, member_number AS "memberNumber", TRIM(CONCAT_WS(' ', first_name, middle_name, last_name, suffix)) AS name, barangay
+     FROM members
+     WHERE status = 'active' AND (member_number ILIKE '%' || $1 || '%'
+        OR TRIM(CONCAT_WS(' ', first_name, middle_name, last_name, suffix)) ILIKE '%' || $1 || '%'
+        OR TRIM(CONCAT_WS(' ', first_name, last_name)) ILIKE '%' || $1 || '%'
+        OR TRIM(CONCAT_WS(', ', last_name, first_name)) ILIKE '%' || $1 || '%')
+     ORDER BY (member_number ILIKE $1) DESC, last_name, first_name
+     LIMIT 12`,
+    [search]
+  );
+  return res.json({ success: true, members: result.rows });
 }
 
 // The date written on a sales form: today when blank, never in the future.
@@ -228,8 +302,9 @@ export async function createKadiwaSale(req, res) {
     return { inventoryId: cleanString(String(item.inventoryId), 30), quantity };
   });
   if (!goods.length && !items.length && Object.values(manual).every((cents) => cents === 0)) throw badRequest('Enter the amount of at least one good sold.');
+  const memberPurchases = parseMemberPurchases(body.memberPurchases);
 
-  const saleId = await withTransaction((client) => insertKadiwaSale(client, req, { encoderName: sellerName, saleDate, manual, expensesCents, items, goods, expenseLines: expenseLines || [] }));
+  const saleId = await withTransaction((client) => insertKadiwaSale(client, req, { encoderName: sellerName, saleDate, manual, expensesCents, items, goods, expenseLines: expenseLines || [], memberPurchases }));
   const sale = await query(`${salesSelect} WHERE s.id = $1`, [saleId]);
   return res.status(201).json({ success: true, sale: withLines(sale.rows[0]) });
 }

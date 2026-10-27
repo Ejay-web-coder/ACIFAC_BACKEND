@@ -1494,6 +1494,40 @@ test('kadiwa analytics: best sellers and items running out', { skip }, async () 
   assert.equal((await admin.post('/api/admin/analytics/kadiwa-products/advice', { from: daysAgo(9), to: today })).status, 404, 'no suggestions endpoint');
 });
 
+test('kadiwa: member purchases on a sale earn patronage points', { skip }, async () => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const member = (await pool.query(`SELECT id, member_number, first_name, last_name FROM members WHERE id = $1`, [state.memberId])).rows[0];
+  const second = (await pool.query(`SELECT id FROM members WHERE id = $1`, [state.secondMemberId])).rows[0];
+
+  // Members are found by member ID or name.
+  const byNumber = await admin.get(`/api/kadiwa/members?search=${encodeURIComponent(member.member_number)}`);
+  assert.equal(byNumber.status, 200);
+  assert.equal(byNumber.data.members[0].id, member.id);
+  const byName = await admin.get(`/api/kadiwa/members?search=${encodeURIComponent(member.last_name)}`);
+  assert.ok(byName.data.members.some((row) => row.id === member.id));
+  assert.deepEqual((await admin.get('/api/kadiwa/members?search=a')).data.members, []);
+
+  const sale = {
+    saleDate: todayDateOnly(), goods: [{ name: 'TALONG', unit: 'KILO', price: '100', amount: '1000' }], items: [], expenses: [{ description: 'None', amount: '0' }],
+  };
+  const url = '/api/kadiwa/sales';
+  // Together never more than the day's sales; each member once; amounts more than zero; only active members.
+  assert.match((await admin.post(url, { ...sale, memberPurchases: [{ memberId: member.id, amount: '1200' }] })).data.message, /more than the day's total sales/);
+  assert.match((await admin.post(url, { ...sale, memberPurchases: [{ memberId: member.id, amount: '100' }, { memberId: member.id, amount: '50' }] })).data.message, /already listed/);
+  assert.equal((await admin.post(url, { ...sale, memberPurchases: [{ memberId: member.id, amount: '0' }] })).status, 400);
+  assert.equal((await admin.post(url, { ...sale, memberPurchases: [{ memberId: 999999, amount: '10' }] })).status, 400);
+
+  const saved = await admin.post(url, { ...sale, memberPurchases: [{ memberId: member.id, amount: '650' }, { memberId: second.id, amount: '125.50' }] });
+  assert.equal(saved.status, 201, JSON.stringify(saved.data));
+  assert.deepEqual(saved.data.sale.memberPurchases.map((line) => [line.memberId, Number(line.amount), Number(line.points)]), [[member.id, 650, 6.5], [second.id, 125.5, 1.26]]);
+  // On the sale's record in the audit log too.
+  const audit = (await admin.get('/api/admin/audit-logs?action=KADIWA_SALE_CREATED')).data.data[0];
+  assert.equal(audit.new_values.member_purchases[0].member_number, member.member_number);
+  // Listed with the sales.
+  const listed = (await admin.get('/api/kadiwa')).data.sales.find((row) => row.id === saved.data.sale.id);
+  assert.equal(listed.memberPurchases.length, 2);
+});
+
 test('loans: applications typed into the app need the borrower and co-maker IDs with 3 signatures', { skip }, async () => {
   const paper = { loanType: 'agricultural', loanMode: 'cash', cashAmount: '5000', term: 12, farmArea: '2', borrowerPhone: '09171234567', borrowerAddress: 'Purok 1, Amnay', cropsPlanted: 'Palay', certified: true };
   const url = '/api/members/me/loan-requests';
@@ -2558,7 +2592,14 @@ test('dashboard and analytics use real data', { skip }, async () => {
   )).rows[0];
   assert.equal(p.business.loans, Number(interest.member));
   assert.ok(p.business.loans > 0, 'the member paid loan interest this year');
-  assert.equal(cents(p.business.machinery + p.business.loans), cents(p.business.total));
+  // Kadiwa Store purchases written on the day's sales count too (see the member purchases test).
+  const purchases = (await pool.query(
+    `SELECT COALESCE(SUM(p.amount), 0) AS member FROM kadiwa_sale_members p JOIN kadiwa_sales s ON s.id = p.sale_id
+     WHERE p.member_id = $1 AND s.status = 'completed' AND s.sale_date BETWEEN $2 AND $3`, [state.memberId, d.from, d.asOf]
+  )).rows[0];
+  assert.equal(p.business.kadiwa, Number(purchases.member));
+  assert.ok(p.business.kadiwa >= 650, 'the member bought at the Kadiwa Store this year');
+  assert.equal(cents(p.business.machinery + p.business.loans + p.business.kadiwa), cents(p.business.total));
   assert.ok(Math.abs(p.businessPoints - p.business.total / 100) < 1e-9);
   assert.ok(p.totalBusiness >= Number(interest.total) && p.totalBusiness >= p.business.total);
   assert.equal(p.businessShare, p.business.total / p.totalBusiness);
@@ -2609,6 +2650,79 @@ test('settings: profile, preferences, legal documents', { skip }, async () => {
   assert.equal((await admin.get('/api/admin/audit-logs?limit=100')).data.data.find((row) => row.id === byAdmin.id).user_full_name, 'Coop Admin');
   const system = logs.find((row) => row.user_id === null);
   if (system) assert.equal(system.user_full_name, null, 'system actions have no person');
+});
+
+test('administrator accounts: name and position required, email and mobile verified and unique, audit log by position', { skip }, async () => {
+  const codeIn = (text) => /(\d{6})/.exec(text)?.[1];
+  const memberEmail = (await pool.query('SELECT email FROM members WHERE id = $1', [state.memberId])).rows[0].email;
+
+  // Conflicts show as the form is filled in: a member's email, a taken username.
+  const check = await admin.get(`/api/admin/accounts/admin-check?email=${encodeURIComponent(memberEmail)}&username=testadmin&phone=09171239876`);
+  assert.equal(check.status, 200, JSON.stringify(check.data));
+  assert.match(check.data.email.problem, /already used|record of member/);
+  assert.match(check.data.username.problem, /taken/);
+  assert.equal(check.data.phone.problem, null);
+  assert.equal(check.data.smsAvailable, true);
+  assert.ok(check.data.positions.includes('Treasurer'));
+  assert.equal((await admin.post('/api/admin/accounts/admin-verifications', { channel: 'email', value: memberEmail })).status, 409);
+
+  // The email: a code is sent, a wrong one is refused, the right one verifies it.
+  const emailCode = await admin.post('/api/admin/accounts/admin-verifications', { channel: 'email', value: 'Treasurer.Officer@acifac.ph', name: 'Liza Ramos' });
+  assert.equal(emailCode.status, 201, JSON.stringify(emailCode.data));
+  const mail = await waitForMail((sent) => sent.to === 'treasurer.officer@acifac.ph' && /verify your email/i.test(sent.subject));
+  assert.equal((await admin.post('/api/admin/accounts/admin-verifications', { channel: 'email', value: 'treasurer.officer@acifac.ph' })).status, 429, 'resend waits');
+  const wrong = await admin.post(`/api/admin/accounts/admin-verifications/${emailCode.data.verificationId}/confirm`, { code: codeIn(mail.text) === '000000' ? '111111' : '000000' });
+  assert.equal(wrong.status, 400);
+  assert.equal((await admin.post(`/api/admin/accounts/admin-verifications/${emailCode.data.verificationId}/confirm`, { code: codeIn(mail.text) })).status, 200);
+
+  const account = {
+    fullName: 'Liza Ramos', position: 'Treasurer', username: 'liza.ramos', email: 'treasurer.officer@acifac.ph', phone: '0917 123 9876',
+    password: 'Treasurer1!', confirmPassword: 'Treasurer1!', emailVerificationId: emailCode.data.verificationId,
+  };
+  // The mobile number must be verified too (text messages are set up here), and the position is required.
+  assert.equal((await admin.post('/api/admin/accounts/admins', account)).status, 400);
+  assert.equal((await admin.post('/api/admin/accounts/admins', { ...account, position: '' })).status, 400);
+  const smsCode = await admin.post('/api/admin/accounts/admin-verifications', { channel: 'sms', value: '+63 917 123 9876' });
+  assert.equal(smsCode.status, 201, JSON.stringify(smsCode.data));
+  const text = sentTexts.findLast((sent) => sent.recipients?.includes('+639171239876'));
+  assert.ok(text, JSON.stringify(sentTexts.at(-1)));
+  assert.equal((await admin.post(`/api/admin/accounts/admin-verifications/${smsCode.data.verificationId}/confirm`, { code: codeIn(text.message) })).status, 200);
+
+  const created = await admin.post('/api/admin/accounts/admins', { ...account, phoneVerificationId: smsCode.data.verificationId });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  assert.equal(created.data.user.role, 'ADMIN');
+  await waitForMail((sent) => sent.to === 'treasurer.officer@acifac.ph' && /administrator account is ready/i.test(sent.subject) && !sent.text.includes('Treasurer1!'));
+  // A verification is used once; the same email or number cannot make a second administrator.
+  assert.equal((await admin.post('/api/admin/accounts/admins', { ...account, username: 'liza2', phoneVerificationId: smsCode.data.verificationId })).status, 409);
+  assert.match((await admin.get('/api/admin/accounts/admin-check?phone=09171239876')).data.phone.problem, /Liza Ramos/);
+
+  // Listed with the name, position and who made the account.
+  const listed = (await admin.get('/api/admin/accounts')).data.accounts.find((row) => row.username === 'liza.ramos');
+  assert.equal(listed.position, 'Treasurer');
+  assert.equal(listed.full_name, 'Liza Ramos');
+  assert.equal(listed.created_by_name, 'Coop Admin');
+  assert.equal(listed.must_change_password, true);
+
+  // The new administrator signs in with the username, the email or the mobile number.
+  for (const identifier of ['liza.ramos', 'treasurer.officer@acifac.ph', '09171239876']) {
+    const officer = new Client();
+    const login = await officer.post('/api/auth/login', { usernameOrEmail: identifier, password: 'Treasurer1!' });
+    assert.equal(login.status, 200, `${identifier}: ${JSON.stringify(login.data)}`);
+    assert.equal(login.data.user.role, 'ADMIN');
+  }
+
+  // The audit log names each administrator with the position they held.
+  const logs = (await admin.get('/api/admin/audit-logs?action=ADMIN_ACCOUNT_CREATED')).data.data;
+  assert.equal(logs[0].user_position, 'Manager');
+  assert.equal(logs[0].user_full_name, 'Coop Admin');
+  assert.equal((await admin.get('/api/admin/audit-logs?search=Manager')).data.data.length > 0, true);
+  // An administrator's own profile keeps a position, and their email stays their own.
+  assert.equal((await admin.patch('/api/auth/profile', { position: '' })).status, 400);
+  assert.equal((await admin.patch('/api/auth/profile', { email: 'treasurer.officer@acifac.ph' })).status, 409);
+
+  // Another administrator can be switched off, and then cannot sign in.
+  assert.equal((await admin.patch(`/api/admin/accounts/${created.data.user.id}/status`, { status: 'INACTIVE' })).status, 200);
+  assert.notEqual((await new Client().post('/api/auth/login', { usernameOrEmail: 'liza.ramos', password: 'Treasurer1!' })).status, 200);
 });
 
 test('member activity log: own actions, office actions, filters, privacy', { skip }, async () => {
@@ -2716,9 +2830,9 @@ test('sessions: forgot password, change password, deactivation, logout', { skip 
   assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'juan@example.com', password: 'ChangedPass1!' })).status, 403);
   await admin.patch(`/api/admin/accounts/${state.memberUserId}/status`, { status: 'ACTIVE' });
   assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'juan@example.com', password: 'ChangedPass1!' })).status, 200);
-  const statusAudit = await admin.get('/api/admin/audit-logs?action=ACCOUNT_STATUS_UPDATED');
-  assert.equal(statusAudit.data.data.at(-1).old_values.account_status, 'ACTIVE');
-  assert.equal(statusAudit.data.data.at(-1).new_values.account_status, 'LOCKED');
+  const statusAudit = (await admin.get('/api/admin/audit-logs?action=ACCOUNT_STATUS_UPDATED')).data.data.filter((row) => row.entity_id === String(state.memberUserId));
+  assert.equal(statusAudit.at(-1).old_values.account_status, 'ACTIVE');
+  assert.equal(statusAudit.at(-1).new_values.account_status, 'LOCKED');
 
   assert.equal((await member.post('/api/auth/logout')).status, 200);
   assert.equal((await member.get('/api/auth/me')).status, 401);

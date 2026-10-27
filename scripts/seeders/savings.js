@@ -2,9 +2,9 @@ import { TIME_ZONE } from '../../src/config/env.js';
 import { centsToString, toCents } from '../../src/utils/money.js';
 import { addDays, addMonths } from './support.js';
 
-// Monthly savings deposits for the last six months (or since the member
-// joined), and a few withdrawals that leave more than the PHP 500 maintaining
-// balance. Each deposit is written as the Savings page writes one (the record,
+// Monthly savings deposits for the last twelve months (or since the member
+// joined; one member in nine does not save), and withdrawals that leave more
+// than the PHP 500 maintaining balance. Each deposit is written as the Savings page writes one (the record,
 // an audit entry, the member's notification), but all of them at once: the
 // seeder may run against a database across the internet.
 const MONTHLY_DEPOSIT = ['1000', '1500', '500', '300', '800', '500', '700', '1200', '400', '300', '600', '500', '300', '500', '300'];
@@ -18,13 +18,19 @@ export default async function seedSavings(ctx) {
   // Every deposit and withdrawal, in date order per member, with the balance after it.
   const entries = [];
   for (const [index, member] of ctx.members.entries()) {
-    for (let monthsAgo = 6; monthsAgo >= 0; monthsAgo -= 1) {
+    if (index % 9 === 8) continue;
+    for (let monthsAgo = 12; monthsAgo >= 0; monthsAgo -= 1) {
+      // Some members skip a month now and then.
+      if ((index + monthsAgo) % 7 === 3 && monthsAgo > 0) continue;
       const date = addDays(addMonths(today, -monthsAgo), -((index * 3) % 9));
       if (date < member.membershipDate || date > today) continue;
       entries.push({ member, kind: 'deposit', date, cents: toCents(MONTHLY_DEPOSIT[index % MONTHLY_DEPOSIT.length]), method: index % 4 === 3 ? 'GCash' : 'Cash', notes: 'Monthly savings', time: '10:00' });
     }
   }
-  for (const withdrawal of WITHDRAWALS) {
+  // Every seventh generated member also took some savings out, 2 to 6 months ago.
+  const generatedWithdrawals = ctx.members.filter((member, index) => index >= 15 && index % 7 === 0)
+    .map((member, n) => ({ key: member.key, monthsAgo: 2 + (n % 5), amount: ['500', '1000', '800'][n % 3] }));
+  for (const withdrawal of [...WITHDRAWALS, ...generatedWithdrawals]) {
     const member = ctx.member(withdrawal.key);
     const date = addMonths(today, -withdrawal.monthsAgo);
     const balance = entries.filter((entry) => entry.member === member && entry.date <= date).reduce((sum, entry) => sum + (entry.kind === 'deposit' ? entry.cents : -entry.cents), 0);

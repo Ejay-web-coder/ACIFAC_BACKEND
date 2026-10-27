@@ -140,7 +140,7 @@ async function windowOf(from, to) {
   return result.rows[0];
 }
 
-// Days (one decimal) a machine was in maintenance within the window, how many
+// Whole days a machine was in maintenance within the window, how many
 // maintenance periods touched it, and since when it is down (if it is now). A
 // machine in maintenance with no recorded start is flagged, not counted: any
 // number of days would be a guess.
@@ -160,7 +160,8 @@ function downtimeIn(machine, spans, window) {
     ms += Math.max(0, Math.min(end, windowEnd) - Math.max(start, windowStart));
   }
   const current = machine.status === 'maintenance' ? (open?.startedAt ?? null) : null;
-  return { days: round(ms / 86400000, 1), events, downSince: current ? new Date(current).toISOString() : null, startUnknown };
+  // Whole days: a machine down for part of a day counts one day.
+  return { days: ms > 0 ? Math.max(1, Math.round(ms / 86400000)) : 0, events, downSince: current ? new Date(current).toISOString() : null, startUnknown };
 }
 
 // Days of from..to (up to today) that the machine was owned.

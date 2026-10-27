@@ -7,6 +7,7 @@ import {
   listKadiwaData,
   listKadiwaSales,
   restockInventoryItem,
+  searchKadiwaMembers,
   updateInventoryItem,
 } from '../controllers/kadiwaController.js';
 
@@ -16,6 +17,8 @@ router.use(requireAuth, requireAdmin);
 router.get('/', listKadiwaData);
 router.get('/sales', listKadiwaSales);
 router.post('/sales', createKadiwaSale);
+// Members for the New Sale's member purchases (patronage points), by member ID or name.
+router.get('/members', searchKadiwaMembers);
 router.post('/inventory', createInventoryItem);
 router.patch('/inventory/:id', updateInventoryItem);
 router.delete('/inventory/:id', deleteInventoryItem);

@@ -30,10 +30,14 @@ export async function listAccounts(req, res) {
     `SELECT m.id AS member_id, m.member_number, m.first_name, m.last_name, COALESCE(u.email, m.email) AS email, u.id AS user_id,
             COALESCE(NULLIF(TRIM(m.phone), ''), u.phone) AS phone,
             u.username, u.role, u.account_status, u.must_change_password, u.last_login,
-            u.created_at AS account_created_at, u.password_changed_at
+            u.created_at AS account_created_at, u.password_changed_at,
+            -- An administrator's name and office, who made the account, and their latest action in the audit log.
+            u.full_name, u.position, NULLIF(TRIM(COALESCE(cb.full_name, cb.username)), '') AS created_by_name,
+            CASE WHEN u.role = 'ADMIN' THEN (SELECT MAX(al.created_at) FROM audit_logs al WHERE al.user_id = u.id) END AS last_activity_at
      FROM users u
      LEFT JOIN members m ON m.id = u.member_id
-     ORDER BY u.created_at DESC`,
+     LEFT JOIN users cb ON cb.id = u.created_by
+     ORDER BY (u.role = 'ADMIN') DESC, u.created_at DESC`,
     []
   );
   return res.status(200).json({ success: true, accounts: result.rows });
@@ -169,8 +173,14 @@ export async function updateAccountStatus(req, res) {
   if (!ACCOUNT_STATUSES.includes(status)) throw badRequest('Status must be ACTIVE, INACTIVE, or LOCKED.');
 
   const account = await withTransaction(async (client) => {
-    const before = await client.query(`SELECT id, username, account_status FROM users WHERE id = $1 FOR UPDATE`, [id]);
+    const before = await client.query(`SELECT id, username, role, account_status FROM users WHERE id = $1 FOR UPDATE`, [id]);
     if (!before.rows[0]) throw notFound('Account not found.');
+    // The cooperative must always keep an administrator who can sign in.
+    if (before.rows[0].role === 'ADMIN' && status !== 'ACTIVE') {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['admin-account-create']);
+      const others = (await client.query(`SELECT COUNT(*)::int AS count FROM users WHERE role = 'ADMIN' AND account_status = 'ACTIVE' AND id <> $1`, [id])).rows[0].count;
+      if (!others) throw badRequest('This is the only active administrator, so it cannot be switched off.');
+    }
     const result = await client.query(`UPDATE users SET account_status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`, [status, id]);
     let revokedSessions = 0;
     if (status !== 'ACTIVE') {
@@ -249,6 +259,8 @@ export async function resetMemberPassword(req, res) {
 // entries older than that column) the person's current one.
 const AUDIT_FROM_SQL = 'FROM audit_logs al LEFT JOIN users au ON au.id = al.user_id LEFT JOIN members am ON am.id = au.member_id';
 const AUDIT_FULL_NAME_SQL = `COALESCE(al.user_full_name_snapshot, NULLIF(TRIM(CONCAT_WS(' ', am.first_name, am.last_name)), ''), NULLIF(TRIM(au.full_name), ''))`;
+// The administrator's position when they acted; entries older than the snapshot show the current one.
+const AUDIT_POSITION_SQL = `COALESCE(al.user_position_snapshot, CASE WHEN al.user_role_snapshot = 'ADMIN' THEN NULLIF(TRIM(au.position), '') END)`;
 
 export async function listAuditLogs(req, res) {
   const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 25, maxLimit: 100 });
@@ -268,7 +280,7 @@ export async function listAuditLogs(req, res) {
   const add = (sql, value) => { params.push(value); conditions.push(sql.replaceAll('$?', `$${params.length}`)); };
 
   if (filters.search) {
-    add(`(COALESCE(al.user_name_snapshot, '') ILIKE $? OR COALESCE(${AUDIT_FULL_NAME_SQL}, '') ILIKE $? OR COALESCE(al.user_id::text, '') ILIKE $? OR COALESCE(al.entity_id, '') ILIKE $? OR COALESCE(al.description, '') ILIKE $?)`, `%${filters.search}%`);
+    add(`(COALESCE(al.user_name_snapshot, '') ILIKE $? OR COALESCE(${AUDIT_FULL_NAME_SQL}, '') ILIKE $? OR COALESCE(${AUDIT_POSITION_SQL}, '') ILIKE $? OR COALESCE(al.user_id::text, '') ILIKE $? OR COALESCE(al.entity_id, '') ILIKE $? OR COALESCE(al.description, '') ILIKE $?)`, `%${filters.search}%`);
   }
   if (filters.action) add('al.action = $?', filters.action);
   if (filters.module) add('al.module = $?', filters.module);
@@ -289,7 +301,7 @@ export async function listAuditLogs(req, res) {
   const [totalResult, logsResult] = await Promise.all([
     query(`SELECT COUNT(*)::int AS total ${AUDIT_FROM_SQL} ${whereClause}`, params),
     query(
-      `SELECT al.id, al.user_id, al.user_name_snapshot, al.user_role_snapshot, ${AUDIT_FULL_NAME_SQL} AS user_full_name,
+      `SELECT al.id, al.user_id, al.user_name_snapshot, al.user_role_snapshot, ${AUDIT_FULL_NAME_SQL} AS user_full_name, ${AUDIT_POSITION_SQL} AS user_position,
               al.action, al.module, al.entity_type, al.entity_id, al.description, al.old_values, al.new_values,
               al.target_user_id, al.ip_address, al.status, al.created_at
        ${AUDIT_FROM_SQL}

@@ -9,7 +9,8 @@
     "migrate": "node scripts/run-migrations.js",
     "create-admin": "node scripts/create-admin.js",
     "seed": "node scripts/seed.js",
-    "test": "node --test --test-concurrency=1"
+    "test": "node --test --test-concurrency=1",
+    "remove-sample-data": "node scripts/remove-sample-data.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.0",

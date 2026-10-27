@@ -7,7 +7,7 @@ import {
 import { validatePasswordPolicy, hashPassword, verifyPassword } from '../utils/password.js';
 import { createAuditLog } from '../utils/audit.js';
 import { keepAlive } from '../utils/background.js';
-import { AppError, badRequest, cleanString, currentUserId, getRequestMeta, optionalString, withCode } from '../utils/http.js';
+import { AppError, badRequest, cleanString, conflict, currentUserId, getRequestMeta, optionalString, withCode } from '../utils/http.js';
 import { sendEmailSafely } from '../services/emailService.js';
 import { passwordResetCodeEmail } from '../services/emailTemplates.js';
 import { isSmsConfigured, passwordResetCodeSms, sendSmsSafely } from '../services/smsService.js';
@@ -15,6 +15,7 @@ import { maskPhilippineMobile, normalizePhilippineMobile } from '../utils/phone.
 import { notifyUser } from '../services/notificationService.js';
 import { clearFailures, findActiveLock, registerFailure, throttleKeys } from '../services/loginThrottle.js';
 import { findAccountsByEmail, findAccountsByPhone } from '../services/accountLookup.js';
+import { emailConflict, phoneConflict } from './adminAccountController.js';
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_PATTERN = /^[+0-9()\s.-]{7,30}$/;
@@ -252,6 +253,14 @@ export async function updateProfile(req, res) {
        WHERE id = $6 RETURNING full_name, email, phone, position`,
       [fullName, email?.toLowerCase() ?? null, phone, position !== undefined, position ?? null, userId]
     );
+    // An administrator signs in and acts in the audit log under their name and
+    // position, so both stay filled in; their email and number stay their own.
+    if (req.user.role === 'ADMIN') {
+      if (!result.rows[0].full_name?.trim() || !result.rows[0].position?.trim()) throw badRequest('Enter your full name and your position in the cooperative.');
+      const problem = (email && email.toLowerCase() !== String(before.email || '').toLowerCase() && await emailConflict(email.toLowerCase(), client, userId))
+        || (phone && normalizePhilippineMobile(phone) && normalizePhilippineMobile(phone) !== normalizePhilippineMobile(before.phone) && await phoneConflict(normalizePhilippineMobile(phone), client, userId));
+      if (problem) throw conflict(problem);
+    }
     // Members' contact details live on their member record as well.
     if (req.user.member_id && (email || phone)) {
       await client.query(

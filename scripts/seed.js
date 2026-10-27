@@ -37,6 +37,7 @@ const SEEDERS = [
   ['members and share capital', './seeders/members.js'],
   ['savings', './seeders/savings.js'],
   ['loans', './seeders/loans.js'],
+  ['loan history', './seeders/loanHistory.js'],
   ['machinery', './seeders/machinery.js'],
   ['Kadiwa store', './seeders/kadiwa.js'],
   ['activities and attendance', './seeders/attendance.js'],
@@ -150,7 +151,11 @@ async function seed(pool) {
     return;
   }
 
+  let roundTrips = 0;
   const ctx = await withTransaction(async (client) => {
+    // Counted, so the cost of a run across the internet (about 0.5 s each) can be told.
+    const send = client.query.bind(client);
+    client.query = (...args) => { roundTrips += 1; return send(...args); };
     const context = createContext(client);
     context.alongside = existing > 0 && !onlyAdd;
     await seedAdmin(context);
@@ -180,6 +185,7 @@ async function seed(pool) {
   console.log(`\nSample data added to ${host}:`);
   for (const [label, amount] of ctx.counts) console.log(`  ${String(amount).padStart(4)}  ${label}`);
   for (const reason of ctx.skippedList) console.log(`  skipped: ${reason}`);
+  console.log(`  (${roundTrips} database round trips)`);
   console.log('\nSign in with:');
   for (const [role, username, password] of ctx.logins) console.log(`  ${role.padEnd(13)} ${username.padEnd(15)} ${password}`);
 }

@@ -1,3 +1,4 @@
+import { getFrontendUrl } from '../config/env.js';
 import { buildLink } from './emailService.js';
 
 function escapeHtml(value) {
@@ -35,6 +36,26 @@ export function passwordResetCodeEmail({ code, expiresInMinutes = 10 }) {
     'ACIFAC Password Reset',
     `ACIFAC Password Reset\n\nYour verification code is:\n\n${code}\n\nThis code expires in ${expiresInMinutes} minutes.\n\nIf you did not request a password reset, you can ignore this email.`,
     `<h2 style="margin:0 0 12px">ACIFAC Password Reset</h2><p>Your verification code is:</p><p style="margin:8px 0;font-size:28px;font-weight:bold;letter-spacing:6px">${escapeHtml(code)}</p><p>This code expires in ${escapeHtml(expiresInMinutes)} minutes.</p><p>If you did not request a password reset, you can ignore this email.</p>`
+  );
+}
+
+// Proves that a new administrator's email reaches them, while an administrator
+// makes their account in Manage Users. Like the reset code, it is only ever here.
+export function adminContactCodeEmail({ code, name, expiresInMinutes = 10 }) {
+  return message(
+    'ACIFAC administrator account: verify your email',
+    `Hello ${name},\n\nAn ACIFAC administrator is making an administrator account for you with this email. Give them this verification code:\n\n${code}\n\nThis code expires in ${expiresInMinutes} minutes. If you did not expect this, ignore this email.`,
+    `<p>Hello ${escapeHtml(name)},</p><p>An ACIFAC administrator is making an administrator account for you with this email. Give them this verification code:</p><p style="margin:8px 0;font-size:28px;font-weight:bold;letter-spacing:6px">${escapeHtml(code)}</p><p>This code expires in ${escapeHtml(expiresInMinutes)} minutes. If you did not expect this, ignore this email.</p>`
+  );
+}
+
+// The new administrator's welcome: who made the account and how to sign in. The temporary password is never in it.
+export function adminAccountCreatedEmail({ name, position, username, createdBy }) {
+  const link = `${getFrontendUrl()}/login`;
+  return message(
+    'Your ACIFAC administrator account is ready',
+    `Hello ${name},\n\n${createdBy} made an ACIFAC administrator account for you as ${position}.\n\nSign in at ${link} with your username (${username}), this email or your mobile number, and the temporary password they gave you. You will be asked to choose your own password.\n\nEverything you do in the system is recorded in the audit log under your name and position.`,
+    `<p>Hello ${escapeHtml(name)},</p><p>${escapeHtml(createdBy)} made an ACIFAC administrator account for you as <strong>${escapeHtml(position)}</strong>.</p><p><a href="${escapeHtml(link)}">Sign in</a> with your username (<strong>${escapeHtml(username)}</strong>), this email or your mobile number, and the temporary password they gave you. You will be asked to choose your own password.</p><p>Everything you do in the system is recorded in the audit log under your name and position.</p>`
   );
 }
 

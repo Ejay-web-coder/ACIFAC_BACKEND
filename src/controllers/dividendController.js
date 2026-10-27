@@ -10,7 +10,8 @@ import { ACTIVITY_POINTS, computePatronageRefund, participationPoints, PESOS_PER
 // ($3) and of all current members, for the patronage refund (see
 // services/patronage.js). Business is counted as the net income counts it:
 // rental fees of rentals started (a rental also recorded as a service counts
-// once, as the service), service fees collected, and loan interest paid.
+// once, as the service), service fees collected, and loan interest paid; and
+// the member's Kadiwa Store purchases written on the day's sales.
 const PATRONAGE_SQL = `
   WITH current_members AS (SELECT id FROM members WHERE status <> 'archived'),
   business AS (
@@ -23,6 +24,9 @@ const PATRONAGE_SQL = `
     UNION ALL
     SELECT l.member_id, 'loans', lp.interest_paid FROM loan_payments lp JOIN loans l ON l.id = lp.loan_id
     WHERE lp.payment_date BETWEEN $1::date AND $2::date
+    UNION ALL
+    SELECT p.member_id, 'kadiwa', p.amount FROM kadiwa_sale_members p JOIN kadiwa_sales ks ON ks.id = p.sale_id
+    WHERE ks.status = 'completed' AND ks.sale_date BETWEEN $1::date AND $2::date
   ),
   attended AS (
     SELECT aa.member_id, a.category FROM activity_attendance aa JOIN activities a ON a.id = aa.activity_id
@@ -32,6 +36,7 @@ const PATRONAGE_SQL = `
   SELECT
     (SELECT COALESCE(SUM(amount) FILTER (WHERE service = 'machinery'), 0) FROM business WHERE member_id = $3) AS machinery,
     (SELECT COALESCE(SUM(amount) FILTER (WHERE service = 'loans'), 0) FROM business WHERE member_id = $3) AS loans,
+    (SELECT COALESCE(SUM(amount) FILTER (WHERE service = 'kadiwa'), 0) FROM business WHERE member_id = $3) AS kadiwa,
     (SELECT COALESCE(SUM(amount), 0) FROM business WHERE member_id IN (SELECT id FROM current_members)) AS "totalBusiness",
     (SELECT COALESCE(json_object_agg(category, n), '{}') FROM
       (SELECT category, COUNT(*)::int AS n FROM attended WHERE member_id = $3 GROUP BY category) t) AS attended,
@@ -74,7 +79,7 @@ export async function getMyDividend(req, res) {
   const activity = patronageRows.rows[0];
   const patronage = computePatronageRefund({
     poolCents: result.patronageRefundPool,
-    memberBusiness: { machinery: toCents(activity.machinery), loans: toCents(activity.loans) },
+    memberBusiness: { machinery: toCents(activity.machinery), loans: toCents(activity.loans), kadiwa: toCents(activity.kadiwa) },
     memberAttended: activity.attended,
     totalBusinessCents: toCents(activity.totalBusiness),
     totalParticipationPoints: participationPoints(activity.totalAttended),

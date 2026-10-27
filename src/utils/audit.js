@@ -160,10 +160,11 @@ export async function createAuditLog({
       `INSERT INTO audit_logs (
         user_id, user_name_snapshot, user_role_snapshot, action, module, entity_type, entity_id,
         description, old_values, new_values, target_user_id, ip_address, user_agent, status, details,
-        user_full_name_snapshot, created_at
+        user_full_name_snapshot, user_position_snapshot, created_at
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
         (SELECT COALESCE(NULLIF(TRIM(CONCAT_WS(' ', m.first_name, m.last_name)), ''), NULLIF(TRIM(u.full_name), ''))
          FROM users u LEFT JOIN members m ON m.id = u.member_id WHERE u.id = $1),
+        (SELECT NULLIF(TRIM(u.position), '') FROM users u WHERE u.id = $1 AND u.role = 'ADMIN'),
         NOW())`,
       [
         payload.user_id,

@@ -1,11 +1,11 @@
 // How the patronage refund pool (half of the net surplus, see dividends.js) is
 // shared among the members, by a weighted point system:
 //   Business volume   70% of the pool. 1 point per PHP 100 of business the
-//                     member did with the cooperative in the year, as the net
-//                     income counts it (see netIncome.js): machinery rental
-//                     and service fees, and loan interest paid. Kadiwa Store
-//                     sales are recorded as daily totals without the buyer, so
-//                     store purchases cannot be counted per member.
+//                     member did with the cooperative in the year: machinery
+//                     rental and service fees and loan interest paid, as the
+//                     net income counts them (see netIncome.js), and Kadiwa
+//                     Store purchases, written with the member's ID or name on
+//                     the day's sale (New Sale, Member purchases).
 //   Participation     30% of the pool. Points per activity attended (present
 //                     or late, final attendance only): a meeting 10, a
 //                     community development or educational and training
