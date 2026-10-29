@@ -34,9 +34,11 @@ const HARVEST_MONTHS = new Set([4, 5, 10, 11]);
 const PREPARATION = ['Rotavator', 'Rotavator', 'Squadrone', 'Tudling'];
 // One bag of fresh palay: 50 kg at PHP 18 a kilo.
 const BAG = { kgPerBag: '50', pricePerKg: '18' };
-// Running costs of a machine in a month it worked: [category, amount, what for].
-const MONTHLY_COSTS = [['fuel', '3200', 'Diesel, 50 L'], ['labor', '1500', 'Operator']];
-const OCCASIONAL_COSTS = [['repair_maintenance', '4800', 'Blades replaced'], ['repair_maintenance', '2500', 'Oil change and filters'], ['other', '800', 'Sacks for the harvester fee']];
+// Running costs of a machine in a month it worked, as a share of the fees it
+// was paid that month, so every month's machinery income stays positive:
+// [category, share of the fees, what for].
+const MONTHLY_COSTS = [['fuel', 0.25, 'Diesel'], ['labor', 0.12, 'Operator']];
+const OCCASIONAL_COSTS = [['repair_maintenance', 0.15, 'Blades replaced'], ['repair_maintenance', 0.08, 'Oil change and filters'], ['other', 0.03, 'Sacks for the harvester fee']];
 // Day rentals: [days from today it starts, days, member key or non-member { name }, status]; and one every
 // RENTAL_EVERY days over the past year for the generated members.
 const NAMED_RENTALS = [
@@ -134,18 +136,28 @@ async function seedServices(ctx) {
   return rows;
 }
 
-// Running costs: fuel and the operator in every month a machine worked, and now and then a repair.
+// Running costs: fuel and the operator in every month a machine was paid for
+// work, and now and then a repair, each a share of that month's fees (at most
+// 52%), recorded on the machine's last working day of the month.
 async function seedExpenses(ctx, services) {
   const months = new Map();
   for (const service of services) {
     const key = `${service.machineryId}|${service.date.slice(0, 7)}`;
-    if (!months.has(key) || months.get(key) < service.date) months.set(key, service.date);
+    const month = months.get(key) ?? { lastDay: service.date, paidCents: 0 };
+    if (month.lastDay < service.date) month.lastDay = service.date;
+    month.paidCents += service.paid ? toCents(service.paid) : 0;
+    months.set(key, month);
   }
   const rows = [];
-  [...months.entries()].forEach(([key, lastDay], n) => {
+  const share = (paidCents, part) => centsToString(Math.round((paidCents * part) / 100) * 100);
+  [...months.entries()].forEach(([key, { lastDay, paidCents }], n) => {
+    if (paidCents < 100000) return; // under PHP 1,000 paid: no costs recorded that month
     const machineryId = key.split('|')[0];
-    for (const [category, amount, description] of MONTHLY_COSTS) rows.push({ machineryId, date: lastDay, category, amount, description });
-    if (n % 3 === 1) rows.push({ machineryId, date: lastDay, ...Object.fromEntries(['category', 'amount', 'description'].map((field, i) => [field, OCCASIONAL_COSTS[n % OCCASIONAL_COSTS.length][i]])) });
+    for (const [category, part, description] of MONTHLY_COSTS) rows.push({ machineryId, date: lastDay, category, amount: share(paidCents, part), description });
+    if (n % 3 === 1) {
+      const [category, part, description] = OCCASIONAL_COSTS[n % OCCASIONAL_COSTS.length];
+      rows.push({ machineryId, date: lastDay, category, amount: share(paidCents, part), description });
+    }
   });
   if (!rows.length) return;
   await ctx.client.query(
