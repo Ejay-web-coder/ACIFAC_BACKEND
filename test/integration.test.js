@@ -689,10 +689,31 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   assert.equal(future.status, 400);
   const over = await admin.post(`/api/admin/loans/${state.loanId}/payments`, { amount: '60000', paymentDate: detail.data.loan.dateApproved });
   assert.equal(over.status, 400);
+  // Two days before a 6-month loan is due, the member is reminded once: a notification, an email and a text.
+  const { refreshLoanStatuses } = await import('../src/services/loanService.js');
+  const { SQL_TODAY } = await import('../src/config/env.js');
+  const dueDate = (await pool.query(`SELECT due_date FROM loan_installments WHERE loan_id = $1`, [state.loanId])).rows[0].due_date;
+  const dueNotes = async () => (await pool.query(`SELECT message FROM notifications WHERE type = 'payment_due' AND user_id = $1`, [state.memberUserId])).rows;
+  await pool.query(`UPDATE loan_installments SET due_date = ${SQL_TODAY} + 5 WHERE loan_id = $1`, [state.loanId]);
+  await refreshLoanStatuses({ force: true });
+  assert.deepEqual(await dueNotes(), [], 'no reminder 5 days before');
+  await pool.query(`UPDATE loan_installments SET due_date = ${SQL_TODAY} + 2 WHERE loan_id = $1`, [state.loanId]);
+  await refreshLoanStatuses({ force: true });
+  await refreshLoanStatuses({ force: true });
+  const due = await dueNotes();
+  assert.equal(due.length, 1, 'one reminder, not repeated');
+  assert.match(due[0].message, /^Your loan L-\d{4}-\d{3} \(PHP 51,250\.00\) is due on /);
+  const { flushSmsOutbox: flushDue } = await import('../src/services/smsService.js');
+  await flushDue();
+  const dueTexts = sentTexts.filter((text) => text.message.startsWith('Your loan ') && text.message.includes('Please pay at the ACIFAC office.'));
+  assert.equal(dueTexts.length, 1, 'texted once');
+  assert.ok(dueTexts[0].message.length <= 160, dueTexts[0].message);
+  await pool.query(`UPDATE loan_installments SET due_date = $2 WHERE loan_id = $1`, [state.loanId, dueDate]);
+  await refreshLoanStatuses({ force: true });
+
   // Simulate time passing: move the loan 200 days into the past, past its due date.
   await pool.query(`UPDATE loans SET date_approved = date_approved - 200 WHERE id = $1`, [state.loanId]);
   await pool.query(`UPDATE loan_installments SET due_date = due_date - 200 WHERE loan_id = $1`, [state.loanId]);
-  const { refreshLoanStatuses } = await import('../src/services/loanService.js');
   await refreshLoanStatuses({ force: true });
   await refreshLoanStatuses({ force: true });
   const overdue = await admin.get(`/api/admin/loans/${state.loanId}`);
@@ -1511,6 +1532,173 @@ test('kadiwa: member purchases on a sale earn patronage points', { skip }, async
   // Listed with the sales.
   const listed = (await admin.get('/api/kadiwa')).data.sales.find((row) => row.id === saved.data.sale.id);
   assert.equal(listed.memberPurchases.length, 2);
+});
+
+test('kadiwa vendors: an administrator makes the account; the vendor\'s sales count only once an administrator confirms them', { skip }, async () => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const today = todayDateOnly();
+  const vendor = new Client();
+
+  // The account: a name, a username and a password the administrator gives.
+  const account = { fullName: 'Rosa Vendor', username: 'rosa.vendor', password: 'Vendor123!', confirmPassword: 'Vendor123!' };
+  assert.equal((await admin.post('/api/admin/accounts/vendors', { ...account, confirmPassword: 'Other123!' })).status, 400);
+  assert.equal((await admin.post('/api/admin/accounts/vendors', { ...account, fullName: '' })).status, 400);
+  assert.equal((await admin.post('/api/admin/accounts/vendors', { ...account, password: 'short', confirmPassword: 'short' })).status, 400);
+  assert.equal((await member.post('/api/admin/accounts/vendors', account)).status, 403);
+  const created = await admin.post('/api/admin/accounts/vendors', account);
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  assert.equal(created.data.user.role, 'VENDOR');
+  assert.equal(created.data.user.password_hash, undefined);
+  assert.equal((await admin.post('/api/admin/accounts/vendors', account)).status, 409, 'username taken');
+  const vendorId = created.data.user.id;
+  const listed = (await admin.get('/api/admin/accounts')).data.accounts.find((row) => row.user_id === vendorId);
+  assert.equal(listed.role, 'VENDOR');
+  assert.equal(listed.full_name, 'Rosa Vendor');
+
+  // The vendor signs in on the same login with the username, and sees only the vendor pages.
+  const login = await vendor.post('/api/auth/login', { usernameOrEmail: 'rosa.vendor', password: 'Vendor123!' });
+  assert.equal(login.status, 200, JSON.stringify(login.data));
+  assert.equal(login.data.role, 'VENDOR');
+  assert.equal(login.data.mustChangePassword, false);
+  // A vendor stays signed in at the store until they log out: no inactivity timeout, a long session.
+  const vendorSession = (await pool.query(`SELECT id, expires_at FROM sessions WHERE user_id = $1 AND revoked_at IS NULL ORDER BY id DESC LIMIT 1`, [created.data.user.id])).rows[0];
+  assert.ok(new Date(vendorSession.expires_at) - Date.now() > 300 * 24 * 3600 * 1000);
+  await pool.query(`UPDATE sessions SET last_activity_at = NOW() - INTERVAL '3 hours' WHERE id = $1`, [vendorSession.id]);
+  assert.equal((await vendor.get('/api/vendor/kadiwa')).status, 200, 'still signed in after hours without activity');
+  for (const url of ['/api/kadiwa', '/api/admin/accounts', '/api/members', '/api/members/me']) assert.equal((await vendor.get(url)).status, 403, url);
+  assert.equal((await vendor.post('/api/kadiwa/sales', { goods: [] })).status, 403);
+  assert.equal((await admin.get('/api/vendor/kadiwa')).status, 403, 'the vendor pages are for vendors');
+  const page = await vendor.get('/api/vendor/kadiwa');
+  assert.equal(page.status, 200);
+  assert.ok(page.data.goods.some((good) => good.name === 'TALONG'));
+  assert.deepEqual(page.data.sales, []);
+  // Every store item in the inventory, with its selling and cost price.
+  const rice = page.data.inventory.find((item) => item.id === 'INV-001');
+  assert.ok(rice && rice.costPrice !== null);
+  assert.equal(page.data.inventory.length, (await admin.get('/api/kadiwa')).data.inventory.length);
+  const stockOf = async () => Number((await pool.query(`SELECT stock FROM kadiwa_inventory WHERE id = 'INV-001'`)).rows[0].stock);
+  const startStock = await stockOf();
+  // The name stays the one the administrator gave.
+  await vendor.patch('/api/auth/profile', { name: 'Someone Else' });
+  assert.equal((await vendor.get('/api/auth/me')).data.user.full_name, 'Rosa Vendor');
+
+  // A sale: the goods sold and the expenses, sent for review under the vendor's name.
+  const sale = { saleDate: today, goods: [{ name: 'TALONG', unit: 'KILO', price: '80', amount: '400' }], expenses: [{ description: 'Ice', amount: '30' }] };
+  // Expenses are not required on a vendor's sale: none typed means none.
+  assert.match((await vendor.post('/api/vendor/kadiwa/sales', { ...sale, goods: [], expenses: [] })).data.message, /goods sold, a store item, or an expense/);
+  // Expenses alone can be sent: the day's costs, with nothing sold.
+  const expensesOnly = await vendor.post('/api/vendor/kadiwa/sales', { ...sale, goods: [] });
+  assert.equal(expensesOnly.status, 201, JSON.stringify(expensesOnly.data));
+  assert.deepEqual([Number(expensesOnly.data.sale.totalExpenses), Number(expensesOnly.data.sale.netSales)], [30, -30]);
+  await admin.post(`/api/kadiwa/sales/${expensesOnly.data.sale.id}/review`, { decision: 'reject', notes: 'Test' });
+  const before = (await admin.get('/api/kadiwa')).data.summary;
+  assert.equal((await vendor.post('/api/vendor/kadiwa/sales', { ...sale, items: [{ inventoryId: 'INV-001', quantity: String(startStock + 1) }] })).status, 409, 'no overselling');
+  // Store items: taken from the stock as the sale is sent, counted under GROCERIES; net income less their cost price.
+  const sent = await vendor.post('/api/vendor/kadiwa/sales', { ...sale, sellerName: 'Not Me', items: [{ inventoryId: 'INV-001', quantity: '2' }], memberPurchases: [{ memberId: state.memberId, amount: '100' }] });
+  assert.equal(sent.status, 201, JSON.stringify(sent.data));
+  assert.equal(sent.data.sale.status, 'pending');
+  assert.equal(sent.data.sale.seller, 'Rosa Vendor');
+  assert.equal(sent.data.sale.byVendor, true);
+  assert.equal(sent.data.sale.items.length, 1);
+  assert.equal(Number(sent.data.sale.groceries), 2 * Number(rice.price));
+  assert.equal(Number(sent.data.sale.costOfGoods), 2 * Number(rice.costPrice));
+  // The members who bought (optional): found with the same member search, and their points count once the sale is confirmed.
+  const found = await vendor.get(`/api/kadiwa/members?search=${encodeURIComponent(sent.data.sale.memberPurchases[0].memberNumber)}`);
+  assert.equal(found.status, 200);
+  assert.equal(found.data.members[0].id, state.memberId);
+  assert.equal((await member.get('/api/kadiwa/members?search=ju')).status, 403);
+  assert.deepEqual(sent.data.sale.memberPurchases.map((line) => [line.memberId, Number(line.amount)]), [[state.memberId, 100]]);
+  assert.equal(Math.round(Number(sent.data.sale.netSales) * 100), Math.round((400 + 2 * Number(rice.price) - 30 - 2 * Number(rice.costPrice)) * 100));
+  assert.equal(await stockOf(), startStock - 2);
+  const saleId = sent.data.sale.id;
+
+  // Waiting for review: listed for the administrators, counted nowhere.
+  const kadiwa = (await admin.get('/api/kadiwa')).data;
+  assert.equal(kadiwa.pendingSales.find((row) => row.id === saleId).seller, 'Rosa Vendor');
+  assert.ok(!kadiwa.sales.some((row) => row.id === saleId));
+  assert.equal(Number(kadiwa.summary.todaySales), Number(before.todaySales));
+  assert.equal(Number(kadiwa.summary.totalNetSales), Number(before.totalNetSales));
+  assert.ok(!(await admin.get(`/api/kadiwa/sales?from=${today}&to=${today}`)).data.sales.some((row) => row.id === saleId));
+  const submitted = (await admin.get(`/api/admin/audit-logs?action=KADIWA_SALE_SUBMITTED`)).data.data.find((row) => row.entity_id === saleId);
+  assert.equal(submitted.user_role_snapshot, 'VENDOR');
+  assert.equal(submitted.new_values.capital_change, undefined);
+  const notified = await pool.query(`SELECT 1 FROM notifications n JOIN users u ON u.id = n.user_id WHERE u.role = 'ADMIN' AND n.type = 'kadiwa_sale_submitted' AND n.entity_id = $1`, [saleId]);
+  assert.ok(notified.rowCount > 0);
+
+  // Rejected with the reason; it can be reviewed once only.
+  assert.equal((await vendor.post(`/api/kadiwa/sales/${saleId}/review`, { decision: 'confirm' })).status, 403, 'a vendor cannot confirm');
+  assert.match((await admin.post(`/api/kadiwa/sales/${saleId}/review`, { decision: 'reject' })).data.message, /reason/);
+  const rejected = await admin.post(`/api/kadiwa/sales/${saleId}/review`, { decision: 'reject', notes: 'TALONG was 300, not 400.' });
+  assert.equal(rejected.status, 200, JSON.stringify(rejected.data));
+  assert.equal(rejected.data.sale.status, 'rejected');
+  assert.equal(rejected.data.sale.reviewNotes, 'TALONG was 300, not 400.');
+  assert.equal(await stockOf(), startStock, 'a rejected sale puts its store items back');
+  const rejectAudit = (await admin.get('/api/admin/audit-logs?action=KADIWA_SALE_REJECTED')).data.data[0];
+  assert.equal(Number(rejectAudit.new_values.stock_returned[0].quantity), 2);
+  assert.equal((await admin.post(`/api/kadiwa/sales/${saleId}/review`, { decision: 'confirm' })).status, 409);
+  assert.equal((await admin.post('/api/kadiwa/sales/S-0000-99999/review', { decision: 'confirm' })).status, 404);
+  assert.ok(!(await admin.get('/api/kadiwa')).data.pendingSales.some((row) => row.id === saleId));
+  const mine = (await vendor.get('/api/vendor/kadiwa')).data.sales;
+  assert.equal(mine.find((row) => row.id === saleId).status, 'rejected');
+
+  // Sent again, corrected, and confirmed: now it counts, and the audit log names the administrator who confirmed it.
+  const again = await vendor.post('/api/vendor/kadiwa/sales', { ...sale, goods: [{ name: 'TALONG', unit: 'KILO', price: '80', amount: '300' }] });
+  assert.equal(again.status, 201);
+  // A sale without expenses.
+  const storeOnly = await vendor.post('/api/vendor/kadiwa/sales', { saleDate: today, goods: [{ name: 'TALONG', unit: 'KILO', price: '80', amount: '80' }], items: [{ inventoryId: 'INV-001', quantity: '1' }], expenses: [] });
+  assert.equal(storeOnly.status, 201, JSON.stringify(storeOnly.data));
+  assert.equal(Number(storeOnly.data.sale.totalExpenses), 0, 'no expenses typed');
+  assert.equal(await stockOf(), startStock - 1);
+  const confirmed = await admin.post(`/api/kadiwa/sales/${again.data.sale.id}/review`, { decision: 'confirm' });
+  assert.equal(confirmed.status, 200, JSON.stringify(confirmed.data));
+  assert.equal(confirmed.data.sale.status, 'completed');
+  assert.ok(confirmed.data.sale.reviewedBy);
+  const after = (await admin.get('/api/kadiwa')).data.summary;
+  assert.equal(Number(after.todaySales), Number(before.todaySales) + 1);
+  assert.equal(Math.round((Number(after.totalNetSales) - Number(before.totalNetSales)) * 100), 27000);
+  assert.ok((await admin.get(`/api/kadiwa/sales?from=${today}&to=${today}`)).data.sales.some((row) => row.id === again.data.sale.id));
+  const audit = (await admin.get('/api/admin/audit-logs?action=KADIWA_SALE_CONFIRMED')).data.data[0];
+  assert.equal(audit.entity_id, again.data.sale.id);
+  assert.equal(audit.user_role_snapshot, 'ADMIN');
+  assert.equal(audit.new_values.vendor, 'Rosa Vendor');
+  assert.equal(audit.new_values.capital_change, '+270.00');
+  const reviewed = (await vendor.get('/api/notifications')).data;
+  assert.ok(JSON.stringify(reviewed).includes('Sale confirmed'));
+  assert.ok(JSON.stringify(reviewed).includes('TALONG was 300'));
+
+  // The administrator renames the vendor and changes the password: the vendor is signed out and uses the new one.
+  assert.equal((await admin.patch(`/api/admin/accounts/vendors/${vendorId}`, { fullName: 'Rosa M. Vendor' })).status, 200);
+  const memberUser = (await pool.query(`SELECT id FROM users WHERE role = 'MEMBER' LIMIT 1`)).rows[0];
+  assert.equal((await admin.patch(`/api/admin/accounts/vendors/${memberUser.id}`, { fullName: 'Not A Vendor' })).status, 400, 'members are not renamed here');
+  assert.equal((await admin.post(`/api/admin/accounts/vendors/${vendorId}/password`, { password: 'Vendor456!', confirmPassword: 'Vendor999!' })).status, 400);
+  const changed = await admin.post(`/api/admin/accounts/vendors/${vendorId}/password`, { password: 'Vendor456!', confirmPassword: 'Vendor456!' });
+  assert.equal(changed.status, 200, JSON.stringify(changed.data));
+  assert.equal((await vendor.get('/api/vendor/kadiwa')).status, 401);
+  assert.equal((await vendor.post('/api/auth/login', { usernameOrEmail: 'rosa.vendor', password: 'Vendor123!' })).status, 401);
+  assert.equal((await vendor.post('/api/auth/login', { usernameOrEmail: 'rosa.vendor', password: 'Vendor456!' })).status, 200);
+  const third = await vendor.post('/api/vendor/kadiwa/sales', sale);
+  assert.equal(third.data.sale.seller, 'Rosa M. Vendor');
+  const passwordAudit = (await admin.get('/api/admin/audit-logs?action=VENDOR_PASSWORD_CHANGED')).data.data[0];
+  assert.equal(passwordAudit.entity_id, String(vendorId));
+  assert.ok(!JSON.stringify(passwordAudit).includes('Vendor456!'));
+  // Sent in parts at different times: one report for the day, confirmed or rejected together.
+  const partOne = await vendor.post('/api/vendor/kadiwa/sales', sale);
+  const partTwo = await vendor.post('/api/vendor/kadiwa/sales', { ...sale, goods: [] });
+  const parts = (await admin.get('/api/kadiwa')).data.pendingSales.filter((row) => [partOne.data.sale.id, partTwo.data.sale.id].includes(row.id));
+  assert.equal(parts.length, 2);
+  assert.ok(parts.every((row) => row.createdBy === vendorId && row.saleDate === today));
+  assert.equal((await admin.post('/api/kadiwa/sales/review', { ids: [partOne.data.sale.id, again.data.sale.id], decision: 'confirm' })).status, 409, 'all or none');
+  assert.equal((await admin.get('/api/kadiwa')).data.pendingSales.filter((row) => parts.some((part) => part.id === row.id)).length, 2, 'nothing reviewed when one part cannot be');
+  assert.equal((await admin.post('/api/kadiwa/sales/review', { ids: [], decision: 'confirm' })).status, 400);
+  const both = await admin.post('/api/kadiwa/sales/review', { ids: [partOne.data.sale.id, partTwo.data.sale.id], decision: 'confirm' });
+  assert.equal(both.status, 200, JSON.stringify(both.data));
+  assert.deepEqual(both.data.sales.map((row) => row.status), ['completed', 'completed']);
+  const partAudits = (await admin.get('/api/admin/audit-logs?action=KADIWA_SALE_CONFIRMED')).data.data.filter((row) => [partOne.data.sale.id, partTwo.data.sale.id].includes(row.entity_id));
+  assert.equal(partAudits.length, 2, 'each part in the audit log');
+  // Leave nothing pending for later tests.
+  await admin.post(`/api/kadiwa/sales/${third.data.sale.id}/review`, { decision: 'reject', notes: 'Test' });
+  await admin.post(`/api/kadiwa/sales/${storeOnly.data.sale.id}/review`, { decision: 'reject', notes: 'Test' });
+  assert.equal(await stockOf(), startStock);
 });
 
 test('loans: applications typed into the app need the borrower and co-maker IDs with 3 signatures', { skip }, async () => {

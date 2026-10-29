@@ -37,7 +37,7 @@ export async function listAccounts(req, res) {
      FROM users u
      LEFT JOIN members m ON m.id = u.member_id
      LEFT JOIN users cb ON cb.id = u.created_by
-     ORDER BY (u.role = 'ADMIN') DESC, u.created_at DESC`,
+     ORDER BY (u.role = 'ADMIN') DESC, (u.role = 'VENDOR') DESC, u.created_at DESC`,
     []
   );
   return res.status(200).json({ success: true, accounts: result.rows });

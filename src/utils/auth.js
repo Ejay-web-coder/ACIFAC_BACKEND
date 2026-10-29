@@ -3,6 +3,10 @@ import bcrypt from 'bcryptjs';
 import { isProduction } from '../config/env.js';
 
 export const SESSION_TTL_MS = 1000 * 60 * 60 * 8;
+// A Kadiwa store vendor stays signed in at the store until they log out
+// (or the office changes their password or switches the account off): no
+// inactivity timeout, and a session as long as browsers keep a cookie.
+export const VENDOR_SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 400;
 // Signed out after this long without activity; enforced on every request.
 export const SESSION_IDLE_TIMEOUT_MINUTES = 20;
 

@@ -25,7 +25,8 @@ export async function loadSession(sessionToken) {
   if (!sessionToken || typeof sessionToken !== 'string' || sessionToken.length > 200) return null;
   const result = await query(
     `SELECT s.id AS session_id, s.expires_at,
-            s.last_activity_at <= NOW() - make_interval(mins => $2) AS idle_expired,
+            -- Kadiwa vendors are never signed out for inactivity (see VENDOR_SESSION_TTL_MS).
+            (u.role <> 'VENDOR' AND s.last_activity_at <= NOW() - make_interval(mins => $2)) AS idle_expired,
             s.last_activity_at < NOW() - make_interval(secs => $3) AS activity_stale,
             GREATEST(0, CEIL(EXTRACT(EPOCH FROM (s.last_activity_at + make_interval(mins => $2) - NOW()))))::int AS idle_expires_in_seconds,
             GREATEST(0, CEIL(EXTRACT(EPOCH FROM (s.expires_at - NOW()))))::int AS session_expires_in_seconds,
@@ -113,6 +114,21 @@ export async function requireAuth(req, res, next) {
 
 export function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== 'ADMIN') {
+    return res.status(403).json({ success: false, message: 'Admin access required.' });
+  }
+  return next();
+}
+
+// Kadiwa store vendors: they record sales for review and nothing else.
+export function requireVendor(req, res, next) {
+  if (!req.user || req.user.role !== 'VENDOR') {
+    return res.status(403).json({ success: false, message: 'A Kadiwa vendor account is required.' });
+  }
+  return next();
+}
+
+export function requireAdminOrVendor(req, res, next) {
+  if (!req.user || (req.user.role !== 'ADMIN' && req.user.role !== 'VENDOR')) {
     return res.status(403).json({ success: false, message: 'Admin access required.' });
   }
   return next();

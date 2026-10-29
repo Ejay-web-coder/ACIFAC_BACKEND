@@ -1,6 +1,6 @@
 import { query, withTransaction } from '../config/db.js';
 import {
-  buildAuthCookieOptions, buildResetGrantCookieOptions, digestToken, generateSecureToken, generateVerificationCode, sanitizeUser, SESSION_TTL_MS,
+  buildAuthCookieOptions, buildResetGrantCookieOptions, digestToken, generateSecureToken, generateVerificationCode, sanitizeUser, SESSION_TTL_MS, VENDOR_SESSION_TTL_MS,
   LOGIN_IP_MAX_FAILURES, LOGIN_LOCK_MINUTES, LOGIN_MAX_FAILED_ATTEMPTS, RESET_CODE_MAX_ATTEMPTS, RESET_CODE_RESEND_SECONDS, RESET_CODE_TTL_MINUTES,
   RESET_CODES_PER_EMAIL_PER_HOUR, RESET_CODES_PER_IP_PER_HOUR, RESET_GRANT_COOKIE, RESET_GRANT_TTL_MINUTES,
 } from '../utils/auth.js';
@@ -145,10 +145,11 @@ export async function login(req, res) {
 
   const sessionToken = generateSecureToken(32);
   const digest = digestToken(sessionToken);
+  const sessionTtlMs = user.role === 'VENDOR' ? VENDOR_SESSION_TTL_MS : SESSION_TTL_MS;
   await withTransaction(async (client) => {
     await client.query(
       `INSERT INTO sessions (user_id, token_hash, token_digest, expires_at) VALUES ($1, $2::text, $2::text, $3)`,
-      [user.id, digest, new Date(Date.now() + SESSION_TTL_MS)]
+      [user.id, digest, new Date(Date.now() + sessionTtlMs)]
     );
     // Housekeeping: drop this user's long-expired sessions.
     await client.query(`DELETE FROM sessions WHERE user_id = $1 AND expires_at < NOW() - INTERVAL '30 days'`, [user.id]);
@@ -157,7 +158,7 @@ export async function login(req, res) {
     await clearFailures(accountKey, client);
   });
 
-  res.cookie('session_token', sessionToken, buildAuthCookieOptions());
+  res.cookie('session_token', sessionToken, buildAuthCookieOptions({ maxAge: sessionTtlMs }));
   await createAuditLog({
     user: { id: user.id, username: user.username, role: user.role },
     action: 'LOGIN',
@@ -237,7 +238,8 @@ export async function me(req, res) {
 
 export async function updateProfile(req, res) {
   const userId = currentUserId(req);
-  const fullName = optionalString(req.body?.name, 200);
+  // A Kadiwa vendor's name is given by the administrator (their sales and the audit log show it).
+  const fullName = req.user.role === 'VENDOR' ? undefined : optionalString(req.body?.name, 200);
   // Member accounts do not use email; only administrators can set one.
   const email = req.user.role === 'ADMIN' ? optionalString(req.body?.email, 255) : undefined;
   const phone = optionalString(req.body?.phone, 50);

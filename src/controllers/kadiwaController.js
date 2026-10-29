@@ -3,9 +3,9 @@ import { SQL_TODAY } from '../config/env.js';
 import { capitalChange, createAuditLog } from '../utils/audit.js';
 import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, paginationMeta, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
-import { notifyAdmins } from '../services/notificationService.js';
+import { notifyAdmins, notifyUser } from '../services/notificationService.js';
 import { goodsForForm, parseExpenseLines, parseGoodsLines, presentSaleLines, salesReport } from '../services/kadiwaGoods.js';
-import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
+import { formatDateOnly, isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { PESOS_PER_BUSINESS_POINT } from '../services/patronage.js';
 
 const CATEGORIES = ['Groceries', 'Vegetables', 'Meat', 'Other'];
@@ -32,6 +32,9 @@ const salesSelect = `
   SELECT s.id, TO_CHAR(s.sale_date, 'YYYY-MM-DD') AS "saleDate", s.created_at AS date, s.encoder_name AS seller,
          s.groceries, s.vegetables, s.meat,
          s.total_expenses AS "totalExpenses", s.cost_of_goods AS "costOfGoods", s.net_sales AS "netSales", s.payment_method AS "paymentMethod", s.status,
+         -- A vendor's sale: who sent it, and the administrator who confirmed or rejected it.
+         (cb.role = 'VENDOR') AS "byVendor", s.created_by AS "createdBy", s.reviewed_at AS "reviewedAt", s.review_notes AS "reviewNotes",
+         NULLIF(TRIM(COALESCE(rv.full_name, rv.username)), '') AS "reviewedBy",
          COALESCE((SELECT json_agg(json_build_object('name', g.name, 'unit', g.unit, 'category', g.category, 'price', g.price,
                    'quantity', g.quantity, 'amount', g.amount) ORDER BY g.line_no)
                    FROM kadiwa_sale_goods g WHERE g.sale_id = s.id), '[]'::json) AS goods,
@@ -44,7 +47,7 @@ const salesSelect = `
          COALESCE((SELECT json_agg(json_build_object('memberId', p.member_id, 'memberNumber', p.member_number, 'name', p.member_name, 'amount', p.amount,
                    'points', ROUND(p.amount / ${PESOS_PER_BUSINESS_POINT}, 2)) ORDER BY p.line_no)
                    FROM kadiwa_sale_members p WHERE p.sale_id = s.id), '[]'::json) AS "memberPurchases"
-  FROM kadiwa_sales s`;
+  FROM kadiwa_sales s LEFT JOIN users cb ON cb.id = s.created_by LEFT JOIN users rv ON rv.id = s.reviewed_by`;
 const salesOrder = 's.sale_date DESC, s.created_at DESC, s.id DESC';
 const TODAY = `sale_date = ${SQL_TODAY} AND status = 'completed'`;
 // Each sale with its lines as the daily form shows them (goods, GROCERIES with the store items).
@@ -52,10 +55,10 @@ const withLines = (sale) => ({ ...sale, lines: presentSaleLines(sale) });
 
 export async function listKadiwaData(req, res) {
   const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 50, maxLimit: 200 });
-  const [inventory, sales, count, summary, goods] = await Promise.all([
+  const [inventory, sales, count, summary, goods, pending] = await Promise.all([
     query(`${inventorySelect} WHERE deleted_at IS NULL ORDER BY ${inventoryOrder}`),
-    query(`${salesSelect} ORDER BY ${salesOrder} LIMIT $1 OFFSET $2`, [limit, offset]),
-    query('SELECT COUNT(*)::int AS total FROM kadiwa_sales'),
+    query(`${salesSelect} WHERE s.status = 'completed' ORDER BY ${salesOrder} LIMIT $1 OFFSET $2`, [limit, offset]),
+    query(`SELECT COUNT(*)::int AS total FROM kadiwa_sales WHERE status = 'completed'`),
     query(
       // Today: the goods sold (revenue), their cost and the expenses, and what is left (net income).
       `SELECT COUNT(*) FILTER (WHERE ${TODAY})::int AS "todaySales",
@@ -71,8 +74,9 @@ export async function listKadiwaData(req, res) {
        FROM kadiwa_sales`
     ),
     goodsForForm({ query }),
+    query(`${salesSelect} WHERE s.status = 'pending' ORDER BY s.created_at, s.id LIMIT 200`),
   ]);
-  return res.json({ success: true, inventory: inventory.rows, sales: sales.rows.map(withLines), pagination: paginationMeta(page, limit, count.rows[0].total), summary: summary.rows[0], goods });
+  return res.json({ success: true, inventory: inventory.rows, sales: sales.rows.map(withLines), pagination: paginationMeta(page, limit, count.rows[0].total), summary: summary.rows[0], goods, pendingSales: pending.rows.map(withLines) });
 }
 
 // Sales from `from` to `to` (YYYY-MM-DD, inclusive): each sale with its lines,
@@ -99,7 +103,8 @@ export async function listKadiwaSales(req, res) {
 // reports read. Shared by the sale form and by OCR-posted Kadiwa sales forms.
 // memberPurchases: [{ memberId, amountCents }], the members who bought that day
 // and for how much (their patronage business); together never more than the day's sales.
-export async function insertKadiwaSale(client, req, { encoderName, saleDate = null, manual, expensesCents, items, goods = [], expenseLines = [], memberPurchases = [] }) {
+// pending: a vendor's sale, counted nowhere until an administrator confirms it.
+export async function insertKadiwaSale(client, req, { encoderName, saleDate = null, manual, expensesCents, items, goods = [], expenseLines = [], memberPurchases = [], pending = false }) {
   const totals = { ...manual };
   for (const good of goods) totals[good.category] = (totals[good.category] || 0) + toCents(good.amount);
   const lines = [];
@@ -157,12 +162,12 @@ export async function insertKadiwaSale(client, req, { encoderName, saleDate = nu
 
   const id = (await client.query(
     `WITH day AS (SELECT COALESCE($8::date, ${SQL_TODAY}) AS sale_date)
-     INSERT INTO kadiwa_sales (id, sale_date, encoder_name, groceries, vegetables, meat, total_expenses, cost_of_goods, net_sales, created_by)
+     INSERT INTO kadiwa_sales (id, sale_date, encoder_name, groceries, vegetables, meat, total_expenses, cost_of_goods, net_sales, created_by, status)
      SELECT 'S-' || TO_CHAR(day.sale_date, 'YYYY') || '-' || LPAD(nextval('kadiwa_sale_seq')::text, 5, '0'), day.sale_date,
-            $1, $2::numeric, $3::numeric, $4::numeric, $5::numeric, $9::numeric, $6::numeric, $7
+            $1, $2::numeric, $3::numeric, $4::numeric, $5::numeric, $9::numeric, $6::numeric, $7, $10
        FROM day
      RETURNING id`,
-    [encoderName, centsToString(groceries), centsToString(totals.Vegetables || 0), centsToString(totals.Meat || 0), centsToString(expensesCents), centsToString(net), currentUserId(req), saleDate, centsToString(costCents)]
+    [encoderName, centsToString(groceries), centsToString(totals.Vegetables || 0), centsToString(totals.Meat || 0), centsToString(expensesCents), centsToString(net), currentUserId(req), saleDate, centsToString(costCents), pending ? 'pending' : 'completed']
   )).rows[0].id;
 
   if (goods.length) {
@@ -212,13 +217,15 @@ export async function insertKadiwaSale(client, req, { encoderName, saleDate = nu
   await createAuditLog({
     client,
     user: req.user,
-    action: 'KADIWA_SALE_CREATED',
+    action: pending ? 'KADIWA_SALE_SUBMITTED' : 'KADIWA_SALE_CREATED',
     module: 'Kadiwa',
     entityType: 'kadiwa_sale',
     entityId: id,
-    description: `Recorded Kadiwa sale ${id}${encoderName ? ` by ${encoderName}` : ''}`,
+    description: pending ? `Vendor ${encoderName} sent Kadiwa sale ${id} for review` : `Recorded Kadiwa sale ${id}${encoderName ? ` by ${encoderName}` : ''}`,
     newValues: {
-      seller: encoderName, sale_date: saleDate, total_expenses: centsToString(expensesCents), cost_of_goods: centsToString(costCents), net_sales: centsToString(net), capital_change: capitalChange(net),
+      seller: encoderName, sale_date: saleDate, total_expenses: centsToString(expensesCents), cost_of_goods: centsToString(costCents), net_sales: centsToString(net),
+      // The capital changes only when the sale counts: now, or when an administrator confirms a vendor's sale.
+      ...(pending ? { status: 'pending' } : { capital_change: capitalChange(net) }),
       goods: goods.map((good) => ({ name: good.name, amount: good.amount })),
       expenses: expenseLines.map((line) => ({ description: line.description, amount: line.amount })),
       items: lines.map((line) => ({ id: line.product.id, name: line.product.label, quantity: line.quantity, unit_price: line.product.price, unit_cost: line.product.cost_price, line_total: line.lineTotal, line_cost: line.lineCost })),
@@ -286,34 +293,170 @@ function parseSaleDate(value) {
 // decrement the stock and count as GROCERIES. The older per-category amounts
 // and `totalExpenses` are still accepted. A seller name is optional: without
 // one, the sale is recorded under the name of the person who saves it.
+// Store items sold from the inventory: [{ inventoryId, quantity }].
+function parseStoreItems(value) {
+  const rawItems = Array.isArray(value) ? value.slice(0, 100) : [];
+  return rawItems.map((item) => {
+    const quantity = String(item?.quantity ?? '').trim();
+    if (!item?.inventoryId || !QUANTITY_PATTERN.test(quantity) || Number(quantity) <= 0) throw badRequest('Each store item needs a product and a quantity greater than zero.');
+    return { inventoryId: cleanString(String(item.inventoryId), 30), quantity };
+  });
+}
+
+// expensesOptional: a vendor's sale may have no expenses (none typed = none).
+function readSaleBody(body, { expensesOptional = false } = {}) {
+  const goods = parseGoodsLines(body.goods);
+  const expenseLines = parseExpenseLines(body.expenses);
+  if (goods.length && !expenseLines?.length && !expensesOptional) throw badRequest('Enter the expenses of the sale: what each was for and the amount (0 if there were none).');
+  const expensesCents = expenseLines ? expenseLines.reduce((sum, line) => sum + line.cents, 0) : parseMoneyInput(body.totalExpenses ?? 0, { allowZero: true });
+  if (expensesCents === null) throw badRequest('Total expenses must be a non-negative amount.');
+  return { saleDate: parseSaleDate(body.saleDate), goods, expenseLines: expenseLines || [], expensesCents };
+}
+
 export async function createKadiwaSale(req, res) {
   const body = req.body || {};
   const sellerName = cleanString(body.sellerName ?? body.encoderName, 200)
     || cleanString(req.user?.full_name ?? '', 200) || cleanString(req.user?.username ?? '', 200) || 'Administrator';
-  const saleDate = parseSaleDate(body.saleDate);
-  const goods = parseGoodsLines(body.goods);
+  const { saleDate, goods, expenseLines, expensesCents } = readSaleBody(body);
   const manual = {};
   for (const [field, category] of [['groceriesPrice', 'Groceries'], ['vegetablesPrice', 'Vegetables'], ['meatPrice', 'Meat']]) {
     const cents = parseMoneyInput(body[field] ?? 0, { allowZero: true });
     if (cents === null) throw badRequest('Sales amounts must be non-negative with at most two decimals.');
     manual[category] = cents;
   }
-  const expenseLines = parseExpenseLines(body.expenses);
-  if (goods.length && !expenseLines?.length) throw badRequest('Enter the expenses of the sale: what each was for and the amount (0 if there were none).');
-  const expensesCents = expenseLines ? expenseLines.reduce((sum, line) => sum + line.cents, 0) : parseMoneyInput(body.totalExpenses ?? 0, { allowZero: true });
-  if (expensesCents === null) throw badRequest('Total expenses must be a non-negative amount.');
-  const rawItems = Array.isArray(body.items) ? body.items.slice(0, 100) : [];
-  const items = rawItems.map((item) => {
-    const quantity = String(item?.quantity ?? '').trim();
-    if (!item?.inventoryId || !QUANTITY_PATTERN.test(quantity) || Number(quantity) <= 0) throw badRequest('Each store item needs a product and a quantity greater than zero.');
-    return { inventoryId: cleanString(String(item.inventoryId), 30), quantity };
-  });
+  const items = parseStoreItems(body.items);
   if (!goods.length && !items.length && Object.values(manual).every((cents) => cents === 0)) throw badRequest('Enter the amount of at least one good sold.');
   const memberPurchases = parseMemberPurchases(body.memberPurchases);
 
-  const saleId = await withTransaction((client) => insertKadiwaSale(client, req, { encoderName: sellerName, saleDate, manual, expensesCents, items, goods, expenseLines: expenseLines || [], memberPurchases }));
+  const saleId = await withTransaction((client) => insertKadiwaSale(client, req, { encoderName: sellerName, saleDate, manual, expensesCents, items, goods, expenseLines, memberPurchases }));
   const sale = await query(`${salesSelect} WHERE s.id = $1`, [saleId]);
   return res.status(201).json({ success: true, sale: withLines(sale.rows[0]) });
+}
+
+// ----- Kadiwa store vendors ------------------------------------------------------------------------
+// A vendor records the day's goods sold, the store items sold from the
+// inventory, the expenses and the members who bought (the daily sales form)
+// under their own name. The sale waits for an administrator to confirm it;
+// until then it counts nowhere. Store items leave the stock when the sale is
+// sent, so two sales cannot sell the same stock; a rejected sale puts them back.
+
+const vendorName = (user) => cleanString(user?.full_name ?? '', 200) || cleanString(user?.username ?? '', 200);
+
+// GET /api/vendor/kadiwa  The goods and store items for the form, and the vendor's own sales, newest first.
+export async function listVendorKadiwa(req, res) {
+  const [goods, sales, inventory] = await Promise.all([
+    goodsForForm({ query }),
+    query(`${salesSelect} WHERE s.created_by = $1 ORDER BY s.created_at DESC, s.id DESC LIMIT 60`, [currentUserId(req)]),
+    query(`${inventorySelect} WHERE deleted_at IS NULL ORDER BY ${inventoryOrder}`),
+  ]);
+  return res.json({ success: true, goods, inventory: inventory.rows, sales: sales.rows.map(withLines) });
+}
+
+// POST /api/vendor/kadiwa/sales { saleDate, goods, items, expenses, memberPurchases }
+export async function createVendorKadiwaSale(req, res) {
+  const body = req.body || {};
+  const { saleDate, goods, expenseLines, expensesCents } = readSaleBody(body, { expensesOptional: true });
+  const items = parseStoreItems(body.items);
+  // Expenses alone are a sale too: a day's costs are recorded even when nothing was sold.
+  if (!goods.length && !items.length && !expenseLines.length) throw badRequest('Enter the goods sold, a store item, or an expense.');
+  const memberPurchases = parseMemberPurchases(body.memberPurchases);
+  const encoderName = vendorName(req.user);
+  const saleId = await withTransaction(async (client) => {
+    const id = await insertKadiwaSale(client, req, { encoderName, saleDate, manual: {}, expensesCents, items, goods, expenseLines, memberPurchases, pending: true });
+    await notifyAdmins(client, {
+      type: 'kadiwa_sale_submitted', title: 'Kadiwa sale to review', severity: 'info', link: '/kadiwa', entityType: 'kadiwa_sale', entityId: id, dedupeKey: `kadiwa-sale-submitted-${id}`,
+      message: `${encoderName} sent the sales and expenses of ${formatDateOnly(saleDate || todayDateOnly())} (${id}) for review.`,
+    });
+    return id;
+  });
+  const sale = await query(`${salesSelect} WHERE s.id = $1`, [saleId]);
+  return res.status(201).json({ success: true, sale: withLines(sale.rows[0]) });
+}
+
+// Confirming counts a vendor's sale in the totals, reports and net income;
+// rejecting sends it back with the reason (required). Either way the audit log
+// records the administrator who did it, and the vendor is told. Runs inside
+// the caller's transaction.
+async function reviewOneSale(client, req, id, decision, notes) {
+  const status = decision === 'confirm' ? 'completed' : 'rejected';
+  const sale = (await client.query('SELECT * FROM kadiwa_sales WHERE id = $1 FOR UPDATE', [id])).rows[0];
+  if (!sale) throw notFound(`Sale ${id} not found.`);
+  if (sale.status !== 'pending') throw conflict(`Sale ${id} was already ${sale.status === 'completed' ? 'confirmed' : 'rejected'}.`);
+  await client.query(
+    'UPDATE kadiwa_sales SET status = $1, reviewed_by = $2, reviewed_at = NOW(), review_notes = $3 WHERE id = $4',
+    [status, currentUserId(req), notes || null, id]
+  );
+  // A rejected sale's store items go back to the stock they were taken from.
+  let returned = [];
+  if (decision === 'reject') {
+    // Locked in a fixed order, like a sale locks them, so this cannot deadlock with one.
+    await client.query(
+      'SELECT id FROM kadiwa_inventory WHERE id IN (SELECT inventory_id FROM kadiwa_sale_items WHERE sale_id = $1) ORDER BY id FOR UPDATE', [id]
+    );
+    returned = (await client.query(
+      `WITH sold AS (SELECT inventory_id, SUM(quantity) AS quantity FROM kadiwa_sale_items WHERE sale_id = $1 GROUP BY inventory_id)
+       UPDATE kadiwa_inventory i SET stock = i.stock + sold.quantity, updated_at = NOW()
+       FROM sold WHERE sold.inventory_id = i.id
+       RETURNING i.id, i.name, sold.quantity`, [id]
+    )).rows;
+  }
+  const net = toCents(sale.net_sales);
+  const gross = toCents(sale.groceries) + toCents(sale.vegetables) + toCents(sale.meat);
+  await createAuditLog({
+    client,
+    user: req.user,
+    action: decision === 'confirm' ? 'KADIWA_SALE_CONFIRMED' : 'KADIWA_SALE_REJECTED',
+    module: 'Kadiwa',
+    entityType: 'kadiwa_sale',
+    entityId: id,
+    description: `${decision === 'confirm' ? 'Confirmed' : 'Rejected'} Kadiwa sale ${id} of vendor ${sale.encoder_name} (${formatDateOnly(sale.sale_date)})`,
+    oldValues: { status: 'pending' },
+    newValues: {
+      status, vendor: sale.encoder_name, sale_date: sale.sale_date, total_sales: centsToString(gross), total_expenses: sale.total_expenses, net_sales: sale.net_sales,
+      ...(decision === 'confirm' ? { capital_change: capitalChange(net) } : { reason: notes, stock_returned: returned.map((row) => ({ id: row.id, name: row.name, quantity: row.quantity })) }),
+      ...(decision === 'confirm' && notes ? { notes } : {}),
+    },
+    targetUserId: sale.created_by,
+    ...getRequestMeta(req),
+  });
+  if (sale.created_by) {
+    await notifyUser(client, sale.created_by, decision === 'confirm'
+      ? { type: 'kadiwa_sale_confirmed', title: 'Sale confirmed', severity: 'success', link: '/vendor', entityType: 'kadiwa_sale', entityId: id, dedupeKey: `kadiwa-sale-reviewed-${id}`,
+        message: `Your sales of ${formatDateOnly(sale.sale_date)} (${id}) were confirmed.${notes ? ` Note: ${notes}` : ''}` }
+      : { type: 'kadiwa_sale_rejected', title: 'Sale rejected', severity: 'warning', link: '/vendor', entityType: 'kadiwa_sale', entityId: id, dedupeKey: `kadiwa-sale-reviewed-${id}`,
+        message: `Your sales of ${formatDateOnly(sale.sale_date)} (${id}) were rejected: ${notes} Please send them again, corrected.` });
+  }
+}
+
+function readDecision(body) {
+  const decision = body?.decision;
+  if (decision !== 'confirm' && decision !== 'reject') throw badRequest('Choose to confirm or reject the sale.');
+  const notes = cleanString(body?.notes ?? '', 1000);
+  if (decision === 'reject' && !notes) throw badRequest('Enter the reason the sale is rejected, so the vendor can correct it.');
+  return { decision, notes };
+}
+
+// POST /api/kadiwa/sales/:id/review { decision: confirm | reject, notes }
+export async function reviewKadiwaSale(req, res) {
+  const id = cleanString(String(req.params.id ?? ''), 30);
+  const { decision, notes } = readDecision(req.body);
+  await withTransaction((client) => reviewOneSale(client, req, id, decision, notes));
+  const sale = await query(`${salesSelect} WHERE s.id = $1`, [id]);
+  return res.json({ success: true, sale: withLines(sale.rows[0]) });
+}
+
+// POST /api/kadiwa/sales/review { ids, decision, notes }
+// One vendor's report for a day, sent in several parts: every part confirmed
+// or rejected together, or none if one cannot be (already reviewed, not found).
+export async function reviewKadiwaSales(req, res) {
+  const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : []).map((value) => cleanString(String(value ?? ''), 30)).filter(Boolean))].sort();
+  if (!ids.length || ids.length > 100) throw badRequest('Choose the sales to review (at most 100).');
+  const { decision, notes } = readDecision(req.body);
+  await withTransaction(async (client) => {
+    for (const id of ids) await reviewOneSale(client, req, id, decision, notes);
+  });
+  const sales = await query(`${salesSelect} WHERE s.id = ANY($1::varchar[]) ORDER BY s.created_at, s.id`, [ids]);
+  return res.json({ success: true, sales: sales.rows.map(withLines) });
 }
 
 // Parses one product from the add sheet or the edit form: its name, size

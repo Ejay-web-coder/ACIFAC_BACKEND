@@ -1,6 +1,6 @@
 import express from 'express';
 import { createMemberAccount, getAccount, listAccounts, listAuditLogs, listMembersWithoutAccounts, resetMemberPassword, sendEmailTest, updateAccountStatus } from '../controllers/adminController.js';
-import { checkAdminContact, confirmAdminContactCode, createAdminAccount, sendAdminContactCode } from '../controllers/adminAccountController.js';
+import { checkAdminContact, confirmAdminContactCode, createAdminAccount, createVendorAccount, sendAdminContactCode, setVendorPassword, updateVendorAccount } from '../controllers/adminAccountController.js';
 import { requireAdmin, requireAuth } from '../middleware/auth.js';
 import { downloadLoanId, downloadLoanRequestId, downloadLoanRequestSignature, downloadLoanSignature, getLoan, getMemberLoanHistory, listLoanRequests, listLoans, listPayments, recordPayment, restructureLoanRequest, reviewLoanRequest } from '../controllers/loanController.js';
 import { createLoanWithIds } from '../controllers/loanIdController.js';
@@ -20,6 +20,10 @@ router.get('/accounts/admin-check', checkAdminContact);
 router.post('/accounts/admin-verifications', sendAdminContactCode);
 router.post('/accounts/admin-verifications/:id/confirm', confirmAdminContactCode);
 router.post('/accounts/admins', createAdminAccount);
+// Kadiwa store vendors: a name, username and password the administrator gives, changed here too.
+router.post('/accounts/vendors', createVendorAccount);
+router.patch('/accounts/vendors/:id', updateVendorAccount);
+router.post('/accounts/vendors/:id/password', setVendorPassword);
 router.get('/accounts/:id', getAccount);
 router.post('/accounts', createMemberAccount);
 router.patch('/accounts/:id/status', updateAccountStatus);

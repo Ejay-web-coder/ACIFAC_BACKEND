@@ -230,3 +230,102 @@ export async function createAdminAccount(req, res) {
     message: `${fullName} can now sign in as ${position} with the username ${username}, the email or the mobile number, and must choose a new password at first sign-in.`,
   });
 }
+
+// ----- Kadiwa store vendors ------------------------------------------------------------------------
+// A vendor account has a name, a username and a password the administrator
+// gives (no email or mobile number needed). The vendor signs in with the
+// username and can only send the Kadiwa store's daily sales and expenses for
+// review. The administrator can change the vendor's name and password later.
+
+function readVendorPassword(body) {
+  if (!body.password || body.password !== body.confirmPassword) throw badRequest('The passwords do not match.');
+  const policy = validatePasswordPolicy(body.password);
+  if (!policy.isValid) throw badRequest(policy.errors[0]);
+  return body.password;
+}
+
+function readVendorName(value) {
+  const fullName = cleanString(value, 200);
+  if (fullName.length < 3) throw badRequest('Enter the vendor\'s full name.');
+  return fullName;
+}
+
+async function lockVendor(client, id) {
+  const vendor = (await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [id])).rows[0];
+  if (!vendor) throw notFound('Account not found.');
+  if (vendor.role !== 'VENDOR') throw badRequest('This is not a Kadiwa vendor account.');
+  return vendor;
+}
+
+// POST /api/admin/accounts/vendors { fullName, username, password, confirmPassword }
+export async function createVendorAccount(req, res) {
+  const body = req.body || {};
+  const fullName = readVendorName(body.fullName);
+  const username = cleanString(body.username, 100).toLowerCase();
+  if (!USERNAME.test(username)) throw badRequest('Username: use 3 or more lowercase letters, numbers, dots, dashes or underscores.');
+  const passwordHash = await hashPassword(readVendorPassword(body));
+
+  const created = await withTransaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['admin-account-create']);
+    const problem = await usernameConflict(username, client);
+    if (problem) throw conflict(problem);
+    const user = (await client.query(
+      `INSERT INTO users (username, password_hash, role, account_status, must_change_password, full_name, position, created_by, created_at, updated_at)
+       VALUES ($1, $2, 'VENDOR', 'ACTIVE', FALSE, $3, 'Kadiwa Store Vendor', $4, NOW(), NOW()) RETURNING *`,
+      [username, passwordHash, fullName, currentUserId(req)]
+    )).rows[0];
+    await createAuditLog({
+      client, user: req.user, action: 'VENDOR_ACCOUNT_CREATED', module: 'Accounts', entityType: 'user', entityId: String(user.id),
+      description: `Created the Kadiwa vendor account of ${fullName}`,
+      newValues: { username, full_name: fullName, role: 'VENDOR' },
+      targetUserId: user.id, ...getRequestMeta(req),
+    });
+    return user;
+  });
+  return res.status(201).json({
+    success: true, user: sanitizeUser(created),
+    message: `${fullName} can now sign in with the username ${username} and the password you gave.`,
+  });
+}
+
+// PATCH /api/admin/accounts/vendors/:id { fullName }
+export async function updateVendorAccount(req, res) {
+  const id = parseId(req.params.id, 'account ID');
+  const fullName = readVendorName(req.body?.fullName);
+  const updated = await withTransaction(async (client) => {
+    const vendor = await lockVendor(client, id);
+    if (vendor.full_name === fullName) return vendor;
+    const row = (await client.query('UPDATE users SET full_name = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [fullName, id])).rows[0];
+    await createAuditLog({
+      client, user: req.user, action: 'VENDOR_ACCOUNT_UPDATED', module: 'Accounts', entityType: 'user', entityId: String(id),
+      description: `Renamed Kadiwa vendor ${vendor.full_name || vendor.username} to ${fullName}`,
+      oldValues: { full_name: vendor.full_name }, newValues: { full_name: fullName },
+      targetUserId: id, ...getRequestMeta(req),
+    });
+    return row;
+  });
+  return res.status(200).json({ success: true, user: sanitizeUser(updated), message: 'Vendor name saved.' });
+}
+
+// POST /api/admin/accounts/vendors/:id/password { password, confirmPassword }
+// Sets a new password and signs the vendor out everywhere.
+export async function setVendorPassword(req, res) {
+  const id = parseId(req.params.id, 'account ID');
+  const passwordHash = await hashPassword(readVendorPassword(req.body || {}));
+  const vendor = await withTransaction(async (client) => {
+    const row = await lockVendor(client, id);
+    await client.query(
+      'UPDATE users SET password_hash = $1, must_change_password = FALSE, password_changed_at = NOW(), updated_at = NOW() WHERE id = $2',
+      [passwordHash, id]
+    );
+    const revoked = await client.query('UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL', [id]);
+    await createAuditLog({
+      client, user: req.user, action: 'VENDOR_PASSWORD_CHANGED', module: 'Accounts', entityType: 'user', entityId: String(id),
+      description: `Changed the password of Kadiwa vendor ${row.full_name || row.username}`,
+      newValues: { revoked_sessions: revoked.rowCount },
+      targetUserId: id, ...getRequestMeta(req),
+    });
+    return row;
+  });
+  return res.status(200).json({ success: true, message: `New password set for ${vendor.full_name || vendor.username}. They sign in again with it.` });
+}

@@ -11,6 +11,7 @@ import adminRoutes from './routes/adminRoutes.js';
 import memberRoutes from './routes/memberRoutes.js';
 import machineryRoutes from './routes/machineryRoutes.js';
 import kadiwaRoutes from './routes/kadiwaRoutes.js';
+import vendorRoutes from './routes/vendorRoutes.js';
 import ocrRoutes from './routes/ocrRoutes.js';
 import loanRoutes from './routes/loanRoutes.js';
 import attendanceRoutes from './routes/attendanceRoutes.js';
@@ -85,6 +86,7 @@ export function createApp() {
   app.use('/api/loans', loanRoutes);
   app.use('/api/machinery', machineryRoutes);
   app.use('/api/kadiwa', kadiwaRoutes);
+  app.use('/api/vendor', vendorRoutes);
   app.use('/api/ocr', ocrRoutes);
   app.use('/api/attendance', attendanceRoutes);
   app.use('/api/notifications', notificationRoutes);

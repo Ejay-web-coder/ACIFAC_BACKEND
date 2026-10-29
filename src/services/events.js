@@ -28,6 +28,8 @@ let stopped = false;
 export function canReceiveEvent(user, event) {
   if (!user || !event?.table) return false;
   if (user.role === 'ADMIN') return event.table !== 'notifications' || Number(event.userId) === Number(user.user_id);
+  // A Kadiwa vendor follows their sales (confirmed or rejected), the store's stock and their notifications.
+  if (user.role === 'VENDOR') return event.table === 'kadiwa_sales' || event.table === 'kadiwa_inventory' || (event.table === 'notifications' && Number(event.userId) === Number(user.user_id));
   if (ADMIN_ONLY_TABLES.has(event.table)) return false;
   if (PUBLIC_TABLES.has(event.table)) return true;
   if (event.table === 'notifications') return Number(event.userId) === Number(user.user_id);

@@ -216,16 +216,19 @@ export async function refreshLoanStatuses({ force = false } = {}) {
     );
 
     const money = `'PHP ' || to_char(i.amount_due - i.amount_paid, 'FM999,999,990.00')`;
-    // Member: installment due within 3 days (respects the loan reminder preference).
+    // Member: a 6-month loan due within 2 days, reminded once by notification,
+    // email and SMS (respects the loan reminder preference). Loans repaid
+    // monthly (from before) get no reminder each month, only when overdue.
     const dueSoon = await query(
       `INSERT INTO notifications (user_id, type, title, message, severity, link, entity_type, entity_id, dedupe_key)
        SELECT u.id, 'payment_due', 'Loan payment due soon',
-              format('Installment %s of loan %s (%s) is due on %s.', i.installment_number, l.loan_number, ${money}, to_char(i.due_date, 'FMMonth DD, YYYY')),
+              format('Your loan %s (%s) is due on %s.', l.loan_number, ${money}, to_char(i.due_date, 'FMMonth DD, YYYY')),
               'warning', '/loan-status', 'loan', l.id::text, 'installment-due-' || i.id
        FROM loan_installments i
        JOIN loans l ON l.id = i.loan_id AND l.status <> 'paid'
        JOIN users u ON u.member_id = l.member_id AND u.account_status = 'ACTIVE'
-       WHERE i.amount_paid < i.amount_due AND i.superseded_by IS NULL AND i.due_date BETWEEN ${SQL_TODAY} AND ${SQL_TODAY} + 3
+       WHERE i.amount_paid < i.amount_due AND i.superseded_by IS NULL AND i.due_date BETWEEN ${SQL_TODAY} AND ${SQL_TODAY} + 2
+         AND l.repayment = 'single'
          AND COALESCE((u.notification_preferences ->> 'loanReminders')::boolean, true)
        ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
        RETURNING user_id, title, message`
