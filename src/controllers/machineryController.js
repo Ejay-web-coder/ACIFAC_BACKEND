@@ -73,6 +73,24 @@ export async function refreshRentalStatuses(db = null) {
      ) next
      WHERE m.id = next.id AND m.status IS DISTINCT FROM next.status`
   );
+  // The office is told when an approved booking's days begin (member or
+  // non-member): each admin once per booking, from its start date until it
+  // ends (one approved on its start date is told at once).
+  await run(
+    `INSERT INTO notifications (user_id, type, title, message, severity, link, entity_type, entity_id, dedupe_key)
+     SELECT a.id, 'booking_due', 'Machine booking starts today',
+            format('%s: %s%s, %s%s. Purpose: %s.', o.machinery_name, o.member_name,
+                   CASE WHEN o.client_category = 'non_member' THEN ' (non-member)' ELSE '' END,
+                   to_char(o.start_date, 'FMMonth DD, YYYY'),
+                   CASE WHEN o.end_date > o.start_date THEN ' to ' || to_char(o.end_date, 'FMMonth DD, YYYY') ELSE '' END,
+                   o.purpose),
+            'info', '/machinery', 'machinery_operation', o.id::text, 'booking-due-' || o.id
+     FROM machinery_operations o
+     CROSS JOIN users a
+     WHERE a.role = 'ADMIN' AND a.account_status = 'ACTIVE'
+       AND o.status <> 'completed' AND o.start_date <= ${SQL_TODAY} AND o.end_date >= ${SQL_TODAY}
+     ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`
+  );
 }
 
 async function assertNoOverlap(client, machineryId, startDate, endDate, excludeRequestId = null) {

@@ -1078,6 +1078,23 @@ test('machinery: the booking calendar shows which machine is free each day; a bo
   assert.equal(wrong.status, 400, 'a booking belongs to its own machine');
   assert.equal((await admin.request('DELETE', `/api/machinery/services/${service.data.service.id}`)).status, 200);
   assert.equal((await admin.patch(`/api/machinery/requests/${asked.data.request.id}`, { status: 'declined' })).status, 200);
+
+  // The office is told on the day an approved booking starts, once per admin, member or non-member.
+  const { refreshRentalStatuses } = await import('../src/controllers/machineryController.js');
+  const dueToday = await admin.post('/api/machinery/requests', { machineryId: 'RT-01', clientCategory: 'non_member', clientName: 'Lito Manalo', startDate: today, endDate: plus(1), purpose: 'Land preparation' });
+  assert.equal(dueToday.status, 201, JSON.stringify(dueToday.data));
+  assert.equal((await admin.patch(`/api/machinery/requests/${dueToday.data.request.id}`, { status: 'approved' })).status, 200);
+  await refreshRentalStatuses();
+  await refreshRentalStatuses();
+  const operations = (await admin.get('/api/machinery?limit=200')).data.operations;
+  const todayOp = operations.find((row) => row.rentalRequestId === dueToday.data.request.id);
+  const laterOp = operations.find((row) => row.rentalRequestId === office.data.request.id);
+  const admins = (await pool.query(`SELECT COUNT(*)::int AS count FROM users WHERE role = 'ADMIN' AND account_status = 'ACTIVE'`)).rows[0].count;
+  const told = (await pool.query(`SELECT title, message FROM notifications WHERE type = 'booking_due' AND dedupe_key = $1`, [`booking-due-${todayOp.id}`])).rows;
+  assert.equal(told.length, admins, 'each admin once, however often the statuses are refreshed');
+  assert.match(told[0].message, /^Rotavator w\/ Tractor 1: Lito Manalo \(non-member\), .* to .*\. Purpose: Land preparation\.$/);
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM notifications WHERE dedupe_key = $1`, [`booking-due-${laterOp.id}`])).rows[0].count, 0, 'not before its day');
+  assert.equal((await admin.request('PATCH', `/api/machinery/operations/${todayOp.id}`, { body: { status: 'completed' } })).status, 200);
 });
 
 test('machinery analytics: utilization, revenue and cost, alerts, downtime, ROI and recommendations', { skip }, async () => {
