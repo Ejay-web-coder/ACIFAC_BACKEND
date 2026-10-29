@@ -1,4 +1,9 @@
 import { query } from '../config/db.js';
+import { centsToString } from './money.js';
+
+// How a money action changes the cooperative's capital (the dashboard's
+// Capital card), signed, for the audit log: "+1500.00" in, "-25000.00" out.
+export const capitalChange = (cents) => `${cents < 0 ? '-' : '+'}${centsToString(Math.abs(cents))}`;
 
 const SENSITIVE_FIELD_NAMES = new Set([
   'password',

@@ -7,37 +7,44 @@ import { SQL_TODAY } from '../config/env.js';
 import { centsToString, toCents } from '../utils/money.js';
 import { paymentHours } from './officeHours.js';
 
-// ACIFAC agricultural loan policy (unchanged from the existing system):
+// ACIFAC agricultural loan policy:
 //   * maximum loan = farm area (ha) x PHP 50,000
 //   * interest = 2.5% of the principal, charged once for the whole term (flat)
 //   * total repayment = principal + interest
-//   * repaid in `term` equal monthly installments, the first due one month
-//     after approval; the last installment absorbs centavo rounding
-//     (interest is split with FLOOR so no installment can go negative).
+//   * a loan is for `loanTerm` (6) months, due in full 6 months after approval
+//     (repayment 'single'); the borrower may pay it in parts before then.
+//   * restructuring: once `renewalMinPaidPercent` (80%) of the total is paid,
+//     the borrower may take a new loan; what is still owed on the old one is
+//     deducted from the new loan's proceeds and closes the old loan.
+// Loans made before October 2026 were repaid in `term` equal monthly
+// installments, the first due one month after approval, the last absorbing
+// centavo rounding (repayment 'monthly'); they keep their schedules.
 // Requests submitted before migration 011 stored no rate; those keep the
 // historical 8% rate they were quoted.
 export const LOAN_POLICY = Object.freeze({
   maxLoanPerHectare: '50000',
   interestRate: '2.5',
   legacyInterestRate: '8',
-  minTerm: 1,
-  maxTerm: 60,
+  loanTerm: 6,
+  repayment: 'single',
+  renewalMinPaidPercent: 80,
   interestMethod: 'flat',
-  scheduleFrequency: 'monthly',
+  scheduleFrequency: 'one payment at the end of the term',
 });
 
 function runner(db) {
   return db && typeof db.query === 'function' ? db.query.bind(db) : query;
 }
 
-// All money arithmetic happens in PostgreSQL NUMERIC.
-export async function calculateLoanFinancials(db, { farmArea, amount, term, interestRate = LOAN_POLICY.interestRate }) {
+// All money arithmetic happens in PostgreSQL NUMERIC. monthly_payment is the
+// amount of each installment: the whole total for a single-payment loan.
+export async function calculateLoanFinancials(db, { farmArea, amount, term, interestRate = LOAN_POLICY.interestRate, single = LOAN_POLICY.repayment === 'single' }) {
   const result = await runner(db)(
     `SELECT ROUND($1::numeric * $2::numeric, 2) AS maximum_eligible_amount,
             ROUND($3::numeric * ($4::numeric / 100), 2) AS calculated_interest,
             ROUND($3::numeric + ROUND($3::numeric * ($4::numeric / 100), 2), 2) AS total_repayment,
             ROUND(ROUND($3::numeric + ROUND($3::numeric * ($4::numeric / 100), 2), 2) / $5::numeric, 2) AS monthly_payment`,
-    [farmArea ?? 0, LOAN_POLICY.maxLoanPerHectare, amount, interestRate, term]
+    [farmArea ?? 0, LOAN_POLICY.maxLoanPerHectare, amount, interestRate, single ? 1 : term]
   );
   return result.rows[0];
 }
@@ -48,39 +55,42 @@ export async function calculateLoanFinancials(db, { farmArea, amount, term, inte
 // does. The loan's due date is its last installment's.
 export async function createInstallments(client, loanId) {
   const loan = (await client.query(
-    `SELECT term, date_approved,
+    `SELECT term, date_approved, repayment,
             COALESCE(total_repayment, ROUND(amount + ROUND(amount * interest_rate / 100, 2), 2)) AS total,
             COALESCE(calculated_interest, ROUND(amount * interest_rate / 100, 2)) AS interest
      FROM loans WHERE id = $1`,
     [loanId]
   )).rows[0];
-  if (loan) await insertSchedule(client, loanId, { total: loan.total, interest: loan.interest, term: loan.term, start: loan.date_approved, firstNumber: 1 });
+  if (loan) await insertSchedule(client, loanId, { total: loan.total, interest: loan.interest, term: loan.term, start: loan.date_approved, firstNumber: 1, single: loan.repayment === 'single' });
 }
 
-// Adds `term` monthly installments numbered from firstNumber, the first due
-// one month after `start`, sharing `total` (of which `interest` is interest)
-// as described above, and makes the loan's due date its last installment's.
-async function insertSchedule(client, loanId, { total, interest, term, start, firstNumber }) {
+// Adds the installments numbered from firstNumber that share `total` (of which
+// `interest` is interest): for a single-payment loan one installment of the
+// whole amount due `term` months after `start`; otherwise `term` monthly
+// installments, the first due one month after `start`, as described above.
+// The loan's due date becomes its last installment's.
+async function insertSchedule(client, loanId, { total, interest, term, start, firstNumber, single = false }) {
   await client.query(
     `WITH base AS (
-       SELECT $3::numeric AS total, $4::numeric AS interest, $5::int AS term, $6::date AS start
+       SELECT $3::numeric AS total, $4::numeric AS interest, $5::int AS term, $6::date AS start,
+              CASE WHEN $8::boolean THEN 1 ELSE $5::int END AS count
      ), parts AS (
-       SELECT b.*, n,
-              CASE WHEN n < b.term THEN ROUND(b.total / b.term, 2) ELSE b.total - ROUND(b.total / b.term, 2) * (b.term - 1) END AS amount_due,
-              CASE WHEN n < b.term THEN FLOOR(b.interest * 100 / b.term) / 100 ELSE b.interest - (FLOOR(b.interest * 100 / b.term) / 100) * (b.term - 1) END AS interest_due
-       FROM base b CROSS JOIN LATERAL generate_series(1, b.term) AS n
+       SELECT b.*, n, CASE WHEN $8::boolean THEN b.term ELSE n END AS months,
+              CASE WHEN n < b.count THEN ROUND(b.total / b.count, 2) ELSE b.total - ROUND(b.total / b.count, 2) * (b.count - 1) END AS amount_due,
+              CASE WHEN n < b.count THEN FLOOR(b.interest * 100 / b.count) / 100 ELSE b.interest - (FLOOR(b.interest * 100 / b.count) / 100) * (b.count - 1) END AS interest_due
+       FROM base b CROSS JOIN LATERAL generate_series(1, b.count) AS n
      )
      INSERT INTO loan_installments (loan_id, installment_number, due_date, amount_due, principal_due, interest_due)
      SELECT $1, $7::int + n - 1, due.day, amount_due, GREATEST(amount_due - interest_due, 0), LEAST(interest_due, amount_due)
      FROM parts
      CROSS JOIN LATERAL (
-       SELECT ((start + make_interval(months => n))::date + k) AS day
+       SELECT ((start + make_interval(months => months))::date + k) AS day
        FROM generate_series(0, 6) AS k
-       WHERE EXTRACT(ISODOW FROM (start + make_interval(months => n))::date + k)::int = ANY($2::int[])
+       WHERE EXTRACT(ISODOW FROM (start + make_interval(months => months))::date + k)::int = ANY($2::int[])
        ORDER BY k LIMIT 1
      ) due
      ON CONFLICT (loan_id, installment_number) DO NOTHING`,
-    [loanId, paymentHours().days, total, interest, term, start, firstNumber]
+    [loanId, paymentHours().days, total, interest, term, start, firstNumber, single]
   );
   await client.query(
     `UPDATE loans SET due_date = last.due_date FROM (SELECT MAX(due_date) AS due_date FROM loan_installments WHERE loan_id = $1 AND superseded_by IS NULL) last
@@ -89,72 +99,9 @@ async function insertSchedule(client, loanId, { total, interest, term, start, fi
   );
 }
 
-// Restructures an open loan in place, inside the caller's transaction with the
-// loan row locked and its state just recomputed. What is still owed, the open
-// part of every installment not yet paid, is carried into `term` new monthly
-// installments from restructuredOn, plus interestRate% of it (flat, once). The
-// open installments are marked as replaced (superseded_by): their unpaid
-// interest stays interest and their unpaid principal stays principal, so the
-// payments that follow split the same way. The loan keeps its number, payments
-// and original amount and term; its total, interest, monthly payment and due
-// date change. Returns the restructuring row.
-export async function restructureLoan(client, loanId, { term, interestRate, reason, restructuredOn, userId }) {
-  const open = (await client.query(
-    `SELECT COALESCE(SUM(principal_due - principal_paid), 0) AS principal,
-            COALESCE(SUM(interest_due - interest_paid), 0) AS interest,
-            COALESCE(SUM(amount_due - amount_paid) FILTER (WHERE due_date < $2::date), 0) AS overdue_amount,
-            COUNT(*) FILTER (WHERE due_date < $2::date)::int AS overdue_installments,
-            (SELECT MAX(installment_number) FROM loan_installments WHERE loan_id = $1) AS last_number,
-            (SELECT balance FROM loans WHERE id = $1) AS balance,
-            (SELECT due_date FROM loans WHERE id = $1) AS due_date
-     FROM loan_installments WHERE loan_id = $1 AND amount_paid < amount_due AND superseded_by IS NULL`,
-    [loanId, restructuredOn]
-  )).rows[0];
-  const principalCents = toCents(open.principal);
-  const interestCents = toCents(open.interest);
-  if (principalCents + interestCents <= 0) throw new Error(`Loan ${loanId} has nothing left to restructure.`);
-  if (principalCents + interestCents !== toCents(open.balance)) throw new Error(`Installment schedule does not match balance for loan ${loanId}.`);
-
-  const restructuring = (await client.query(
-    `WITH figures AS (
-       SELECT $4::numeric AS principal, $5::numeric AS interest, $4::numeric + $5::numeric AS carried,
-              ROUND(($4::numeric + $5::numeric) * $8::numeric / 100, 2) AS added
-     )
-     INSERT INTO loan_restructurings (loan_id, restructured_on, reason, balance_carried, principal_carried, interest_carried, overdue_amount, overdue_installments,
-                                      interest_rate, added_interest, new_term, new_monthly_payment, previous_due_date, new_due_date, first_installment_number, recorded_by)
-     SELECT $1, $2::date, $3, carried, principal, interest, $6::numeric, $7::int, $8::numeric, added, $9::int, ROUND((carried + added) / $9::int, 2), $10::date, $10::date, $11::int, $12::int
-     FROM figures
-     RETURNING *`,
-    [loanId, restructuredOn, reason, centsToString(principalCents), centsToString(interestCents), open.overdue_amount, open.overdue_installments,
-      interestRate, term, open.due_date, Number(open.last_number) + 1, userId]
-  )).rows[0];
-
-  await client.query(
-    'UPDATE loan_installments SET superseded_by = $2, updated_at = NOW() WHERE loan_id = $1 AND amount_paid < amount_due AND superseded_by IS NULL',
-    [loanId, restructuring.id]
-  );
-  const addedCents = toCents(restructuring.added_interest);
-  await insertSchedule(client, loanId, {
-    total: centsToString(principalCents + interestCents + addedCents), interest: centsToString(interestCents + addedCents),
-    term, start: restructuredOn, firstNumber: restructuring.first_installment_number,
-  });
-  await client.query(
-    `UPDATE loans
-     SET total_repayment = COALESCE(total_repayment, ROUND(amount + ROUND(amount * interest_rate / 100, 2), 2)) + $2::numeric,
-         calculated_interest = COALESCE(calculated_interest, ROUND(amount * interest_rate / 100, 2)) + $2::numeric,
-         monthly_payment = $3::numeric, updated_at = NOW()
-     WHERE id = $1`,
-    [loanId, restructuring.added_interest, restructuring.new_monthly_payment]
-  );
-  return (await client.query(
-    `UPDATE loan_restructurings r SET new_due_date = l.due_date FROM loans l WHERE r.id = $1 AND l.id = r.loan_id RETURNING r.*`,
-    [restructuring.id]
-  )).rows[0];
-}
-
 // Applies a payment to the oldest unpaid installments, interest portion first
 // (the same order the previous implementation used). Works in centavos.
-// Installments replaced by a restructuring are no longer due (see restructureLoan).
+// Installments replaced by an earlier (reschedule) restructuring are no longer due.
 export async function allocatePayment(client, loanId, amountCents, paymentDate) {
   const installments = await client.query(
     `SELECT id, amount_due, amount_paid, interest_due, interest_paid, principal_due, principal_paid

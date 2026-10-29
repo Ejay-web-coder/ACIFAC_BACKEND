@@ -1,30 +1,28 @@
 import { SQL_TODAY, TIME_ZONE } from '../../src/config/env.js';
 import { LOAN_POLICY } from '../../src/services/loanService.js';
 import { paymentHours } from '../../src/services/officeHours.js';
-import { centsToString, toCents } from '../../src/utils/money.js';
+import { centsToString } from '../../src/utils/money.js';
 import { addDays, addMonths, officeDayOnOrBefore } from './support.js';
 
 // A year and more of loans for the generated members (the named ones get
-// theirs in loans.js): loans paid off, loans being paid on time or late,
-// overdue loans, second loans of members who paid off the first, applications
-// waiting for a decision and declined ones. The loans follow the Loans page's
-// policy (at most farm area x PHP 50,000, 2.5% flat interest, equal monthly
-// installments due on office days, the last one absorbing the rounding) and
-// payments pay the oldest installment in full, interest first, as the Payments
-// page allocates them. Everything is written a statement at a time for all
-// loans together: per loan through the app's helpers it would take minutes
-// across the internet.
-//   pattern: [kind, months ago approved or days ago submitted, term, how installments are paid]
+// theirs in loans.js): loans paid off (on time, early or late), loans not due
+// yet, overdue loans, second loans of members who paid off the first,
+// applications waiting for a decision and declined ones. The loans follow the
+// Loans page's policy (at most farm area x PHP 50,000, 2.5% flat interest, 6
+// months, one payment of the whole amount due 6 months after approval on an
+// office day) and are paid in full at once, as the Payments page requires.
+// Everything is written a statement at a time for all loans together: per
+// loan through the app's helpers it would take minutes across the internet.
+//   pattern: [kind, months ago approved or days ago submitted, how it is paid]
+const TERM = LOAN_POLICY.loanTerm;
 const PATTERNS = [
-  ['paid', 13, 6, 'on time'], ['paid', 11, 6, 'mixed'], ['active', 4, 10, 'on time'], ['active', 2, 6, 'on time'], ['overdue', 6, 8, 2],
-  ['paid', 9, 6, 'on time'], ['active', 5, 12, 'mixed'], ['pending', 4], ['active', 1, 6, 'on time'], ['declined', 35],
-  ['paid', 14, 8, 'on time'], ['active', 3, 8, 'late'], ['overdue', 5, 6, 1], ['active', 6, 12, 'on time'], ['pending', 9],
+  ['paid', 13, 'on time'], ['paid', 11, 'late'], ['active', 4], ['active', 2], ['overdue', 8],
+  ['paid', 9, 'early'], ['active', 5], ['pending', 4], ['active', 1], ['declined', 35],
+  ['paid', 14, 'on time'], ['active', 3], ['overdue', 7], ['paid', 7, 'on time'], ['pending', 9],
 ];
 const PURPOSES = {
   agricultural: ['Seeds and fertilizer for the wet season rice crop.', 'Land preparation and hired labor for the coming planting.', 'Fertilizer and pesticide for the dry season crop.',
     'Certified palay seeds and fertilizer.', 'Hybrid corn seeds and fertilizer.'],
-  personal: ['House repair after the typhoon.', 'Tuition of a child in college.'],
-  emergency: ['Hospital bills.', 'Medicine for a family member.'],
 };
 const DECLINE_REASONS = ['The member has an unpaid balance with the cooperative.', 'The requested amount is more than the farm area allows this season.'];
 const RELATIONS = ['Brother', 'Sister', 'Cousin', 'Neighbor', 'Spouse'];
@@ -32,15 +30,16 @@ const stamp = (dayParam, time) => `((${dayParam})::date + TIME '${time}') AT TIM
 
 // The loan of a member, from the pattern: amount, type, dates and how it is paid.
 function planFor(member, n, today) {
-  const [kind, ago, term, paying] = PATTERNS[n % PATTERNS.length];
+  const [kind, ago, paying] = PATTERNS[n % PATTERNS.length];
   const eligibleCents = Math.round(Number(member.farmArea) * Number(LOAN_POLICY.maxLoanPerHectare) * 100);
-  const type = n % 11 === 7 ? 'personal' : n % 13 === 5 ? 'emergency' : 'agricultural';
+  // ACIFAC gives agricultural loans only.
+  const type = 'agricultural';
   const share = [0.5, 0.6, 0.8, 0.4, 0.7][n % 5];
   const amountCents = Math.max(500000, Math.min(eligibleCents, Math.floor((eligibleCents * share) / 500000) * 500000));
   const submittedOn = kind === 'pending' || kind === 'declined' ? addDays(today, -ago) : addDays(officeDayOnOrBefore(addMonths(today, -ago)), -4);
   if (submittedOn < addDays(member.membershipDate, 30)) return null;
   return {
-    member, kind, type, term: term || 6, paying, amountCents, submittedOn,
+    member, kind, type, term: TERM, paying, amountCents, submittedOn,
     approvedOn: kind === 'pending' || kind === 'declined' ? null : officeDayOnOrBefore(addMonths(today, -ago)),
     purpose: PURPOSES[type][n % PURPOSES[type].length],
   };
@@ -54,7 +53,7 @@ export default async function seedLoanHistory(ctx) {
   for (const [n, first] of plans.filter((plan) => plan.kind === 'paid').entries()) {
     if (n % 2) continue;
     const again = planFor(first.member, 2 + (n % 3) * 5, today);
-    if (again && again.kind === 'active' && again.submittedOn > addMonths(first.approvedOn, first.term)) plans.push(again);
+    if (again && again.kind === 'active' && again.submittedOn > addMonths(first.approvedOn, TERM)) plans.push(again);
   }
   if (!plans.length) return;
 
@@ -112,7 +111,7 @@ export default async function seedLoanHistory(ctx) {
        date_approved, due_date, next_payment_date, monthly_payment, farm_area, maximum_eligible_amount, purpose, loan_mode,
        calculated_interest, total_repayment, created_at, updated_at)
      SELECT 'L-TMP-' || r.ord, r.request_id, r.member_id, r.member_number, r.member_name, r.loan_type, r.amount, r.total, $13::numeric, r.term,
-            r.approved, r.approved + make_interval(months => r.term), r.approved + INTERVAL '1 month', ROUND(r.total / r.term, 2), r.farm_area,
+            r.approved, r.approved + make_interval(months => r.term), r.approved + make_interval(months => r.term), r.total, r.farm_area,
             ROUND(r.farm_area * $14::numeric, 2), r.purpose, 'cash', r.interest, r.total, ${stamp('r.approved', '15:00')}, ${stamp('r.approved', '15:00')}
      FROM unnest($1::int[], $2::int[], $3::text[], $4::text[], $5::text[], $6::numeric[], $7::numeric[], $8::int[], $9::date[], $10::numeric[], $11::text[], $12::numeric[])
           WITH ORDINALITY AS r(request_id, member_id, member_number, member_name, loan_type, amount, total, term, approved, farm_area, purpose, interest, ord)
@@ -125,23 +124,19 @@ export default async function seedLoanHistory(ctx) {
   loans.forEach((plan, index) => { plan.loanId = loanIds[index]; });
   await client.query(`UPDATE loans SET loan_number = 'L-' || TO_CHAR(date_approved, 'YYYY') || '-' || LPAD(id::text, 3, '0') WHERE id = ANY($1::int[])`, [loanIds]);
 
-  // Installment schedules: the same SQL as loanService's insertSchedule, for all loans at once.
+  // The schedule: one installment of the whole amount per loan, due TERM months
+  // after approval on an office day (loanService's insertSchedule for a single-payment loan).
   await client.query(
     `WITH base AS (
        SELECT * FROM unnest($1::int[], $2::numeric[], $3::numeric[], $4::int[], $5::date[]) AS b(loan_id, total, interest, term, start)
-     ), parts AS (
-       SELECT b.*, n,
-              CASE WHEN n < b.term THEN ROUND(b.total / b.term, 2) ELSE b.total - ROUND(b.total / b.term, 2) * (b.term - 1) END AS amount_due,
-              CASE WHEN n < b.term THEN FLOOR(b.interest * 100 / b.term) / 100 ELSE b.interest - (FLOOR(b.interest * 100 / b.term) / 100) * (b.term - 1) END AS interest_due
-       FROM base b CROSS JOIN LATERAL generate_series(1, b.term) AS n
      )
      INSERT INTO loan_installments (loan_id, installment_number, due_date, amount_due, principal_due, interest_due)
-     SELECT loan_id, n, due.day, amount_due, GREATEST(amount_due - interest_due, 0), LEAST(interest_due, amount_due)
-     FROM parts
+     SELECT loan_id, 1, due.day, total, GREATEST(total - interest, 0), LEAST(interest, total)
+     FROM base
      CROSS JOIN LATERAL (
-       SELECT ((start + make_interval(months => n))::date + k) AS day
+       SELECT ((start + make_interval(months => term))::date + k) AS day
        FROM generate_series(0, 6) AS k
-       WHERE EXTRACT(ISODOW FROM (start + make_interval(months => n))::date + k)::int = ANY($6::int[])
+       WHERE EXTRACT(ISODOW FROM (start + make_interval(months => term))::date + k)::int = ANY($6::int[])
        ORDER BY k LIMIT 1
      ) due`,
     [loanIds, lc((p) => centsToString(p.amountCents + interestCents(p))), lc((p) => centsToString(interestCents(p))), lc((p) => p.term), lc((p) => p.approvedOn), paymentHours().days]
@@ -152,27 +147,22 @@ export default async function seedLoanHistory(ctx) {
     [loanIds]
   );
 
-  // Payments: each one pays the oldest installment in full, on time (two days
-  // early) or late (twelve days after), as the plan says; overdue loans stop paying.
+  // Payments: the whole amount at once, on time (two days before the due date),
+  // early (half-way through the term) or late (twelve days after); active and
+  // overdue loans are not paid yet.
   const installments = (await client.query(
     `SELECT id, loan_id, installment_number, due_date::text AS due_date, amount_due, principal_due, interest_due
      FROM loan_installments WHERE loan_id = ANY($1::int[]) ORDER BY loan_id, installment_number`, [loanIds]
   )).rows;
   const payments = [];
   for (const plan of loans) {
-    let balance = plan.amountCents + interestCents(plan);
-    const schedule = installments.filter((row) => row.loan_id === plan.loanId);
-    for (const [index, row] of schedule.entries()) {
-      if (plan.kind === 'overdue' && index >= plan.paying) break;
-      const late = plan.paying === 'late' ? index % 2 === 1 : plan.paying === 'mixed' ? index % 3 === 2 : false;
-      let paidOn = officeDayOnOrBefore(addDays(row.due_date, late ? 12 : -2));
-      if (paidOn < plan.approvedOn) paidOn = plan.approvedOn;
-      if (paidOn > today) break;
-      // An active loan never runs past due: the installment due by today is paid on time.
-      if (plan.kind === 'active' && late && addDays(row.due_date, 12) > today) paidOn = officeDayOnOrBefore(addDays(row.due_date, -2)) < plan.approvedOn ? plan.approvedOn : officeDayOnOrBefore(addDays(row.due_date, -2));
-      balance -= toCents(row.amount_due);
-      payments.push({ loanId: plan.loanId, installmentId: row.id, amount: row.amount_due, principal: row.principal_due, interest: row.interest_due, date: paidOn, remaining: centsToString(balance) });
-    }
+    if (plan.kind !== 'paid') continue;
+    const row = installments.find((installment) => installment.loan_id === plan.loanId);
+    const due = row.due_date;
+    let paidOn = officeDayOnOrBefore(plan.paying === 'late' ? addDays(due, 12) : plan.paying === 'early' ? addMonths(plan.approvedOn, Math.floor(TERM / 2)) : addDays(due, -2));
+    if (paidOn < plan.approvedOn) paidOn = plan.approvedOn;
+    if (paidOn > today) continue;
+    payments.push({ loanId: plan.loanId, installmentId: row.id, amount: row.amount_due, principal: row.principal_due, interest: row.interest_due, date: paidOn, remaining: '0.00' });
   }
   if (payments.length) {
     const pc = (pick) => payments.map(pick);

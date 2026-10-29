@@ -5,24 +5,27 @@ import { addDays, addMonths, officeDayOnOrBefore, stampSql } from './support.js'
 
 // Loan applications and loans. Each goes through the application code of the
 // Loans page (eligibility = farm area x PHP 50,000, 2.5% flat interest), is
-// approved `approved` months ago, gets its monthly installment schedule, and
-// its installments are paid as `paid` says, oldest first:
+// approved `approved` months ago, gets its schedule (one payment of the whole
+// amount, due 6 months after approval), and is paid as `paid` says:
 //   'on time' = paid two days before the due date, 'late' = 12 days after,
-//   and an installment not listed (or not yet reached) stays unpaid.
-// Loans whose unpaid installments are past due become overdue on their own.
+//   and a loan not paid stays unpaid.
+// Loans unpaid past their due date become overdue on their own.
+// Every loan is for 6 months and repaid in one payment of the whole amount by
+// the due date, so `paid` is ['on time'] (paid off), ['late'] (paid after the
+// due date) or [] (not paid yet: active, or overdue once the due date passed).
 const LOANS = [
-  { key: 'juan', type: 'agricultural', amount: '60000', term: 6, approved: 7, paid: Array(6).fill('on time'), purpose: 'Seeds, fertilizer and land preparation for the wet season rice crop.' },
-  { key: 'maria', type: 'agricultural', amount: '50000', term: 10, approved: 5, paid: Array(5).fill('on time'), purpose: 'Certified palay seeds and fertilizer.' },
-  { key: 'pedro', type: 'agricultural', amount: '40000', term: 6, approved: 5, paid: ['on time', 'late'], purpose: 'Fertilizer and pesticide for 1.5 ha of rice.' },
-  { key: 'rosario', type: 'personal', amount: '20000', term: 12, approved: 4, paid: ['late', 'late', 'on time'], purpose: 'Repair of the house roof.' },
-  { key: 'antonio', type: 'agricultural', amount: '75000', term: 8, approved: 2, paid: ['on time', 'on time'], purpose: 'Hired labor and fertilizer for 2 ha of rice.' },
-  { key: 'ricardo', type: 'emergency', amount: '10000', term: 4, approved: 1, paid: [], purpose: 'Hospital bills.' },
+  { key: 'juan', type: 'agricultural', amount: '60000', term: 6, approved: 7, paid: ['on time'], purpose: 'Seeds, fertilizer and land preparation for the wet season rice crop.' },
+  { key: 'maria', type: 'agricultural', amount: '50000', term: 6, approved: 5, paid: [], purpose: 'Certified palay seeds and fertilizer.' },
+  { key: 'pedro', type: 'agricultural', amount: '40000', term: 6, approved: 8, paid: ['late'], purpose: 'Fertilizer and pesticide for 1.5 ha of rice.' },
+  { key: 'rosario', type: 'agricultural', amount: '20000', term: 6, approved: 7, paid: [], purpose: 'Fertilizer for 1.2 ha of rice.' },
+  { key: 'antonio', type: 'agricultural', amount: '75000', term: 6, approved: 2, paid: [], purpose: 'Hired labor and fertilizer for 2 ha of rice.' },
+  { key: 'ricardo', type: 'agricultural', amount: '10000', term: 6, approved: 1, paid: [], purpose: 'Seeds for the dry season crop.' },
 ];
 // Applications still waiting for a decision, and one declined.
 const APPLICATIONS = [
   { key: 'elena', type: 'agricultural', amount: '30000', term: 6, daysAgo: 3, purpose: 'Fertilizer for the coming planting.' },
-  { key: 'ernesto', type: 'agricultural', amount: '45000', term: 8, daysAgo: 1, purpose: 'Land preparation and seeds for 1.4 ha.' },
-  { key: 'danilo', type: 'personal', amount: '15000', term: 6, daysAgo: 20, purpose: 'Motorcycle repair.', declined: 'The member has been with the cooperative for less than a year.' },
+  { key: 'ernesto', type: 'agricultural', amount: '45000', term: 6, daysAgo: 1, purpose: 'Land preparation and seeds for 1.4 ha.' },
+  { key: 'danilo', type: 'agricultural', amount: '15000', term: 6, daysAgo: 20, purpose: 'Seeds and fertilizer for the coming planting.', declined: 'The member has been with the cooperative for less than a year.' },
 ];
 
 async function applyFor(ctx, plan, submittedOn) {
@@ -47,7 +50,7 @@ async function approve(ctx, { requestId, member, application }, approvedOn) {
        date_approved, due_date, next_payment_date, monthly_payment, farm_area, maximum_eligible_amount, purpose, loan_mode,
        calculated_interest, total_repayment, created_at, updated_at)
      VALUES ('L-TMP-' || left(md5(random()::text), 20), $1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, $9,
-       $10::date, $10::date + make_interval(months => $9::int), $10::date + INTERVAL '1 month', $11::numeric, $12::numeric, $13::numeric, $14, 'cash',
+       $10::date, $10::date + make_interval(months => $9::int), $10::date + make_interval(months => $9::int), $11::numeric, $12::numeric, $13::numeric, $14, 'cash',
        $15::numeric, $7::numeric, ${stampSql('$10', '15:00')}, ${stampSql('$10', '15:00')})
      RETURNING id`,
     [requestId, member.id, member.member_number, member.full_name, application.loanType, application.requestedAmount, financials.total_repayment,

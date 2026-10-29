@@ -99,6 +99,8 @@ async function memberForm(overrides = {}, file = PNG, signatures = 0) {
 const admin = new Client();
 const member = new Client();
 const state = {};
+// A member has one open loan at a time: tests that lend to the same member again settle the open ones first.
+const settleOpenLoans = (memberId) => pool.query(`UPDATE loans SET status = 'paid', balance = 0, next_payment_date = NULL WHERE member_id = $1 AND status <> 'paid'`, [memberId]);
 
 // A loan application as the form sends it: AI reads the borrower's and the
 // co-maker's IDs as they are picked, then the application is posted with both
@@ -652,8 +654,10 @@ test('auto refresh: browsers poll which tables changed, and only see their own',
 });
 
 test('loans: quote, apply, approve, installments, payments, overdue, paid', { skip }, async () => {
+  // Every loan is for 6 months, repaid in one payment of the whole amount (a term sent is ignored).
   const quote = await member.post('/api/loans/quote', { farmArea: '2', amount: '50000', term: 12 });
-  assert.deepEqual([quote.data.quote.maximumEligibleAmount, quote.data.quote.calculatedInterest, quote.data.quote.totalRepayment, quote.data.quote.monthlyPayment], ['100000.00', '1250.00', '51250.00', '4270.83']);
+  assert.deepEqual([quote.data.quote.maximumEligibleAmount, quote.data.quote.calculatedInterest, quote.data.quote.totalRepayment, quote.data.quote.monthlyPayment, quote.data.quote.term],
+    ['100000.00', '1250.00', '51250.00', '51250.00', 6]);
 
   const tooMuch = await applyWithIds(member, '/api/members/me/loan-requests', { loanType: 'agricultural', amount: '150000', term: 12, purpose: 'Seeds', farmArea: '2' });
   assert.equal(tooMuch.status, 400);
@@ -672,30 +676,29 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   const detail = await admin.get(`/api/admin/loans/${state.loanId}`);
   assert.equal(detail.data.loan.totalAmount, '51250.00');
   assert.equal(detail.data.loan.balance, '51250.00');
-  assert.equal(detail.data.installments.length, 12);
-  const scheduleTotal = detail.data.installments.reduce((sum, row) => sum + Math.round(Number(row.amountDue) * 100), 0);
-  assert.equal(scheduleTotal, 5125000);
+  assert.equal(detail.data.loan.term, 6);
+  assert.equal(detail.data.loan.repayment, 'single');
+  // One installment of the whole amount, due 6 months after approval (moved to an office day).
+  assert.equal(detail.data.installments.length, 1);
+  assert.equal(detail.data.installments[0].amountDue, '51250.00');
+  const dueDays = (Date.parse(detail.data.installments[0].dueDate) - Date.parse(detail.data.loan.dateApproved)) / 86400000;
+  assert.ok(dueDays >= 181 && dueDays <= 186, String(dueDays));
   assert.match(detail.data.loan.id, /^L-\d{4}-\d{3}$/);
 
   const future = await admin.post(`/api/admin/loans/${state.loanId}/payments`, { amount: '100', paymentDate: '2999-01-01' });
   assert.equal(future.status, 400);
   const over = await admin.post(`/api/admin/loans/${state.loanId}/payments`, { amount: '60000', paymentDate: detail.data.loan.dateApproved });
   assert.equal(over.status, 400);
-  const pay = await admin.post(`/api/admin/loans/${state.loanId}/payments`, { amount: '4270.83', paymentDate: detail.data.loan.dateApproved });
-  assert.equal(pay.status, 201, JSON.stringify(pay.data));
-  assert.equal(pay.data.payment.interestPaid, '104.16');
-  assert.equal(pay.data.payment.principalPaid, '4166.67');
-  assert.equal(pay.data.payment.remainingBalance, '46979.17');
-
-  // Simulate time passing: move the loan 3 months into the past.
-  await pool.query(`UPDATE loans SET date_approved = date_approved - 90 WHERE id = $1`, [state.loanId]);
-  await pool.query(`UPDATE loan_installments SET due_date = due_date - 90 WHERE loan_id = $1`, [state.loanId]);
+  // Simulate time passing: move the loan 200 days into the past, past its due date.
+  await pool.query(`UPDATE loans SET date_approved = date_approved - 200 WHERE id = $1`, [state.loanId]);
+  await pool.query(`UPDATE loan_installments SET due_date = due_date - 200 WHERE loan_id = $1`, [state.loanId]);
   const { refreshLoanStatuses } = await import('../src/services/loanService.js');
   await refreshLoanStatuses({ force: true });
   await refreshLoanStatuses({ force: true });
   const overdue = await admin.get(`/api/admin/loans/${state.loanId}`);
   assert.equal(overdue.data.loan.status, 'overdue');
-  assert.ok(Number(overdue.data.loan.overdueAmount) > 0);
+  assert.equal(overdue.data.loan.overdueAmount, '51250.00');
+  assert.equal(overdue.data.loan.overdueInstallments, 1);
   const overdueNotes = await pool.query(`SELECT COUNT(*)::int AS n FROM notifications WHERE type = 'payment_overdue' AND user_id = $1`, [state.memberUserId]);
   assert.equal(overdueNotes.rows[0].n, overdue.data.loan.overdueInstallments, 'one notification per overdue installment, no duplicates');
   const overdueMail = sentEmails.filter((mail) => /Loan payment overdue/.test(mail.subject));
@@ -714,6 +717,9 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
 
   const rest = await admin.post(`/api/admin/loans/${state.loanId}/payments`, { amount: overdue.data.loan.balance, paymentDate: overdue.data.loan.dateApproved });
   assert.equal(rest.status, 201, JSON.stringify(rest.data));
+  assert.equal(rest.data.payment.interestPaid, '1250.00');
+  assert.equal(rest.data.payment.principalPaid, '50000.00');
+  assert.equal(rest.data.payment.remainingBalance, '0.00');
   const paid = await admin.get(`/api/admin/loans/${state.loanId}`);
   assert.equal(paid.data.loan.status, 'paid');
   assert.equal(paid.data.loan.balance, '0.00');
@@ -722,9 +728,16 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
 
   const mine = await member.get('/api/members/me');
   assert.equal(mine.data.data.loans[0].status, 'paid');
-  assert.equal(mine.data.data.payments.length, 2);
+  assert.equal(mine.data.data.payments.length, 1);
 
-  const declined = await applyWithIds(member, '/api/members/me/loan-requests', { loanType: 'emergency', amount: '1000', term: 3, purpose: 'Repair', farmArea: '2' });
+  // Agricultural loans only.
+  for (const loanType of ['emergency', 'personal']) {
+    const other = await applyWithIds(member, '/api/members/me/loan-requests', { loanType, amount: '1000', term: 3, purpose: 'Repair', farmArea: '2' });
+    assert.equal(other.status, 400, loanType);
+    assert.match(other.data.message, /agricultural loans only/);
+  }
+  const declined = await applyWithIds(member, '/api/members/me/loan-requests', { amount: '1000', term: 3, purpose: 'Repair', farmArea: '2' });
+  assert.equal(declined.data.request.loanType, 'agricultural', 'the loan type is agricultural when none is sent');
   const decline = await admin.patch(`/api/admin/loan-requests/${declined.data.request.id}`, { status: 'declined', reason: 'Incomplete documents' });
 
   // The paper-form layout sends the cash amount; the server adds the farm inputs to it.
@@ -808,8 +821,8 @@ test('machinery: the office rents to a non-member by name only', { skip }, async
   const { todayDateOnly } = await import('../src/utils/dates.js');
   const today = todayDateOnly();
   const plus = (days) => { const d = new Date(`${today}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
-  const pump = (await admin.get('/api/machinery')).data.machinery.find((row) => row.id === 'M-003');
-  const base = { machineryId: pump.id, clientCategory: 'non_member', startDate: plus(20), endDate: plus(22), purpose: 'Irrigation' };
+  const pump = (await admin.get('/api/machinery')).data.machinery.find((row) => row.id === 'RT-02');
+  const base = { machineryId: pump.id, clientCategory: 'non_member', startDate: plus(20), endDate: plus(22), purpose: 'Land preparation' };
 
   assert.equal((await admin.post('/api/machinery/requests', { ...base, clientName: '   ' })).status, 400, 'a name is required');
   assert.equal((await admin.post('/api/machinery/requests', { ...base, clientCategory: 'guest', clientName: 'Rosa Reyes' })).status, 400);
@@ -844,55 +857,39 @@ test('machinery: the office rents to a non-member by name only', { skip }, async
 });
 
 test('machinery services: dated rates, fees, payments, expenses and the PhilMech report', { skip }, async () => {
-  // Seeded by sql/017, sql/038 and sql/041: per-service machines stay out of the per-day booking.
+  // sql/050: ACIFAC's fleet is two rotavators with tractor and two Kubota harvesters,
+  // each with its own ID, all paid per service, with the rates the office had set.
   const fleet = (await admin.get('/api/machinery')).data.machinery;
-  const tractor = fleet.find((row) => row.name === 'Hand Tractor 2');
-  const harvester = fleet.find((row) => row.name === 'Harvester' && row.pricingMode === 'per_service');
-  // ACIFAC's fleet: 2 harvesters, 2 hand tractors (both per service since 041), 2 rotavators, a water pump and a rice thresher.
-  const seeded = fleet.filter((row) => row.id <= 'M-008').map((row) => [row.id, row.name, row.pricingMode]);
+  const tractor = fleet.find((row) => row.id === 'RT-01');
+  const harvester = fleet.find((row) => row.id === 'HK-01');
+  const seeded = fleet.filter((row) => /^(RT|HK)-/.test(row.id)).map((row) => [row.id, row.name, row.type, row.pricingMode]);
   assert.deepEqual(seeded, [
-    ['M-001', 'Hand Tractor', 'per_service'], ['M-002', 'Rice Thresher', 'per_day'], ['M-003', 'Water Pump', 'per_day'], ['M-004', 'Rotavator', 'per_day'],
-    ['M-005', 'Harvester', 'per_service'], ['M-006', 'Hand Tractor 2', 'per_service'], ['M-007', 'Harvester 2', 'per_service'], ['M-008', 'Rotavator 2', 'per_day'],
+    ['HK-01', 'Harvester Kubota 1', 'Harvester Kubota', 'per_service'], ['HK-02', 'Harvester Kubota 2', 'Harvester Kubota', 'per_service'],
+    ['RT-01', 'Rotavator w/ Tractor 1', 'Rotavator w/ Tractor', 'per_service'], ['RT-02', 'Rotavator w/ Tractor 2', 'Rotavator w/ Tractor', 'per_service'],
   ]);
-  const handTractorRates = (await admin.get('/api/machinery/M-001/rates')).data.rates;
-  assert.deepEqual(handTractorRates.map((rate) => [rate.serviceType, rate.unit, rate.memberRate, rate.nonMemberRate, rate.effectiveFrom, rate.effectiveTo]).sort(),
-    [['Rotavator', 'per_ha', '3800.00', '4000.00', '2026-10-15', null], ['Squadrone', 'per_ha', '3400.00', '3400.00', '2026-10-15', null], ['Tudling', 'per_ha', '1800.00', '1800.00', '2026-10-15', null]],
-    'Hand Tractor 2\'s rates in force on 2026-10-15, from that day');
-  const harvester2 = fleet.find((row) => row.id === 'M-007');
-  const rotavator2 = fleet.find((row) => row.id === 'M-008');
-  assert.deepEqual([harvester2.acquisitionDate, harvester2.condition, harvester2.deliveryDate, harvester2.parentMachineryId], ['2026-10-09', 'operational', null, null]);
-  assert.deepEqual([rotavator2.acquisitionDate, Number(rotavator2.dailyFee), rotavator2.parentMachineryId], ['2026-10-09', 700, null]);
-  const harvester2Rates = (await admin.get('/api/machinery/M-007/rates')).data.rates;
-  assert.deepEqual(harvester2Rates.map((rate) => [rate.serviceType, rate.unit, rate.memberRate, rate.nonMemberRate, rate.effectiveFrom, rate.effectiveTo]),
-    [['Harvesting', 'per_100_bags', '10.00', '12.00', '2026-10-09', null]], 'the first harvester\'s rates, from the day the second was acquired');
-  assert.equal(tractor.pricingMode, 'per_service');
-  assert.equal(tractor.deliveryDate, '2025-02-21');
-  assert.equal(tractor.condition, 'always_repair');
-  assert.equal(harvester.deliveryDate, '2020-12-08');
-  assert.equal(fleet.find((row) => row.id === 'M-004').parentMachineryId, tractor.id);
-  const catalog = (await member.get('/api/machinery/catalog')).data.machinery;
-  assert.ok(catalog.every((row) => row.id !== tractor.id && row.id !== harvester.id && row.id !== 'M-001'));
-
-  // Day rentals (their own tab): every booking, with the machine's current name and the fee per day.
-  assert.equal((await member.get('/api/machinery/day-rentals')).status, 403);
-  const dayRentals = (await admin.get('/api/machinery/day-rentals?limit=200')).data;
-  const bookings = (await pool.query('SELECT COUNT(*)::int AS count, COALESCE(SUM(duration), 0)::int AS days, COALESCE(SUM(rental_fee), 0) AS fees FROM machinery_operations')).rows[0];
-  assert.deepEqual([dayRentals.totals.count, dayRentals.totals.days, Number(dayRentals.totals.rentalFees)], [bookings.count, bookings.days, Number(bookings.fees)]);
-  assert.ok(dayRentals.rentals.length > 0, 'the machinery tests before this one booked machines');
-  for (const rental of dayRentals.rentals) {
-    assert.equal(Math.round(Number(rental.dailyFee) * 100) * rental.duration, Math.round(Number(rental.rentalFee) * 100));
-    assert.equal(rental.machineryName, fleet.find((row) => row.id === rental.machineryId).name);
+  assert.ok(!fleet.some((row) => /^M-00[1-8]$/.test(row.id) && ['Water Pump', 'Rice Thresher', 'Hand Tractor'].includes(row.name)), 'the earlier machines are gone');
+  for (const id of ['RT-01', 'RT-02']) {
+    const rates = (await admin.get(`/api/machinery/${id}/rates`)).data.rates;
+    assert.deepEqual(rates.map((rate) => [rate.serviceType, rate.unit, rate.memberRate, rate.nonMemberRate, rate.effectiveFrom, rate.effectiveTo]).sort(), [
+      ['Rotavator', 'per_ha', '2800.00', '2800.00', '2026-01-01', '2026-04-30'], ['Rotavator', 'per_ha', '3800.00', '4000.00', '2026-05-01', null],
+      ['Squadrone', 'per_ha', '3400.00', '3400.00', '2026-05-01', null], ['Squadrone', 'per_ha', '3500.00', '3500.00', '2026-04-01', '2026-04-30'],
+      ['Tudling', 'per_ha', '1800.00', '1800.00', '2026-01-01', null],
+    ], `${id} keeps the tractor's rates`);
   }
-  const first = dayRentals.rentals[0];
-  const byMachine = (await admin.get(`/api/machinery/day-rentals?machineryId=${first.machineryId}&year=${first.startDate.slice(0, 4)}`)).data.rentals;
-  assert.ok(byMachine.length > 0 && byMachine.every((row) => row.machineryId === first.machineryId && row.startDate.startsWith(first.startDate.slice(0, 4))));
-  const byName = (await admin.get(`/api/machinery/day-rentals?search=${encodeURIComponent(first.memberName.slice(0, 4))}`)).data.rentals;
-  assert.ok(byName.some((row) => row.id === first.id));
-  assert.equal((await admin.get('/api/machinery/day-rentals?year=1999')).status, 400);
-  assert.ok(catalog.some((row) => row.id === 'M-003'), 'per-day machines such as the Water Pump are still bookable');
-  const perDay = await member.post('/api/machinery/requests', { machineryId: tractor.id, startDate: '2099-01-01', endDate: '2099-01-02', purpose: 'Plowing' });
-  assert.equal(perDay.status, 409);
-  assert.match(perDay.data.message, /paid per service/);
+  for (const id of ['HK-01', 'HK-02']) {
+    const rates = (await admin.get(`/api/machinery/${id}/rates`)).data.rates;
+    assert.deepEqual(rates.map((rate) => [rate.serviceType, rate.unit, rate.memberRate, rate.nonMemberRate, rate.effectiveFrom, rate.effectiveTo]),
+      [['Harvesting', 'per_100_bags', '10.00', '12.00', '2020-12-08', null]], `${id} keeps the harvester's rates`);
+  }
+
+  // Members book any machine of the fleet; its fee is charged when the work is recorded here.
+  const catalog = (await member.get('/api/machinery/catalog')).data.machinery;
+  assert.deepEqual(catalog.filter((row) => /^(RT|HK)-/.test(row.id)).map((row) => row.id), ['HK-01', 'HK-02', 'RT-01', 'RT-02']);
+  const booking = await member.post('/api/machinery/requests', { machineryId: tractor.id, startDate: '2099-01-01', endDate: '2099-01-03', purpose: 'Land preparation' });
+  assert.equal(booking.status, 201, JSON.stringify(booking.data));
+  assert.deepEqual([booking.data.request.duration, Number(booking.data.request.rentalFee)], [2, 0]);
+  assert.equal((await admin.patch(`/api/machinery/requests/${booking.data.request.id}`, { status: 'declined' })).status, 200);
+  assert.equal((await member.get('/api/machinery/day-rentals')).status, 404, 'Day Rentals are gone');
   assert.equal((await member.get('/api/machinery/services')).status, 403);
 
   // The report's member cases use the registered test member (the fee does not depend on the name).
@@ -964,7 +961,7 @@ test('machinery services: dated rates, fees, payments, expenses and the PhilMech
 
   const fuel = await admin.post('/api/machinery/expenses', { machineryId: tractor.id, expenseDate: '2026-06-01', croppingPeriod: '1st', year: 2026, category: 'fuel', amount: '2500', description: 'Diesel' });
   assert.equal(fuel.status, 201, JSON.stringify(fuel.data));
-  await admin.post('/api/machinery/expenses', { machineryId: 'M-004', expenseDate: '2026-06-05', croppingPeriod: '1st', year: 2026, category: 'repair_maintenance', amount: '3000', description: 'Rotavator blades' });
+  await admin.post('/api/machinery/expenses', { machineryId: tractor.id, expenseDate: '2026-06-05', croppingPeriod: '1st', year: 2026, category: 'repair_maintenance', amount: '3000', description: 'Rotavator blades' });
   const late = await admin.post('/api/machinery/expenses', { machineryId: tractor.id, expenseDate: '2026-08-15', croppingPeriod: '1st', year: 2026, category: 'labor', amount: '1500' });
   const expenses = await admin.get(`/api/machinery/expenses?croppingPeriod=1st&year=2026`);
   assert.equal(expenses.data.totals.total, '7000.00');
@@ -973,7 +970,7 @@ test('machinery services: dated rates, fees, payments, expenses and the PhilMech
   const report = await admin.get(`/api/machinery/reports/philmech?croppingPeriod=1st&year=2026&fromMonth=1&toMonth=7`);
   assert.equal(report.status, 200, JSON.stringify(report.data));
   const tractorReport = report.data.report.machines.find((row) => row.machineryId === tractor.id);
-  assert.deepEqual(tractorReport.implements, [{ id: 'M-004', name: 'Rotavator' }]);
+  assert.deepEqual(tractorReport.implements, [], 'the rotavator is part of the machine');
   assert.deepEqual(tractorReport.summary.farmers, { member: 1, nonMember: 2, total: 3 });
   assert.deepEqual(tractorReport.summary.areaHa, { member: '1.5000', nonMember: '2.0000', total: '3.5000' });
   assert.deepEqual(tractorReport.summary.grossIncome, { collected: '6000.00', collectibles: '4600.00', total: '10600.00' });
@@ -989,6 +986,8 @@ test('machinery services: dated rates, fees, payments, expenses and the PhilMech
   assert.ok(harvestReport.warnings.some((warning) => warning.code === 'SERVICE_WITHOUT_AREA'));
 
   assert.equal((await admin.request('DELETE', `/api/machinery/expenses/${late.data.expense.id}`)).status, 200);
+  const expenseChanges = (await pool.query(`SELECT action, new_values ->> 'capital_change' AS change FROM audit_logs WHERE entity_type = 'machinery_expense' AND entity_id = $1 ORDER BY id`, [String(late.data.expense.id)])).rows;
+  assert.deepEqual(expenseChanges.map((row) => [row.action, row.change]), [['MACHINERY_EXPENSE_RECORDED', '-1500.00'], ['MACHINERY_EXPENSE_DELETED', '+1500.00']], 'an expense takes from the capital; deleting it puts the money back');
   assert.equal((await admin.request('DELETE', `/api/machinery/services/${discounted.data.service.id}`)).status, 200);
   const actions = (await pool.query(`SELECT action FROM audit_logs WHERE module = 'Machinery' AND action LIKE 'MACHINERY_%' GROUP BY action ORDER BY action`)).rows.map((row) => row.action);
   for (const action of ['MACHINERY_EXPENSE_DELETED', 'MACHINERY_EXPENSE_RECORDED', 'MACHINERY_PERIOD_BALANCE_RECORDED', 'MACHINERY_RATE_ADDED', 'MACHINERY_RATE_UPDATED',
@@ -1041,84 +1040,44 @@ test('machinery: the PhilMech report form is saved per cropping', { skip }, asyn
   assert.equal(audits.rows[0].count, 2);
 });
 
-test('machinery: day rentals are paid in parts up to the fee; a rental also recorded as a service is paid there', { skip }, async (t) => {
+test('machinery: the booking calendar shows which machine is free each day; a booking is recorded as a service', { skip }, async () => {
   const { todayDateOnly } = await import('../src/utils/dates.js');
   const today = todayDateOnly();
   const plus = (days) => { const d = new Date(`${today}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
-  const fleet = (await admin.get('/api/machinery')).data.machinery;
-  // The rotavator (attached to the tractor, so its rental can become a tractor service)
-  // is bookable for this test only.
-  const rotavator = fleet.find((row) => row.id === 'M-004');
-  await pool.query(`UPDATE machinery SET status = 'available' WHERE id = $1`, [rotavator.id]);
-  t.after(() => pool.query('UPDATE machinery SET status = $2 WHERE id = $1', [rotavator.id, rotavator.status]));
-  const book = async (startDate, endDate, clientName) => {
-    const created = await admin.post('/api/machinery/requests', { machineryId: rotavator.id, clientCategory: 'non_member', clientName, startDate, endDate, purpose: 'Land preparation' });
-    assert.equal(created.status, 201, JSON.stringify(created.data));
-    assert.equal((await admin.patch(`/api/machinery/requests/${created.data.request.id}`, { status: 'approved' })).status, 200);
-    const operation = (await admin.get('/api/machinery?limit=200')).data.operations.find((row) => row.rentalRequestId === created.data.request.id);
-    return { requestId: created.data.request.id, id: operation.id };
-  };
 
-  const rental = await book(plus(70), plus(73), 'Mario Reyes');
-  const path = `/api/machinery/day-rentals/${rental.id}`;
-  assert.equal((await member.get(path)).status, 403);
-  assert.equal((await member.post(`${path}/payments`, { amount: '1', paymentDate: today })).status, 403);
-  assert.equal((await admin.get('/api/machinery/day-rentals/999999')).status, 404);
-  const detail = (await admin.get(path)).data;
-  const fee = Number(detail.rental.rentalFee);
-  assert.ok(fee > 500, 'three days of the rotavator');
-  assert.deepEqual([Number(detail.rental.amountPaid), Number(detail.rental.balance), detail.rental.paymentStatus, detail.rental.serviceId, detail.payments],
-    [0, fee, 'unpaid', null, []], 'a new rental is unpaid');
+  // The office books RT-02 for a non-member; a member asks for HK-02 (still pending).
+  const office = await admin.post('/api/machinery/requests', { machineryId: 'RT-02', clientCategory: 'non_member', clientName: 'Mario Reyes', startDate: plus(70), endDate: plus(72), purpose: 'Land preparation' });
+  assert.equal(office.status, 201, JSON.stringify(office.data));
+  assert.equal((await admin.patch(`/api/machinery/requests/${office.data.request.id}`, { status: 'approved' })).status, 200);
+  const asked = await member.post('/api/machinery/requests', { machineryId: 'HK-02', startDate: plus(71), endDate: plus(71), purpose: 'Harvesting' });
+  assert.equal(asked.status, 201, JSON.stringify(asked.data));
+  assert.equal((await member.post('/api/machinery/requests', { machineryId: 'RT-02', startDate: plus(72), endDate: plus(74), purpose: 'x' })).status, 409, 'booked days are taken');
 
-  // Amounts above zero with 2 decimals at most, never past the balance or dated in the future.
-  for (const bad of [{ amount: '0', paymentDate: today }, { amount: 'abc', paymentDate: today }, { amount: '1.234', paymentDate: today },
-    { amount: String(fee + 1), paymentDate: today }, { amount: '1', paymentDate: plus(1) }, { amount: '1', paymentDate: 'soon' }]) {
-    assert.equal((await admin.post(`${path}/payments`, bad)).status, 400, JSON.stringify(bad));
+  const url = `/api/machinery/availability?from=${plus(69)}&to=${plus(73)}`;
+  const seen = (await member.get(url)).data;
+  assert.deepEqual(seen.machinery.filter((row) => /^(RT|HK)-/.test(row.id)).map((row) => row.id), ['HK-01', 'HK-02', 'RT-01', 'RT-02']);
+  const mine = seen.bookings.filter((row) => ['RT-02', 'HK-02'].includes(row.machineryId));
+  assert.deepEqual(mine.map((row) => [row.status, row.machineryId, row.startDate, row.endDate]), [['booked', 'RT-02', plus(70), plus(72)], ['pending', 'HK-02', plus(71), plus(71)]]);
+  assert.ok(seen.bookings.every((row) => !('renter' in row) && !('purpose' in row)), 'members do not see who booked');
+  const forOffice = (await admin.get(url)).data.bookings.find((row) => row.machineryId === 'RT-02');
+  assert.deepEqual([forOffice.renter, forOffice.purpose, forOffice.requestId], ['Mario Reyes', 'Land preparation', office.data.request.id]);
+  // Days outside the range are left out.
+  assert.ok(!(await member.get(`/api/machinery/availability?from=${plus(80)}&to=${plus(85)}`)).data.bookings.some((row) => row.machineryId === 'RT-02' && row.startDate === plus(70)));
+  for (const bad of [`from=${plus(5)}&to=${plus(4)}`, `from=${plus(1)}&to=${plus(100)}`, 'from=soon&to=later', '']) {
+    assert.equal((await member.get(`/api/machinery/availability?${bad}`)).status, 400, bad);
   }
-  const first = await admin.post(`${path}/payments`, { amount: '500', paymentDate: today, notes: 'OR 1001' });
-  assert.equal(first.status, 201, JSON.stringify(first.data));
-  assert.deepEqual([Number(first.data.rental.amountPaid), Number(first.data.rental.balance), first.data.rental.paymentStatus], [500, fee - 500, 'partial']);
-  assert.deepEqual(first.data.payments.map((row) => [Number(row.amount), row.paymentDate, row.notes, Boolean(row.recordedBy)]), [[500, today, 'OR 1001', true]]);
-  const partial = (await admin.get('/api/machinery/day-rentals?paymentStatus=partial&limit=200')).data.rentals;
-  assert.ok(partial.some((row) => row.id === rental.id) && partial.every((row) => row.paymentStatus === 'partial'));
-  assert.equal((await admin.get('/api/machinery/day-rentals?paymentStatus=paid')).status, 400);
 
-  const rest = await admin.post(`${path}/payments`, { amount: (fee - 500).toFixed(2), paymentDate: today });
-  assert.equal(rest.status, 201, JSON.stringify(rest.data));
-  assert.deepEqual([Number(rest.data.rental.balance), rest.data.rental.paymentStatus, rest.data.payments.length], [0, 'full', 2]);
-  assert.equal((await admin.post(`${path}/payments`, { amount: '0.01', paymentDate: today })).status, 400, 'nothing is left to pay');
-
-  // Voiding a payment puts the balance back; the audit log keeps both.
-  assert.equal((await admin.request('DELETE', `${path}/payments/999999`)).status, 404);
-  const voided = await admin.request('DELETE', `${path}/payments/${first.data.payments[0].id}`);
-  assert.equal(voided.status, 200, JSON.stringify(voided.data));
-  assert.deepEqual([Number(voided.data.rental.amountPaid), voided.data.rental.paymentStatus, voided.data.payments.length], [fee - 500, 'partial', 1]);
-  const audit = (await pool.query(`SELECT action FROM audit_logs WHERE entity_type = 'machinery_rental_payment' ORDER BY id`)).rows.map((row) => row.action);
-  assert.deepEqual(audit.slice(-3), ['MACHINERY_RENTAL_PAYMENT_RECEIVED', 'MACHINERY_RENTAL_PAYMENT_RECEIVED', 'MACHINERY_RENTAL_PAYMENT_VOIDED']);
-
-  // The totals add up the rows.
-  const all = (await admin.get('/api/machinery/day-rentals?limit=200')).data;
-  assert.equal(all.rentals.length, all.totals.count);
-  const sum = (field) => all.rentals.reduce((total, row) => total + Math.round(Number(row[field]) * 100), 0);
-  assert.equal(Math.round(Number(all.totals.amountPaid) * 100), sum('amountPaid'));
-  assert.equal(Math.round(Number(all.totals.balance) * 100), sum('balance'));
-
-  // A rental is paid in one place: one with payments here cannot become a service,
-  // and one recorded as a service shows and takes the service's payments.
-  const tractor = fleet.find((row) => row.id === rotavator.parentMachineryId);
-  const serviceBase = { machineryId: tractor.id, croppingPeriod: '1st', year: 2026, serviceType: 'Rotavator', serviceDate: '2026-06-10', clientCategory: 'non_member', areaHa: '1' };
-  const refused = await admin.post('/api/machinery/services', { ...serviceBase, clientName: 'Mario Reyes', rentalRequestId: rental.requestId });
-  assert.equal(refused.status, 400);
-  assert.match(refused.data.message, /already has payments under Day Rentals/);
-  const other = await book(plus(80), plus(81), 'Lorna Cruz');
-  const service = await admin.post('/api/machinery/services', { ...serviceBase, clientName: 'Lorna Cruz', rentalRequestId: other.requestId });
+  // The work done on a booking is recorded as a service of that machine, at its rate.
+  const service = await admin.post('/api/machinery/services', {
+    machineryId: 'RT-02', croppingPeriod: '1st', year: 2026, serviceType: 'Rotavator', serviceDate: '2026-06-10', clientCategory: 'non_member', clientName: 'Mario Reyes', areaHa: '1',
+    rentalRequestId: office.data.request.id,
+  });
   assert.equal(service.status, 201, JSON.stringify(service.data));
-  const linked = (await admin.get(`/api/machinery/day-rentals/${other.id}`)).data.rental;
-  assert.deepEqual([linked.serviceId, Number(linked.balance), linked.paymentStatus], [service.data.service.id, Number(service.data.service.balance), service.data.service.paymentStatus]);
-  const elsewhere = await admin.post(`/api/machinery/day-rentals/${other.id}/payments`, { amount: '1', paymentDate: today });
-  assert.equal(elsewhere.status, 409);
-  assert.match(elsewhere.data.message, /under Services/);
+  assert.equal(service.data.service.feeAmount, '4000.00', 'the non-member rotavator rate per hectare');
+  const wrong = await admin.post('/api/machinery/services', { machineryId: 'HK-01', croppingPeriod: '1st', year: 2026, serviceType: 'Harvesting', serviceDate: '2026-05-05', clientCategory: 'non_member', clientName: 'Mario Reyes', totalBags: '100', bagValue: '1000', rentalRequestId: office.data.request.id });
+  assert.equal(wrong.status, 400, 'a booking belongs to its own machine');
   assert.equal((await admin.request('DELETE', `/api/machinery/services/${service.data.service.id}`)).status, 200);
+  assert.equal((await admin.patch(`/api/machinery/requests/${asked.data.request.id}`, { status: 'declined' })).status, 200);
 });
 
 test('machinery analytics: utilization, revenue and cost, alerts, downtime, ROI and recommendations', { skip }, async () => {
@@ -1167,7 +1126,8 @@ test('machinery analytics: utilization, revenue and cost, alerts, downtime, ROI 
   assert.equal(data.forecast.forecast.length, 6);
   // Used 3 of 101 days in the last 12 months while earning more than it cost: find it more work
   // (one recommendation for all such machines). Repairs are 2/3 of its revenue.
-  assert.ok(data.ruleRecommendations.some((item) => item.type === 'promote' && `${item.title} ${item.reason}`.includes('Analytics Tractor (3%)')));
+  // Alone or with other little-used machines (one recommendation either way).
+  assert.ok(data.ruleRecommendations.some((item) => item.type === 'promote' && /Analytics Tractor \(3%\)|Find more work for Analytics Tractor[\s\S]*Only 3%/.test(`${item.title} ${item.reason}`)), JSON.stringify(data.ruleRecommendations));
   assert.ok(data.ruleRecommendations.some((item) => item.machineId === id && item.type === 'maintenance' && /66\.7%/.test(item.reason)));
 
   // A period still to come has nothing to measure yet.
@@ -1342,6 +1302,14 @@ test('kadiwa: a product is deleted; one already sold stays for its past sales', 
   const history = await admin.get(`/api/kadiwa/sales?from=${day}&to=${day}`);
   const pastSale = history.data.sales.find((entry) => entry.id === sale.data.sale.id);
   assert.ok(pastSale.items.some((item) => item.inventoryId === sold.id && item.name === 'Sold Then Deleted'), 'the past sale still shows it');
+
+  // Overall: every completed sale, from the first one to today, however long ago.
+  const overall = (await admin.get(`${'/api/kadiwa/sales'}?overall=true`)).data;
+  const counted = (await pool.query(`SELECT COUNT(*)::int AS count, COALESCE(SUM(net_sales), 0) AS net, TO_CHAR(MIN(sale_date), 'YYYY-MM-DD') AS first FROM kadiwa_sales WHERE status = 'completed' AND sale_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date`)).rows[0];
+  assert.deepEqual([overall.from, overall.sales.length, overall.report.totals.sales], [counted.first, counted.count, counted.count]);
+  assert.equal(Math.round(Number(overall.report.totals.net) * 100), Math.round(Number(counted.net) * 100), 'the same net income as the Net Income card counts');
+  assert.ok(overall.sales.some((entry) => entry.id === sale.data.sale.id));
+  assert.equal((await admin.get('/api/kadiwa/sales?from=2020-01-01&to=2026-01-01')).status, 400, 'a chosen period is still at most a year');
 
   // A deleted product cannot be sold, restocked, edited or deleted again; the same product can be added as a new one.
   assert.equal((await admin.post('/api/kadiwa/sales', { sellerName: 'Tester', items: [{ inventoryId: sold.id, quantity: '1' }] })).status, 404);
@@ -1620,6 +1588,7 @@ test('loans: applications typed into the app need the borrower and co-maker IDs 
   assert.equal((await admin.request('GET', `/api/admin/loans/${approved.data.loanId}/borrower-signature`, { raw: true })).status, 200);
 
   // An admin releasing a loan at once must confirm ID warnings.
+  await settleOpenLoans(state.memberId);
   const direct = { ...paper, memberId: state.memberId, cashAmount: '3000' };
   const unconfirmed = await applyWithIds(admin, '/api/admin/loans', direct, { coMaker: { ...CO_MAKER_ID, address: 'Poblacion, Sablayan' } });
   assert.equal(unconfirmed.status, 422);
@@ -1666,8 +1635,9 @@ test('loans: payments are received on weekdays during office hours; due dates sk
     assert.match(closed.data.message, /only during office hours/);
     assert.equal((await member.get('/api/loans/policy')).data.policy.paymentHours.openNow, false);
 
-    // New loans: every installment falls on a day the office receives payments.
+    // New loans: the one payment falls due on a day the office receives payments.
     process.env.LOAN_PAYMENT_HOURS = 'Mon-Fri 08:00-17:00';
+    await settleOpenLoans(state.memberId);
     const released = await applyWithIds(admin, '/api/admin/loans', {
       loanType: 'agricultural', loanMode: 'cash', cashAmount: '2400', term: 12, farmArea: '2', borrowerPhone: '09171234567', borrowerAddress: 'Purok 1, Amnay', cropsPlanted: 'Palay', certified: true, memberId: state.memberId,
     }, { acknowledgeIdWarnings: true });
@@ -1675,13 +1645,65 @@ test('loans: payments are received on weekdays during office hours; due dates sk
     const loanId = released.data.loan.databaseId;
     const detail = await admin.get(`/api/admin/loans/${loanId}`);
     const dueDates = detail.data.installments.map((row) => row.dueDate);
-    assert.equal(dueDates.length, 12);
+    assert.equal(dueDates.length, 1);
     assert.ok(dueDates.every((date) => isoDay(date) <= 5), JSON.stringify(dueDates));
     assert.equal(detail.data.loan.dueDate, dueDates.at(-1), 'the loan is due with its last installment');
     await pool.query('DELETE FROM loans WHERE id = $1', [loanId]);
   } finally {
     process.env.LOAN_PAYMENT_HOURS = 'Mon-Sun 00:00-24:00';
   }
+});
+
+test('loans: one open loan per member; an application once 80% is paid restructures it on approval', { skip }, async () => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const { refreshLoanStatuses } = await import('../src/services/loanService.js');
+  const today = todayDateOnly();
+  const plus = (days) => { const d = new Date(`${today}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
+  await settleOpenLoans(state.memberId);
+  for (const request of (await admin.get('/api/admin/loan-requests?status=pending&limit=100')).data.requests.filter((row) => Number(row.memberDatabaseId) === state.memberId)) {
+    await admin.patch(`/api/admin/loan-requests/${request.id}`, { status: 'declined', reason: 'test cleanup' });
+  }
+  // Juan's open loan: PHP 10,250 with interest, nothing paid yet.
+  const oldId = (await pool.query(
+    `INSERT INTO loans (loan_number, member_id, member_name, loan_type, amount, balance, interest_rate, term, status, date_approved, due_date, monthly_payment, calculated_interest, total_repayment, repayment)
+     VALUES ('L-ONE-001', $1, 'Juan Dela Cruz', 'agricultural', 10000, 10250, 2.5, 6, 'active', $2, $3, 10250, 250, 10250, 'single') RETURNING id`,
+    [state.memberId, plus(-10), plus(170)]
+  )).rows[0].id;
+  await refreshLoanStatuses({ force: true });
+
+  // A second loan is refused, from the member's form and from the office's New Loan.
+  const application = { loanType: 'agricultural', amount: '20000', term: 12, purpose: 'Next cropping', farmArea: '2' };
+  const early = await applyWithIds(member, '/api/members/me/loan-requests', application);
+  assert.equal(early.status, 409, JSON.stringify(early.data));
+  assert.match(early.data.message, /You have an open loan \(L-ONE-001\).*at least 80%.*PHP 8,200\.00 more/);
+  const direct = await applyWithIds(admin, '/api/admin/loans', { loanType: 'agricultural', loanMode: 'cash', cashAmount: '20000', farmArea: '2', borrowerPhone: '09171234567', borrowerAddress: 'Purok 1, Amnay', cropsPlanted: 'Palay', certified: true, memberId: state.memberId }, { acknowledgeIdWarnings: true });
+  assert.equal(direct.status, 409, JSON.stringify(direct.data));
+  assert.match(direct.data.message, /This member has an open loan \(L-ONE-001\)/);
+
+  // With 80% paid the member may apply; the new loan must cover what is still owed.
+  assert.equal((await admin.post(`/api/admin/loans/${oldId}/payments`, { amount: '8200', paymentDate: today })).status, 201);
+  assert.equal((await applyWithIds(member, '/api/members/me/loan-requests', { ...application, amount: '2000' })).status, 400);
+  const applied = await applyWithIds(member, '/api/members/me/loan-requests', application);
+  assert.equal(applied.status, 201, JSON.stringify(applied.data));
+  const request = (await admin.get('/api/admin/loan-requests?status=pending&limit=100')).data.requests.find((row) => row.id === applied.data.request.id);
+  assert.deepEqual([request.openLoanNumber, request.openLoanBalance, request.openLoanTotal], ['L-ONE-001', '2050.00', '10250.00'], 'the office sees the loan it restructures');
+
+  // Approving it restructures the open loan: the PHP 2,050 still owed is deducted.
+  const approved = await admin.patch(`/api/admin/loan-requests/${applied.data.request.id}`, { status: 'approved' });
+  assert.equal(approved.status, 200, JSON.stringify(approved.data));
+  const created = (await admin.get(`/api/admin/loans/${approved.data.loanId}`)).data.loan;
+  assert.deepEqual([created.renewedFromLoan, created.renewalDeduction, created.netProceeds, created.amount], ['L-ONE-001', '2050.00', '17950.00', '20000.00']);
+  const old = (await admin.get(`/api/admin/loans/${oldId}`)).data;
+  assert.deepEqual([old.loan.status, old.loan.balance, old.restructurings[0].kind, old.restructurings[0].newLoanNumber], ['paid', '0.00', 'renewal', created.id]);
+  assert.match(old.restructurings[0].reason, /approval of loan application/);
+  const told = (await pool.query(`SELECT message FROM notifications WHERE user_id = $1 AND type = 'loan_approved' ORDER BY id DESC LIMIT 1`, [state.memberUserId])).rows[0].message;
+  assert.match(told, /L-ONE-001 was restructured.*you receive PHP 17,950\.00/);
+  // The audit log records how each step changed the capital: the payment in, the money released out.
+  const capitalLog = async (action, entityId) => (await pool.query(`SELECT new_values ->> 'capital_change' AS change FROM audit_logs WHERE action = $1 AND entity_id = $2 ORDER BY id DESC LIMIT 1`, [action, String(entityId)])).rows[0]?.change;
+  const paymentId = old.payments.find((row) => row.amount === '8200.00').id;
+  assert.equal(await capitalLog('PAYMENT_CREATED', paymentId), '+8200.00');
+  assert.equal(await capitalLog('LOAN_APPROVED', applied.data.request.id), '-17950.00', 'only what the member received leaves the cooperative');
+  await settleOpenLoans(state.memberId);
 });
 
 test('ocr: upload, classify, duplicate, failure recorded and retried, review saved', { skip }, async () => {
@@ -1988,6 +2010,7 @@ test('ocr: the printed Kadiwa forms add products to the inventory and record a s
 });
 
 test('ocr: the paper Agri loan form becomes a pending loan application', { skip }, async () => {
+  await settleOpenLoans(state.memberId);
   const detail = await admin.get(`/api/members/${state.memberId}`);
   const memberNumber = detail.data.data.member_number;
   const pending = await admin.get('/api/admin/loan-requests?status=pending&limit=100');
@@ -2308,6 +2331,11 @@ test('ocr automation: two readings must agree, busy scans are read again by the 
 });
 
 test('member emails: savings, share capital, loan application, scanned forms, opt-out', { skip }, async () => {
+  await settleOpenLoans(state.memberId);
+  // One pending application at a time (agricultural loans only).
+  for (const request of (await admin.get('/api/admin/loan-requests?status=pending&limit=100')).data.requests.filter((row) => Number(row.memberDatabaseId) === state.memberId)) {
+    await admin.patch(`/api/admin/loan-requests/${request.id}`, { status: 'declined', reason: 'test cleanup' });
+  }
   const address = (await pool.query(
     `SELECT COALESCE(NULLIF(u.email, ''), m.email) AS email FROM members m LEFT JOIN users u ON u.member_id = m.id WHERE m.id = $1`, [state.memberId]
   )).rows[0].email;
@@ -2331,7 +2359,7 @@ test('member emails: savings, share capital, loan application, scanned forms, op
   assert.equal((await waitForMail(/share capital contribution recorded/i, 1)).length >= 1, true);
 
   const applicationsBefore = mailsFor(/received your loan application/i).length;
-  const applied = await applyWithIds(member, '/api/members/me/loan-requests', { loanType: 'personal', loanMode: 'cash', purpose: 'Seeds', amount: '5000', term: '6', farmArea: '2', borrowerPhone: '09171234567', borrowerAddress: 'Purok 1, Amnay' });
+  const applied = await applyWithIds(member, '/api/members/me/loan-requests', { loanType: 'agricultural', loanMode: 'cash', purpose: 'Seeds', amount: '5000', term: '6', farmArea: '2', borrowerPhone: '09171234567', borrowerAddress: 'Purok 1, Amnay' });
   assert.equal(applied.status, 201, JSON.stringify(applied.data));
   const applicationMail = await waitForMail(/received your loan application/i, applicationsBefore + 1);
   assert.ok(applicationMail.some((mail) => mail.text.includes(`#${applied.data.request.id}`)));
@@ -2429,10 +2457,11 @@ test('dashboard and analytics use real data', { skip }, async () => {
   assert.ok(dashboard.data.recentActivities.length > 0);
   const analytics = await admin.get('/api/admin/analytics?from=2000-01-01&to=2999-12-31');
   assert.equal(analytics.status, 200, JSON.stringify(analytics.data));
-  assert.equal(analytics.data.summary.completedLoans, 1);
-  assert.equal(analytics.data.summary.totalLoanPayments, 51250);
+  // The loans paid off so far (tests that lend again settle the member's open loan).
+  assert.equal(analytics.data.summary.completedLoans, (await pool.query(`SELECT COUNT(*)::int AS count FROM loans WHERE status = 'paid'`)).rows[0].count);
+  assert.equal(analytics.data.summary.totalLoanPayments, Number((await pool.query('SELECT COALESCE(SUM(amount), 0) AS total FROM loan_payments')).rows[0].total));
   const juan = analytics.data.memberAnalytics.find((row) => row.databaseId === state.memberId);
-  assert.equal(juan.totalPaid, 51250);
+  assert.equal(juan.totalPaid, Number((await pool.query('SELECT COALESCE(SUM(p.amount), 0) AS total FROM loan_payments p JOIN loans l ON l.id = p.loan_id WHERE l.member_id = $1', [state.memberId])).rows[0].total));
   assert.ok(analytics.data.methodology.onTimePaymentRate);
 
   // Loan disbursement: every month (0 without a loan), each with its change from the month before.
@@ -2557,6 +2586,24 @@ test('dashboard and analytics use real data', { skip }, async () => {
     ['community', 3, Math.round(Math.max(0, netIncome) * 3) / 100],
     ['optional', 7, Math.round(Math.max(0, netIncome) * 7) / 100],
   ]);
+  // And what is shared out to the members: 35% each for dividends and patronage refunds.
+  const incomeShares = dashboard.data.stats.netIncomeShares;
+  assert.deepEqual(incomeShares.map(({ key, percent }) => [key, percent]), [['dividends', 35], ['patronage', 35]]);
+  const netCents = Math.round(Math.max(0, netIncome) * 100);
+  const fundCents = dashboard.data.stats.statutoryFunds.reduce((sum, fund) => sum + Math.round(fund.amount * 100), 0);
+  assert.equal(incomeShares.reduce((sum, share) => sum + Math.round(share.amount * 100), 0) + fundCents, netCents, 'the funds and the two shares add up to the net income');
+  assert.ok(Math.abs(Math.round(incomeShares[0].amount * 100) - Math.round(netCents * 0.35)) <= 1);
+  // The Capital card: where the cooperative's money is, by module, and their total.
+  const capital = dashboard.data.stats.capital;
+  assert.deepEqual(capital.parts.map((part) => part.key), ['shareCapital', 'savings', 'loans', 'machinery', 'kadiwa']);
+  const byKey = Object.fromEntries(capital.parts.map((part) => [part.key, part.amount]));
+  const sql = (await pool.query(`SELECT
+      (SELECT COALESCE(SUM(sc.amount), 0) FROM share_contributions sc JOIN members m ON m.id = sc.member_id WHERE m.status <> 'archived') AS shares,
+      (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'withdrawal' THEN -amount ELSE amount END), 0) FROM savings_transactions) AS savings,
+      (SELECT COALESCE(SUM(amount), 0) FROM loan_payments) - (SELECT COALESCE(SUM(amount), 0) FROM loans) AS loans`)).rows[0];
+  assert.deepEqual([byKey.shareCapital, byKey.savings, byKey.loans], [Number(sql.shares), Number(sql.savings), Number(sql.loans)]);
+  assert.deepEqual([byKey.machinery, byKey.kadiwa], [parts.machinery, parts.kadiwa], 'the same cash as in the net income');
+  assert.equal(Math.round(capital.total * 100), capital.parts.reduce((sum, part) => sum + Math.round(part.amount * 100), 0));
 
   // A member's dividend: this year's net income, less 30% statutory funds, half
   // of the surplus shared by share capital.
@@ -2616,6 +2663,47 @@ test('dashboard and analytics use real data', { skip }, async () => {
   assert.equal(lastYear.data.data.yearComplete, true);
   for (const year of ['1999', String(d.year + 1), 'abc']) assert.equal((await member.get(`/api/members/me/dividend?year=${year}`)).status, 400, year);
   assert.equal((await admin.get('/api/members/me/dividend')).status, 403, 'only a member sees their own dividend');
+
+  // The loan summary and history: the member sees in their account what the admin opens from Loans & Payments.
+  const mine = await member.get('/api/members/me/loan-history');
+  assert.equal(mine.status, 200, JSON.stringify(mine.data));
+  const theirs = (await admin.get(`/api/admin/members/${state.memberId}/loan-history`)).data;
+  assert.deepEqual(mine.data.summary, theirs.summary);
+  assert.deepEqual(mine.data.loans.map((loan) => loan.id), theirs.loans.map((loan) => loan.id));
+  assert.ok(mine.data.loans.length > 0 && mine.data.payments.length > 0);
+  assert.equal(mine.data.summary.totalPaid, (mine.data.payments.reduce((total, payment) => total + Math.round(Number(payment.amount) * 100), 0) / 100).toFixed(2));
+  assert.equal((await admin.get('/api/members/me/loan-history')).status, 403, 'an admin has no member record of their own');
+  assert.ok([401, 403].includes((await member.get(`/api/admin/members/${state.memberId}/loan-history`)).status), 'a member sees only their own');
+});
+
+test('loans: the office keeps a farm input price list the in-kind table offers', { skip }, async () => {
+  const url = '/api/admin/farm-inputs';
+  const urea = { category: 'fertilizer', name: 'Urea 46-0-0', unit: 'bag', unitPrice: '1650' };
+  assert.ok([401, 403].includes((await member.post(url, urea)).status), 'only the office edits the list');
+  for (const bad of [{ ...urea, category: 'tools' }, { ...urea, name: ' ' }, { ...urea, unit: '' }, { ...urea, unitPrice: '0' }, { ...urea, unitPrice: '1.234' }]) {
+    assert.equal((await admin.post(url, bad)).status, 400, JSON.stringify(bad));
+  }
+  const created = await admin.post(url, urea);
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  assert.deepEqual([created.data.item.category, created.data.item.name, created.data.item.unit, created.data.item.unitPrice, created.data.item.active], ['fertilizer', 'Urea 46-0-0', 'bag', '1650.00', true]);
+  assert.equal((await admin.post(url, { ...urea, name: 'urea 46-0-0 ', unit: 'BAG' })).status, 409, 'the same product and unit once');
+  const seeds = await admin.post(url, { category: 'seeds', name: 'Hybrid rice seeds', unit: 'bag', unitPrice: '5200.50' });
+  assert.equal(seeds.status, 201);
+
+  // A new price; then the product is hidden from the form.
+  const id = created.data.item.id;
+  const repriced = await admin.put(`${url}/${id}`, { unitPrice: '1725.75' });
+  assert.equal(repriced.status, 200, JSON.stringify(repriced.data));
+  assert.equal(repriced.data.item.unitPrice, '1725.75');
+  assert.equal((await admin.put(`${url}/${id}`, {})).status, 400);
+  assert.equal((await admin.put(`${url}/999999`, { unitPrice: '1' })).status, 404);
+  const listed = (await member.get('/api/loans/farm-inputs')).data.items;
+  assert.deepEqual(listed.map((item) => [item.category, item.name, item.unitPrice]), [['fertilizer', 'Urea 46-0-0', '1725.75'], ['seeds', 'Hybrid rice seeds', '5200.50']], 'in the order of the form');
+  assert.equal((await admin.put(`${url}/${id}`, { active: false })).status, 200);
+  assert.deepEqual((await member.get('/api/loans/farm-inputs?all=true')).data.items.map((item) => item.name), ['Hybrid rice seeds'], 'a member sees only what is offered');
+  assert.deepEqual((await admin.get('/api/loans/farm-inputs?all=true')).data.items.map((item) => [item.name, item.active]), [['Urea 46-0-0', false], ['Hybrid rice seeds', true]]);
+  const audit = (await pool.query(`SELECT action FROM audit_logs WHERE entity_type = 'farm_input_price' ORDER BY id`)).rows.map((row) => row.action);
+  assert.deepEqual(audit, ['FARM_INPUT_CREATED', 'FARM_INPUT_CREATED', 'FARM_INPUT_UPDATED', 'FARM_INPUT_UPDATED']);
 });
 
 test('settings: profile, preferences, legal documents', { skip }, async () => {
@@ -3375,16 +3463,17 @@ test('attendance: activities, recording, duplicates, finalization, rates, cancel
   assert.equal(canReceiveEvent(anaUser, { table: 'activities' }), true);
 });
 
-test('loans: restructuring gives an open loan a new schedule and stays in the credit history', { skip }, async () => {
+test('loans: restructuring after 80% paid deducts the balance from a new loan and stays in the credit history', { skip }, async () => {
   const { todayDateOnly } = await import('../src/utils/dates.js');
   const { refreshLoanStatuses } = await import('../src/services/loanService.js');
   const today = todayDateOnly();
   const plus = (date, days) => { const d = new Date(`${date}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
   const approved = plus(today, -100);
   // PHP 12,000 at 2.5% over 6 months, approved 100 days ago: three installments have fallen due.
+  // A loan from before the single-payment policy, repaid monthly (those loans keep their schedules).
   const loanId = (await pool.query(
-    `INSERT INTO loans (loan_number, member_id, member_name, loan_type, amount, balance, interest_rate, term, status, date_approved, due_date, monthly_payment, calculated_interest, total_repayment)
-     VALUES ('L-RS-001', $1, 'Juan Dela Cruz', 'agricultural', 12000, 12300, 2.5, 6, 'active', $2, $3, 2050, 300, 12300) RETURNING id`,
+    `INSERT INTO loans (loan_number, member_id, member_name, loan_type, amount, balance, interest_rate, term, status, date_approved, due_date, monthly_payment, calculated_interest, total_repayment, repayment)
+     VALUES ('L-RS-001', $1, 'Juan Dela Cruz', 'agricultural', 12000, 12300, 2.5, 6, 'active', $2, $3, 2050, 300, 12300, 'monthly') RETURNING id`,
     [state.memberId, approved, plus(approved, 182)]
   )).rows[0].id;
   await refreshLoanStatuses({ force: true });
@@ -3401,53 +3490,56 @@ test('loans: restructuring gives an open loan a new schedule and stays in the cr
   assert.deepEqual([historyBefore.onTimePayments, historyBefore.latePayments, historyBefore.restructureCount], [0, 3, 0]);
 
   const url = `/api/admin/loans/${loanId}/restructure`;
-  const valid = { term: 4, interestRate: '2.5', reason: 'Typhoon damaged the crop' };
+  const valid = { amount: '50000', farmArea: '2', reason: 'Next cropping season' };
   // Admins only (the test member may already be signed out by the session tests).
   assert.ok([401, 403].includes((await member.post(url, valid)).status));
-  assert.equal((await admin.post(url, { ...valid, term: 0 })).status, 400);
-  assert.equal((await admin.post(url, { ...valid, term: 61 })).status, 400);
-  assert.equal((await admin.post(url, { ...valid, interestRate: 'ten' })).status, 400);
+  assert.equal((await admin.post(url, { ...valid, amount: 'abc' })).status, 400);
   assert.equal((await admin.post(url, { ...valid, reason: '  ' })).status, 400);
   assert.equal((await admin.post(`/api/admin/loans/${state.loanId}/restructure`, valid)).status, 409, 'a fully paid loan has nothing to restructure');
+  // Only PHP 2,050 of PHP 12,300 is paid: at least 80% (PHP 9,840) must be.
+  const early = await admin.post(url, valid);
+  assert.equal(early.status, 409);
+  assert.match(early.data.message, /at least 80%.*PHP 7,790\.00 more/);
+
+  // A part payment brings it to exactly 80%.
+  const more = await admin.post(`/api/admin/loans/${loanId}/payments`, { amount: '7790', paymentDate: today });
+  assert.equal(more.status, 201, JSON.stringify(more.data));
+  assert.equal(more.data.payment.remainingBalance, '2460.00');
+  assert.equal((await admin.post(url, { ...valid, amount: '150000' })).status, 400, 'at most PHP 50,000 a hectare');
+  assert.equal((await admin.post(url, { ...valid, amount: '2000' })).status, 400, 'the new loan must cover what is still owed');
 
   const done = await admin.post(url, valid);
   assert.equal(done.status, 201, JSON.stringify(done.data));
-  // PHP 10,250 still owed (two installments of it overdue) + 2.5% = 10,506.25 over 4 months.
+  // PHP 2,460 still owed is deducted from the new PHP 50,000 loan: PHP 47,540 is released.
   assert.deepEqual(
-    [done.data.restructuring.balance_carried, done.data.restructuring.overdue_installments, done.data.restructuring.added_interest, done.data.restructuring.new_monthly_payment],
-    ['10250.00', 2, '256.25', '2626.56']
+    [done.data.restructuring.kind, done.data.restructuring.balance_carried, done.data.restructuring.amount_paid_before, done.data.restructuring.total_before, done.data.restructuring.net_proceeds],
+    ['renewal', '2460.00', '9840.00', '12300.00', '47540.00']
   );
-  const loan = done.data.loan;
-  assert.deepEqual([loan.status, loan.balance, loan.totalAmount, loan.totalInterest, loan.monthlyPayment, loan.restructureCount, loan.lastRestructuredOn, loan.amount, loan.term],
-    ['active', '10506.25', '12556.25', '556.25', '2626.56', 1, today, '12000.00', 6]);
+  const previous = done.data.previousLoan;
+  assert.deepEqual([previous.status, previous.balance, previous.totalPaid, previous.restructureCount, previous.lastRestructuredOn], ['paid', '0.00', '12300.00', 1, today]);
+  const created = done.data.loan;
+  assert.deepEqual(
+    [created.amount, created.totalAmount, created.totalInterest, created.balance, created.term, created.repayment, created.renewedFromLoan, created.renewalDeduction, created.netProceeds, created.restructureCount],
+    ['50000.00', '51250.00', '1250.00', '51250.00', 6, 'single', 'L-RS-001', '2460.00', '47540.00', 0]
+  );
+  const dueDays = (Date.parse(created.dueDate) - Date.parse(today)) / 86400000;
+  assert.ok(dueDays >= 181 && dueDays <= 186, String(dueDays));
   const detail = (await admin.get(`/api/admin/loans/${loanId}`)).data;
-  assert.deepEqual(detail.installments.map((row) => row.status), ['paid_late', 'restructured', 'restructured', 'restructured', 'restructured', 'restructured', 'upcoming', 'upcoming', 'upcoming', 'upcoming']);
-  const fresh = detail.installments.slice(6);
-  assert.deepEqual(fresh.map((row) => row.number), [7, 8, 9, 10]);
-  assert.equal(fresh.reduce((sum, row) => sum + Math.round(Number(row.amountDue) * 100), 0), 1050625);
-  assert.equal(fresh.reduce((sum, row) => sum + Math.round(Number(row.interestDue) * 100), 0), 25625 + 25000, 'the unpaid interest of the old schedule stays interest');
-  assert.ok(fresh[0].dueDate > today && detail.loan.dueDate === fresh[3].dueDate);
-  assert.deepEqual(detail.restructurings.map((row) => [row.reason, row.newTerm, row.recordedBy]), [['Typhoon damaged the crop', 4, 'testadmin']]);
-
-  // The replaced installments no longer make the loan overdue, even after the daily refresh.
-  await refreshLoanStatuses({ force: true });
-  assert.equal((await admin.get(`/api/admin/loans/${loanId}`)).data.loan.status, 'active');
-  // Payments now go to the new schedule.
-  const next = await admin.post(`/api/admin/loans/${loanId}/payments`, { amount: '2626.56', paymentDate: today });
-  assert.equal(next.status, 201, JSON.stringify(next.data));
-  assert.equal(next.data.payment.remainingBalance, '7879.69');
-  const afterPayment = (await admin.get(`/api/admin/loans/${loanId}`)).data.installments;
-  assert.equal(afterPayment[6].status, 'paid');
-  assert.ok(afterPayment.slice(1, 6).every((row) => row.status === 'restructured' && row.amountPaid === '0.00'));
+  assert.deepEqual(detail.restructurings.map((row) => [row.kind, row.reason, row.newLoanNumber, row.newLoanAmount, row.recordedBy]),
+    [['renewal', 'Next cropping season', created.id, '50000.00', 'testadmin']]);
+  // Payments are listed newest first: the deduction is the last one.
+  assert.deepEqual([detail.payments[0].amount, detail.payments[0].remainingBalance], ['2460.00', '0.00']);
+  assert.ok(detail.installments.every((row) => row.status === 'paid' || row.status === 'paid_late'));
+  assert.equal((await admin.post(url, valid)).status, 409, 'the old loan is closed');
 
   // The member is told; the credit history keeps the late installments and counts the restructured loan.
   const told = (await pool.query(`SELECT message FROM notifications WHERE user_id = $1 AND type = 'loan_restructured'`, [state.memberUserId])).rows;
-  assert.ok(told.length === 1 && told[0].message.includes('L-RS-001') && told[0].message.includes('4 months'), JSON.stringify(told));
+  assert.ok(told.length === 1 && told[0].message.includes('L-RS-001') && told[0].message.includes(created.id) && told[0].message.includes('PHP 47,540.00'), JSON.stringify(told));
   const analytics = (await admin.get('/api/admin/analytics?from=2000-01-01&to=2999-12-31')).data;
   const juan = analytics.memberAnalytics.find((row) => row.databaseId === state.memberId);
   const history = juan.loanHistory.find((row) => row.id === loanId);
-  assert.deepEqual([history.onTimePayments, history.latePayments, history.restructureCount], [0, 3, 1]);
-  assert.deepEqual([juan.restructuredLoans, juan.restructurings], [1, 1]);
+  assert.deepEqual([history.latePayments, history.restructureCount], [3, 1]);
+  assert.deepEqual([juan.restructuredLoans, juan.restructurings], [juanBefore.restructuredLoans + 1, juanBefore.restructurings + 1]);
   assert.equal(juan.latePayments, juanBefore.latePayments, 'restructuring does not erase late payments');
   assert.equal(juan.overdueInstallments, juanBefore.overdueInstallments - 2);
   assert.ok(analytics.methodology.restructuredLoans);
@@ -3455,7 +3547,7 @@ test('loans: restructuring gives an open loan a new schedule and stays in the cr
   assert.ok(!('debtToCapitalRatio' in juan) && !('exposure' in juan) && !('savings' in juan) && !analytics.methodology.debtToCapital);
   const audit = (await pool.query(`SELECT new_values FROM audit_logs WHERE action = 'LOAN_RESTRUCTURED' AND entity_id = $1`, [String(loanId)])).rows;
   assert.equal(audit.length, 1);
-  assert.equal(audit[0].new_values.reason, 'Typhoon damaged the crop');
+  assert.deepEqual([audit[0].new_values.reason, audit[0].new_values.net_proceeds], ['Next cropping season', '47540.00']);
 
   // Clicking the member in the credit history: a suggestion from how they
   // repaid, with the same figures as the table (rule-based here: no AI key).
@@ -3472,4 +3564,34 @@ test('loans: restructuring gives an open loan a new schedule and stays in the cr
   assert.equal((await admin.post('/api/admin/analytics/members/999999/credit-advice')).status, 404);
   // Admins only (the member's session has ended by this test, hence 401 or 403).
   assert.ok([401, 403].includes((await member.post(`/api/admin/analytics/members/${state.memberId}/credit-advice`)).status));
+
+  // A single-payment loan, past due, is paid in parts; once 80% is paid it is
+  // restructured into a new loan (at most PHP 50,000 a hectare).
+  const singleId = (await pool.query(
+    `INSERT INTO loans (loan_number, member_id, member_name, loan_type, amount, balance, interest_rate, term, status, date_approved, due_date, monthly_payment, calculated_interest, total_repayment, repayment)
+     VALUES ('L-RS-002', $1, 'Juan Dela Cruz', 'agricultural', 10000, 10250, 2.5, 6, 'active', $2, $3, 10250, 250, 10250, 'single') RETURNING id`,
+    [state.memberId, plus(today, -200), plus(today, -17)]
+  )).rows[0].id;
+  await refreshLoanStatuses({ force: true });
+  assert.equal((await admin.get(`/api/admin/loans/${singleId}`)).data.loan.status, 'overdue');
+  const half = await admin.post(`/api/admin/loans/${singleId}/payments`, { amount: '5000', paymentDate: today });
+  assert.equal(half.status, 201, JSON.stringify(half.data));
+  assert.equal(half.data.payment.remainingBalance, '5250.00');
+  const singleUrl = `/api/admin/loans/${singleId}/restructure`;
+  assert.equal((await admin.post(singleUrl, { amount: '20000', farmArea: '1', reason: 'Late harvest' })).status, 409, 'under 80% paid');
+  assert.equal((await admin.post(`/api/admin/loans/${singleId}/payments`, { amount: '3200', paymentDate: today })).status, 201);
+  assert.equal((await admin.post(singleUrl, { amount: '20000', farmArea: '0.3', reason: 'Late harvest' })).status, 400, '0.3 ha allows PHP 15,000');
+  const single = await admin.post(singleUrl, { amount: '20000', farmArea: '1', reason: 'Late harvest' });
+  assert.equal(single.status, 201, JSON.stringify(single.data));
+  assert.deepEqual([single.data.restructuring.balance_carried, single.data.restructuring.net_proceeds, single.data.restructuring.overdue_installments], ['2050.00', '17950.00', 1]);
+  assert.deepEqual([single.data.previousLoan.status, single.data.loan.totalAmount, single.data.loan.farmArea], ['paid', '20500.00', '1.00']);
+
+  // The member's loan summary lists both restructured loans, the new ones, and every payment.
+  const loanHistory = (await admin.get(`/api/admin/members/${state.memberId}/loan-history`)).data;
+  const numbers = loanHistory.loans.map((row) => row.id);
+  assert.ok(['L-RS-001', 'L-RS-002', created.id, single.data.loan.id].every((number) => numbers.includes(number)), JSON.stringify(numbers));
+  assert.equal(loanHistory.summary.loans, loanHistory.loans.length);
+  assert.equal(loanHistory.summary.restructurings, (await pool.query('SELECT COUNT(*)::int AS count FROM loan_restructurings r JOIN loans l ON l.id = r.loan_id WHERE l.member_id = $1', [state.memberId])).rows[0].count);
+  assert.ok(loanHistory.payments.some((row) => row.loanNumber === 'L-RS-002' && row.amount === '2050.00'), 'the deduction is in the payment history');
+  assert.equal((await admin.get('/api/admin/members/999999/loan-history')).status, 404);
 });

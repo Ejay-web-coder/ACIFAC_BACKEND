@@ -1,9 +1,10 @@
 // Per-service machinery work for the PhilMech utilization report: jobs done
 // for farmers (priced per hectare or per 100 bags from dated rates), their
 // payments, operating expenses, beginning cash per cropping, and the report.
-// The per-day rental flow stays in machineryController.js.
+// Bookings (members reserve a machine for some days) stay in machineryController.js;
+// the work done on them is recorded and paid here.
 import { query, withTransaction } from '../config/db.js';
-import { createAuditLog } from '../utils/audit.js';
+import { capitalChange, createAuditLog } from '../utils/audit.js';
 import { formatDateOnly, isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
@@ -171,12 +172,6 @@ async function assertRentalRequest(db, rentalRequestId, machineryId) {
     [rentalRequestId, machineryId]
   )).rows[0];
   if (!row) throw badRequest('That rental request is not for this machine.');
-  // A rental is paid in one place: under Day Rentals, or as this service.
-  const paid = (await db.query(
-    `SELECT 1 FROM machinery_rental_payments p JOIN machinery_operations o ON o.id = p.operation_id WHERE o.rental_request_id = $1 LIMIT 1`,
-    [rentalRequestId]
-  )).rows[0];
-  if (paid) throw badRequest('That rental already has payments under Day Rentals, so it cannot also be recorded as a service.');
 }
 
 const auditService = (row) => ({
@@ -321,7 +316,7 @@ export async function receivePayment(req, res) {
       [id, centsToString(amount), paymentDate, notes, currentUserId(req)]
     )).rows[0];
     const service = (await client.query(`${serviceSelect} WHERE s.id = $1`, [id])).rows[0];
-    await createAuditLog({ client, user: req.user, action: 'MACHINERY_SERVICE_PAYMENT_RECEIVED', module: 'Machinery', entityType: 'machinery_service_payment', entityId: String(payment.id), description: `Received payment from ${service.clientName} for ${service.serviceType}`, oldValues: { amount_paid: before.amountPaid, balance: before.balance, payment_status: before.paymentStatus }, newValues: { amount: centsToString(amount), payment_date: paymentDate, amount_paid: service.amountPaid, balance: service.balance, payment_status: service.paymentStatus }, ...getRequestMeta(req) });
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_SERVICE_PAYMENT_RECEIVED', module: 'Machinery', entityType: 'machinery_service_payment', entityId: String(payment.id), description: `Received payment from ${service.clientName} for ${service.serviceType}`, oldValues: { amount_paid: before.amountPaid, balance: before.balance, payment_status: before.paymentStatus }, newValues: { amount: centsToString(amount), capital_change: capitalChange(amount), payment_date: paymentDate, amount_paid: service.amountPaid, balance: service.balance, payment_status: service.paymentStatus }, ...getRequestMeta(req) });
     return service;
   });
   const payments = (await query(`${paymentSelect} WHERE p.service_id = $1 ORDER BY p.payment_date, p.id`, [id])).rows;
@@ -337,7 +332,7 @@ export async function voidPayment(req, res) {
     if (!payment) throw notFound('Payment not found.');
     await client.query('DELETE FROM machinery_service_payments WHERE id = $1', [paymentId]);
     const service = (await client.query(`${serviceSelect} WHERE s.id = $1`, [id])).rows[0];
-    await createAuditLog({ client, user: req.user, action: 'MACHINERY_SERVICE_PAYMENT_VOIDED', module: 'Machinery', entityType: 'machinery_service_payment', entityId: String(paymentId), description: `Voided a payment from ${service.clientName} for ${service.serviceType}`, oldValues: { amount: payment.amount, payment_date: payment.payment_date, notes: payment.notes }, newValues: { amount_paid: service.amountPaid, balance: service.balance, payment_status: service.paymentStatus }, ...getRequestMeta(req) });
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_SERVICE_PAYMENT_VOIDED', module: 'Machinery', entityType: 'machinery_service_payment', entityId: String(paymentId), description: `Voided a payment from ${service.clientName} for ${service.serviceType}`, oldValues: { amount: payment.amount, payment_date: payment.payment_date, notes: payment.notes }, newValues: { capital_change: capitalChange(-toCents(payment.amount)), amount_paid: service.amountPaid, balance: service.balance, payment_status: service.paymentStatus }, ...getRequestMeta(req) });
     return service;
   });
   const payments = (await query(`${paymentSelect} WHERE p.service_id = $1 ORDER BY p.payment_date, p.id`, [id])).rows;
@@ -400,7 +395,7 @@ export async function createExpense(req, res) {
       [machine.id, input.expenseDate, input.croppingPeriod, input.year, input.category, input.amount, input.description, currentUserId(req)]
     )).rows[0].id;
     const row = (await client.query(`${expenseSelect} WHERE e.id = $1`, [id])).rows[0];
-    await createAuditLog({ client, user: req.user, action: 'MACHINERY_EXPENSE_RECORDED', module: 'Machinery', entityType: 'machinery_expense', entityId: String(id), description: `Recorded ${input.category.replace('_', ' & ')} expense for ${machine.name}`, newValues: auditExpense(row), ...getRequestMeta(req) });
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_EXPENSE_RECORDED', module: 'Machinery', entityType: 'machinery_expense', entityId: String(id), description: `Recorded ${input.category.replace('_', ' & ')} expense for ${machine.name}`, newValues: { ...auditExpense(row), capital_change: capitalChange(-toCents(row.amount)) }, ...getRequestMeta(req) });
     return row;
   });
   return res.status(201).json({ success: true, expense });
@@ -418,7 +413,7 @@ export async function updateExpense(req, res) {
       [id, machine.id, input.expenseDate, input.croppingPeriod, input.year, input.category, input.amount, input.description]
     );
     const row = (await client.query(`${expenseSelect} WHERE e.id = $1`, [id])).rows[0];
-    await createAuditLog({ client, user: req.user, action: 'MACHINERY_EXPENSE_UPDATED', module: 'Machinery', entityType: 'machinery_expense', entityId: String(id), description: `Updated expense for ${machine.name}`, oldValues: auditExpense(before), newValues: auditExpense(row), ...getRequestMeta(req) });
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_EXPENSE_UPDATED', module: 'Machinery', entityType: 'machinery_expense', entityId: String(id), description: `Updated expense for ${machine.name}`, oldValues: auditExpense(before), newValues: { ...auditExpense(row), capital_change: capitalChange(toCents(before.amount) - toCents(row.amount)) }, ...getRequestMeta(req) });
     return row;
   });
   return res.json({ success: true, expense });
@@ -430,7 +425,7 @@ export async function deleteExpense(req, res) {
     const before = (await client.query(`${expenseSelect} WHERE e.id = $1 FOR UPDATE OF e`, [id])).rows[0];
     if (!before) throw notFound('Expense not found.');
     await client.query('DELETE FROM machinery_expenses WHERE id = $1', [id]);
-    await createAuditLog({ client, user: req.user, action: 'MACHINERY_EXPENSE_DELETED', module: 'Machinery', entityType: 'machinery_expense', entityId: String(id), description: `Deleted ${before.category.replace('_', ' & ')} expense for ${before.machineryName}`, oldValues: auditExpense(before), ...getRequestMeta(req) });
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_EXPENSE_DELETED', module: 'Machinery', entityType: 'machinery_expense', entityId: String(id), description: `Deleted ${before.category.replace('_', ' & ')} expense for ${before.machineryName}`, oldValues: auditExpense(before), newValues: { capital_change: capitalChange(toCents(before.amount)) }, ...getRequestMeta(req) });
   });
   return res.json({ success: true, message: 'Expense deleted.' });
 }

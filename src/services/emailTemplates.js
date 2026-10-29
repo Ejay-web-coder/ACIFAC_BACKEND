@@ -1,5 +1,6 @@
 import { getFrontendUrl } from '../config/env.js';
 import { buildLink } from './emailService.js';
+import { formatDateOnly } from '../utils/dates.js';
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -78,10 +79,14 @@ export function loanSubmittedEmail({ memberName, memberNumber, amount, requestId
   );
 }
 
-export function loanDecisionEmail({ requestId, amount, interestRate, term, status, reason, totalRepayment, monthlyPayment }) {
+// repayment 'single': the whole amount is due by dueDate (YYYY-MM-DD), payable in parts; otherwise in monthly installments.
+export function loanDecisionEmail({ requestId, amount, interestRate, term, status, reason, totalRepayment, monthlyPayment, repayment = 'monthly', dueDate = null }) {
   const decision = status === 'approved' ? 'approved' : 'declined';
+  const payment = repayment === 'single'
+    ? `Payment: the whole ${formatAmount(totalRepayment)}, due${dueDate ? ` by ${formatDateOnly(dueDate)}` : ''}`
+    : `Monthly installment: ${formatAmount(monthlyPayment)}`;
   const details = status === 'approved'
-    ? `Amount: ${formatAmount(amount)}\nInterest: ${interestRate ?? 'Not specified'}% of principal (flat)\nTotal repayment: ${formatAmount(totalRepayment)}\nMonthly installment: ${formatAmount(monthlyPayment)}\nTerm: ${term ?? 'Not specified'} months`
+    ? `Amount: ${formatAmount(amount)}\nInterest: ${interestRate ?? 'Not specified'}% of principal (flat)\nTotal repayment: ${formatAmount(totalRepayment)}\n${payment}\nTerm: ${term ?? 'Not specified'} months`
     : `Reason: ${reason || 'Please contact ACIFAC for more information.'}`;
   return message(
     `ACIFAC loan application ${decision}`,

@@ -1,6 +1,6 @@
 import { query, withTransaction } from '../config/db.js';
 import { SQL_TODAY } from '../config/env.js';
-import { createAuditLog } from '../utils/audit.js';
+import { capitalChange, createAuditLog } from '../utils/audit.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { AppError, badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, optionalString, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
@@ -320,7 +320,7 @@ async function recordContribution(req, memberId, body) {
       entityId: String(insert.rows[0].id),
       description: `Recorded share contribution for member ${member.member_number || memberId}`,
       oldValues: { total: centsToString(currentCents) },
-      newValues: { member_id: memberId, amount: centsToString(amountCents), total: newTotal, contribution_date: contributionDate, payment_method: paymentMethod, reference_number: referenceNumber },
+      newValues: { member_id: memberId, amount: centsToString(amountCents), capital_change: capitalChange(amountCents), total: newTotal, contribution_date: contributionDate, payment_method: paymentMethod, reference_number: referenceNumber },
       ...getRequestMeta(req),
     });
     await notifyMember(client, memberId, {
@@ -436,7 +436,7 @@ async function insertSavingsTransaction(client, req, { kind, memberId, amountCen
     entityId: String(inserted.id),
     description: `Recorded savings ${details.label} for member ${member.member_number || memberId}`,
     oldValues: { total_savings: before },
-    newValues: { member_id: memberId, amount: centsToString(amountCents), total_savings: newTotal, date, payment_method: paymentMethod, reference_number: reference },
+    newValues: { member_id: memberId, amount: centsToString(amountCents), capital_change: capitalChange(kind === 'withdrawal' ? -amountCents : amountCents), total_savings: newTotal, date, payment_method: paymentMethod, reference_number: reference },
     ...getRequestMeta(req),
   });
   await notifyMember(client, memberId, {

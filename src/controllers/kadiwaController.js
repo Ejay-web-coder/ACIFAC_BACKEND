@@ -1,6 +1,6 @@
 import { query, withTransaction } from '../config/db.js';
 import { SQL_TODAY } from '../config/env.js';
-import { createAuditLog } from '../utils/audit.js';
+import { capitalChange, createAuditLog } from '../utils/audit.js';
 import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, paginationMeta, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import { notifyAdmins } from '../services/notificationService.js';
@@ -78,10 +78,17 @@ export async function listKadiwaData(req, res) {
 // Sales from `from` to `to` (YYYY-MM-DD, inclusive): each sale with its lines,
 // and the report for the period, the 15-day or monthly summary of every good sold.
 export async function listKadiwaSales(req, res) {
-  const from = String(req.query.from || '');
-  const to = String(req.query.to || '');
+  // overall=true: every sale, from the first one to today (Sales History > Overall).
+  const overall = req.query.overall === 'true';
+  let from = String(req.query.from || '');
+  let to = String(req.query.to || '');
+  if (overall) {
+    to = todayDateOnly();
+    const first = (await query(`SELECT TO_CHAR(MIN(sale_date), 'YYYY-MM-DD') AS first FROM kadiwa_sales WHERE status = 'completed'`)).rows[0].first;
+    from = first && first < to ? first : to;
+  }
   if (!isValidDateOnly(from) || !isValidDateOnly(to) || from > to) throw badRequest('Choose a valid period: from and to as YYYY-MM-DD, from not after to.');
-  if ((Date.parse(to) - Date.parse(from)) / 86400000 > 366) throw badRequest('Choose a period of at most one year.');
+  if (!overall && (Date.parse(to) - Date.parse(from)) / 86400000 > 366) throw badRequest('Choose a period of at most one year.');
   const sales = (await query(`${salesSelect} WHERE s.sale_date BETWEEN $1::date AND $2::date AND s.status = 'completed' ORDER BY ${salesOrder} LIMIT 5000`, [from, to])).rows;
   return res.json({ success: true, from, to, sales: sales.map(withLines), report: salesReport(sales) });
 }
@@ -211,7 +218,7 @@ export async function insertKadiwaSale(client, req, { encoderName, saleDate = nu
     entityId: id,
     description: `Recorded Kadiwa sale ${id}${encoderName ? ` by ${encoderName}` : ''}`,
     newValues: {
-      seller: encoderName, sale_date: saleDate, total_expenses: centsToString(expensesCents), cost_of_goods: centsToString(costCents), net_sales: centsToString(net),
+      seller: encoderName, sale_date: saleDate, total_expenses: centsToString(expensesCents), cost_of_goods: centsToString(costCents), net_sales: centsToString(net), capital_change: capitalChange(net),
       goods: goods.map((good) => ({ name: good.name, amount: good.amount })),
       expenses: expenseLines.map((line) => ({ description: line.description, amount: line.amount })),
       items: lines.map((line) => ({ id: line.product.id, name: line.product.label, quantity: line.quantity, unit_price: line.product.price, unit_cost: line.product.cost_price, line_total: line.lineTotal, line_cost: line.lineCost })),

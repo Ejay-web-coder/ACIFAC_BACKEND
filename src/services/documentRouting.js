@@ -1,4 +1,5 @@
 import { query, withTransaction } from '../config/db.js';
+import { LOAN_POLICY } from './loanService.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { badRequest, conflict, toHttpError } from '../utils/http.js';
 import { parseMoneyInput } from '../utils/money.js';
@@ -27,8 +28,8 @@ const LOAN_INPUT_ROWS = [
   ['fertilizer', 'Fertilizer'], ['pesticides', 'Pesticides'], ['herbicides', 'Herbicides'],
   ['insecticides', 'Insecticides'], ['seeds', 'Seeds'], ['plantChemicals', 'Plant Chemicals for Spray'],
 ];
-// Loan term used when the paper form (which has no term) is posted.
-const DEFAULT_LOAN_TERM = '12';
+// Every loan is for the policy's 6 months, due in full by the due date.
+const DEFAULT_LOAN_TERM = String(LOAN_POLICY.loanTerm);
 // Rows of the children and source-of-income tables on the paper membership form.
 const CHILD_ROWS = [1, 2, 3];
 const INCOME_ROWS = [1, 2];
@@ -99,7 +100,7 @@ export const FORM_DEFINITIONS = {
       { slot: 'coMaker', person: 'co-maker', checkId: 'coMakerId', matchId: 'coMakerMatch' },
     ],
     description: 'ACIFAC "Loan Application Form (Agri)" for an agricultural loan, usually two pages: borrower details, farm details, loan mode with the in-kind farm inputs table, cash amount, co-maker, and collateral with the borrower signature.',
-    notes: 'The printed blank form from New Loan has the form code ACIFAC-LOAN at the top right, sections numbered I to VI, and a Loan Term (months) line (term). For the in-kind table use the keys <row>Description, <row>Quantity, <row>Unit, <row>UnitPrice and <row>Total for the rows fertilizer, pesticides, herbicides, insecticides, seeds and plantChemicals (Plant Chemicals for Spray); leave a row empty when it is not filled. loanMode is the ticked box: cash, in-kind or combination. sex is Male or Female. irrigationType is rainfed, irrigated or other. collateralType is the ticked box: Land Title / Property, Harvest, or Savings Deposit / Share Capital. Ignore the office-use approval section (APPROVED / DISAPPROVED / FOR EVALUATION and approved amounts).',
+    notes: 'The printed blank form from New Loan has the form code ACIFAC-LOAN at the top right and sections numbered I to VI; its loan term is printed (6 months, due at end of term), so use "" for term. For the in-kind table use the keys <row>Description, <row>Quantity, <row>Unit, <row>UnitPrice and <row>Total for the rows fertilizer, pesticides, herbicides, insecticides, seeds and plantChemicals (Plant Chemicals for Spray); leave a row empty when it is not filled. loanMode is the ticked box: cash, in-kind or combination. sex is Male or Female. irrigationType is rainfed, irrigated or other. collateralType is the ticked box: Land Title / Property, Harvest, or Savings Deposit / Share Capital. Ignore the office-use approval section (APPROVED / DISAPPROVED / FOR EVALUATION and approved amounts).',
     fields: [
       f('formNo', 'Form No.'), f('applicationDate', 'Date of Application', { kind: 'date' }),
       f('memberName', 'Borrower Name', { required: true }), f('memberNumber', 'Member No.'),
@@ -119,7 +120,7 @@ export const FORM_DEFINITIONS = {
       f('coMakerName', 'Co-Maker Name', { required: true }), f('coMakerAddress', 'Co-Maker Address'), f('coMakerContact', 'Co-Maker Contact No.', { kind: 'phone' }),
       f('coMakerRelationship', 'Relationship to Borrower'),
       f('collateralType', 'Collateral Offered'), f('collateralDetails', 'Description / Details of Collateral'),
-      f('term', 'Loan Term (months) - not on the paper form; 12 if blank', { kind: 'integer' }),
+      f('term', `Loan Term (months) - always ${LOAN_POLICY.loanTerm}, due at end of term`, { kind: 'integer' }),
     ],
   },
   'Savings Form': {
@@ -894,7 +895,7 @@ function checkLoanAmounts(data, add) {
   if (mode !== 'in-kind' && !cashCents) problems.push('no cash amount requested is written on the form');
   if (problems.length) add('amounts', 'Loan amounts', 'fail', `${problems.join('; ')}.`);
   else add('amounts', 'Loan amounts', 'pass', `Requested ${pesoText(cashCents + inKindCents)}${lines.length ? ` (cash ${pesoText(cashCents)} + in-kind ${pesoText(inKindCents)})` : ''}; the table adds up.`);
-  if (!String(data.term || '').trim()) add('term', 'Loan term', 'pass', `The paper form has no loan term; the standard ${DEFAULT_LOAN_TERM} months will be used. Change it above if the member agreed another term.`);
+  add('term', 'Loan term', 'pass', `Every loan is for ${DEFAULT_LOAN_TERM} months, repaid in one payment of the whole amount by the due date.`);
 }
 
 // The printed Kadiwa forms, as Add Inventory and New Sale would save them.
@@ -1092,13 +1093,6 @@ export async function verifyDocument(req, scan, { documentType, extractedData, a
 
 // ---------------------------------------------------------------------------
 // Posting.
-
-const LOAN_TYPE_WORDS = [['agri', 'agricultural'], ['farm', 'agricultural'], ['crop', 'agricultural'], ['personal', 'personal'], ['emergency', 'emergency']];
-
-function loanTypeOf(value) {
-  const text = String(value || '').toLowerCase();
-  return LOAN_TYPE_WORDS.find(([word]) => text.includes(word))?.[1] || text;
-}
 
 function loanModeOf(value) {
   const text = String(value || '').toLowerCase();

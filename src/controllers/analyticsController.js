@@ -2,8 +2,12 @@ import { query } from '../config/db.js';
 import { SQL_TODAY, TIME_ZONE } from '../config/env.js';
 import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { badRequest, notFound, parseId } from '../utils/http.js';
+import { toCents } from '../utils/money.js';
 import { centsToNumber, netIncomeCents } from '../services/netIncome.js';
-import { computeDividend } from '../services/dividends.js';
+import { computeDividend, DIVIDEND_POOL_PERCENT, PATRONAGE_POOL_PERCENT, STATUTORY_PERCENT } from '../services/dividends.js';
+
+// A pool's share of the whole net income: its percent of what is left after the statutory funds.
+const sharePercent = (poolPercent) => ((100 - STATUTORY_PERCENT) * poolPercent) / 100;
 import { refreshLoanStatusesInBackground } from '../services/loanService.js';
 import { signedSavings } from '../services/savingsLedger.js';
 import { refreshRentalStatusesInBackground } from './machineryController.js';
@@ -480,6 +484,12 @@ export async function getDashboard(req, res) {
         (SELECT COUNT(*)::int FROM members m WHERE m.status <> 'archived' AND EXISTS (SELECT 1 FROM users u WHERE u.member_id = m.id)) AS "registeredMembers",
         (SELECT COUNT(*)::int FROM members m WHERE m.status <> 'archived' AND NOT EXISTS (SELECT 1 FROM users u WHERE u.member_id = m.id)) AS "unregisteredMembers",
         (SELECT COALESCE(SUM(balance), 0) FROM loans WHERE status IN ('active', 'overdue')) AS "outstandingLoans",
+        -- The capital card: members' paid-up share capital (terminated members left out) and savings balances.
+        (SELECT COALESCE(SUM(total), 0) FROM (${MEMBER_SHARE_TOTALS}) shares) AS "shareCapital",
+        (SELECT COALESCE(SUM(${signedSavings('st')}), 0) FROM savings_transactions st) AS "savings",
+        -- Loan cash: payments collected less the amounts released. A restructuring's deduction is a
+        -- payment on the old loan, so only what the member received leaves the cooperative.
+        (SELECT COALESCE(SUM(amount), 0) FROM loan_payments) - (SELECT COALESCE(SUM(amount), 0) FROM loans) AS "loanCash",
         (SELECT COUNT(DISTINCT i.loan_id)::int FROM loan_installments i JOIN loans l ON l.id = i.loan_id
           WHERE l.status <> 'paid' AND i.amount_paid < i.amount_due AND i.superseded_by IS NULL AND i.due_date BETWEEN ${SQL_TODAY} AND ${SQL_TODAY} + 7) AS "loansDueThisWeek",
         (SELECT COUNT(*)::int FROM loans WHERE status = 'overdue') AS "overdueLoans",
@@ -511,16 +521,41 @@ export async function getDashboard(req, res) {
     netIncomeCents(),
   ]);
   const row = stats.rows[0];
+  // The statutory funds set aside from that net income and what is shared out (none when there is no net income).
+  const distribution = computeDividend({ netIncomeCents: income.total, memberShareCents: 0, totalShareCents: 0 });
   return res.json({
     success: true,
     stats: {
       ...row,
       outstandingLoans: toNumber(row.outstandingLoans),
+      shareCapital: toNumber(row.shareCapital),
+      savings: toNumber(row.savings),
+      // The cooperative's capital: the cash it holds, all time. Money comes in
+      // as share capital, savings deposits, loan payments and business income,
+      // and goes out as savings withdrawals, loans released and expenses:
+      //   Share Capital  contributions          Savings  deposits - withdrawals
+      //   Loans          payments - released    Machinery  fees collected + other income - expenses
+      //   Kadiwa Store   net sales (sales - expenses - cost of goods)
+      // Every one of these is recorded in the audit log with its capital_change.
+      capital: (() => {
+        const parts = [
+          { key: 'shareCapital', label: 'Share Capital', amount: toCents(row.shareCapital) },
+          { key: 'savings', label: 'Savings', amount: toCents(row.savings) },
+          { key: 'loans', label: 'Loans (collected - released)', amount: toCents(row.loanCash) },
+          { key: 'machinery', label: 'Machinery', amount: income.parts.machinery },
+          { key: 'kadiwa', label: 'Kadiwa Store', amount: income.parts.kadiwa },
+        ];
+        return { total: centsToNumber(parts.reduce((sum, part) => sum + part.amount, 0)), parts: parts.map((part) => ({ ...part, amount: centsToNumber(part.amount) })) };
+      })(),
       netIncome: centsToNumber(income.total),
       netIncomeBreakdown: Object.fromEntries(Object.entries(income.parts).map(([key, cents]) => [key, centsToNumber(cents)])),
-      // The statutory funds set aside from that net income (none when there is no net income).
-      statutoryFunds: computeDividend({ netIncomeCents: income.total, memberShareCents: 0, totalShareCents: 0 }).funds
-        .map(({ key, label, percent, amount }) => ({ key, label, percent, amount: centsToNumber(amount) })),
+      statutoryFunds: distribution.funds.map(({ key, label, percent, amount }) => ({ key, label, percent, amount: centsToNumber(amount) })),
+      // What is left is shared out to the members: half as dividends on share
+      // capital, half as patronage refunds (35% of the net income each).
+      netIncomeShares: [
+        { key: 'dividends', label: 'Dividends', percent: sharePercent(DIVIDEND_POOL_PERCENT), amount: centsToNumber(distribution.dividendPool) },
+        { key: 'patronage', label: 'Patronage Refund', percent: sharePercent(PATRONAGE_POOL_PERCENT), amount: centsToNumber(distribution.patronageRefundPool) },
+      ],
     },
     shareCapitalLevels: SHARE_CAPITAL_BANDS.map((band) => ({ ...band, members: shareCapitalLevels.rows[0][band.key] })),
     recentActivities: activities.rows,
