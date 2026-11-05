@@ -7,6 +7,7 @@ import { notifyAdmins, notifyUser } from '../services/notificationService.js';
 import { goodsForForm, parseExpenseLines, parseGoodsLines, presentSaleLines, salesReport } from '../services/kadiwaGoods.js';
 import { formatDateOnly, isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { PESOS_PER_BUSINESS_POINT } from '../services/patronage.js';
+import { kadiwaProductAnalytics, kadiwaSalesTrend } from '../services/kadiwaProducts.js';
 
 const CATEGORIES = ['Groceries', 'Vegetables', 'Meat', 'Other'];
 const CATEGORY_COLUMN = { Groceries: 'groceries', Vegetables: 'vegetables', Meat: 'meat', Other: null };
@@ -16,10 +17,13 @@ const SIZE_PATTERN = /^\d+(\.\d{1,3})?$/;
 const SIZE_UNITS = { ml: 'mL', l: 'L', mg: 'mg', g: 'g', kg: 'kg' };
 const MAX_SHEET_ROWS = 200;
 const INVENTORY_LOCK = 'acifac-kadiwa-inventory';
+// The store there was before branches; scanned forms are recorded for it.
+export const MAIN_BRANCH_ID = 1;
 
 const inventorySelect = `
   SELECT id, name, category, size_value AS "sizeValue", size_unit AS "sizeUnit", stock, unit, price, cost_price AS "costPrice",
-         reorder_level AS "reorderLevel", updated_at AS "updatedAt"
+         reorder_level AS "reorderLevel", updated_at AS "updatedAt", branch_id AS "branchId",
+         (SELECT b.name FROM kadiwa_branches b WHERE b.id = kadiwa_inventory.branch_id) AS "branchName"
   FROM kadiwa_inventory`;
 const inventoryOrder = 'LOWER(name), size_unit NULLS FIRST, size_value NULLS FIRST, id';
 
@@ -30,6 +34,7 @@ function productLabel(name, sizeValue, sizeUnit) {
 
 const salesSelect = `
   SELECT s.id, TO_CHAR(s.sale_date, 'YYYY-MM-DD') AS "saleDate", s.created_at AS date, s.encoder_name AS seller,
+         s.branch_id AS "branchId", kb.name AS "branchName",
          s.groceries, s.vegetables, s.meat,
          s.total_expenses AS "totalExpenses", s.cost_of_goods AS "costOfGoods", s.net_sales AS "netSales", s.payment_method AS "paymentMethod", s.status,
          -- A vendor's sale: who sent it, and the administrator who confirmed or rejected it.
@@ -47,18 +52,145 @@ const salesSelect = `
          COALESCE((SELECT json_agg(json_build_object('memberId', p.member_id, 'memberNumber', p.member_number, 'name', p.member_name, 'amount', p.amount,
                    'points', ROUND(p.amount / ${PESOS_PER_BUSINESS_POINT}, 2)) ORDER BY p.line_no)
                    FROM kadiwa_sale_members p WHERE p.sale_id = s.id), '[]'::json) AS "memberPurchases"
-  FROM kadiwa_sales s LEFT JOIN users cb ON cb.id = s.created_by LEFT JOIN users rv ON rv.id = s.reviewed_by`;
+  FROM kadiwa_sales s LEFT JOIN users cb ON cb.id = s.created_by LEFT JOIN users rv ON rv.id = s.reviewed_by
+  LEFT JOIN kadiwa_branches kb ON kb.id = s.branch_id`;
 const salesOrder = 's.sale_date DESC, s.created_at DESC, s.id DESC';
 const TODAY = `sale_date = ${SQL_TODAY} AND status = 'completed'`;
 // Each sale with its lines as the daily form shows them (goods, GROCERIES with the store items).
 const withLines = (sale) => ({ ...sale, lines: presentSaleLines(sale) });
 
+// ----- Branches ------------------------------------------------------------------------------------
+// Each branch keeps its own stock and records its own sales; the Kadiwa page,
+// its reports and the sales history can show one branch or all of them.
+
+const branchSelect = `
+  SELECT b.id, b.name, b.address, b.status, b.created_at AS "createdAt",
+         (SELECT COUNT(*)::int FROM kadiwa_inventory i WHERE i.branch_id = b.id AND i.deleted_at IS NULL) AS products,
+         (SELECT COUNT(*)::int FROM users u WHERE u.kadiwa_branch_id = b.id AND u.role = 'VENDOR') AS vendors
+  FROM kadiwa_branches b`;
+const branchOrder = "(b.status = 'active') DESC, b.id";
+
+// ?branch=all|<id>: the branch to show, or null for every branch.
+function readBranchFilter(value) {
+  const text = String(value ?? '').trim();
+  if (!text || text === 'all') return null;
+  const id = Number(text);
+  if (!Number.isInteger(id) || id <= 0) throw badRequest('Choose a valid branch.');
+  return id;
+}
+
+// The branch a new sale or product goes to: it must exist and be open.
+export async function openBranch(db, value, { fallback = MAIN_BRANCH_ID } = {}) {
+  const id = value === undefined || value === null || value === '' ? fallback : Number(value);
+  if (!Number.isInteger(id) || id <= 0) throw badRequest('Choose a valid branch.');
+  const row = (await db.query('SELECT id, name, status FROM kadiwa_branches WHERE id = $1', [id])).rows[0];
+  if (!row) throw notFound('Branch not found.');
+  if (row.status !== 'active') throw conflict(`${row.name} is closed: it takes no new sales or products.`);
+  return row;
+}
+
+function readBranchInput(body) {
+  const name = cleanString(body?.name, 120);
+  if (name.length < 2) throw badRequest('Enter the branch name.');
+  return { name, address: cleanString(body?.address, 300) };
+}
+
+// GET /api/kadiwa/branches
+export async function listKadiwaBranches(req, res) {
+  const rows = (await query(`${branchSelect} ORDER BY ${branchOrder}`)).rows;
+  return res.json({ success: true, branches: rows });
+}
+
+// POST /api/kadiwa/branches { name, address }
+export async function createKadiwaBranch(req, res) {
+  const input = readBranchInput(req.body);
+  const id = await withTransaction(async (client) => {
+    if ((await client.query('SELECT 1 FROM kadiwa_branches WHERE LOWER(btrim(name)) = LOWER($1)', [input.name])).rows[0]) throw conflict(`There is already a branch named ${input.name}.`);
+    const row = (await client.query('INSERT INTO kadiwa_branches (name, address, created_by) VALUES ($1, $2, $3) RETURNING id', [input.name, input.address, currentUserId(req)])).rows[0];
+    await createAuditLog({ client, user: req.user, action: 'KADIWA_BRANCH_CREATED', module: 'Kadiwa', entityType: 'kadiwa_branch', entityId: String(row.id), description: `Added the Kadiwa store branch ${input.name}`, newValues: input, ...getRequestMeta(req) });
+    return row.id;
+  });
+  const branch = (await query(`${branchSelect} WHERE b.id = $1`, [id])).rows[0];
+  return res.status(201).json({ success: true, branch });
+}
+
+// PATCH /api/kadiwa/branches/:id { name, address, status }
+// A closed branch keeps its records but takes no new sales or products; the last open branch cannot close.
+export async function updateKadiwaBranch(req, res) {
+  const id = readBranchFilter(req.params.id);
+  if (!id) throw badRequest('Choose a valid branch.');
+  const input = readBranchInput(req.body);
+  const status = cleanString(req.body?.status, 10) || 'active';
+  if (!['active', 'closed'].includes(status)) throw badRequest('A branch is open (active) or closed.');
+  await withTransaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['acifac-kadiwa-branches']);
+    const before = (await client.query('SELECT * FROM kadiwa_branches WHERE id = $1 FOR UPDATE', [id])).rows[0];
+    if (!before) throw notFound('Branch not found.');
+    if ((await client.query('SELECT 1 FROM kadiwa_branches WHERE LOWER(btrim(name)) = LOWER($1) AND id <> $2', [input.name, id])).rows[0]) throw conflict(`There is already a branch named ${input.name}.`);
+    if (status === 'closed' && before.status === 'active') {
+      const open = (await client.query(`SELECT COUNT(*)::int AS count FROM kadiwa_branches WHERE status = 'active' AND id <> $1`, [id])).rows[0].count;
+      if (!open) throw conflict('This is the only open branch: add or reopen another branch before closing it.');
+    }
+    await client.query('UPDATE kadiwa_branches SET name = $2, address = $3, status = $4, updated_at = NOW() WHERE id = $1', [id, input.name, input.address, status]);
+    const verb = status !== before.status ? (status === 'closed' ? 'Closed' : 'Reopened') : 'Updated';
+    await createAuditLog({
+      client, user: req.user, action: 'KADIWA_BRANCH_UPDATED', module: 'Kadiwa', entityType: 'kadiwa_branch', entityId: String(id),
+      description: `${verb} the Kadiwa store branch ${input.name}`,
+      oldValues: { name: before.name, address: before.address, status: before.status }, newValues: { ...input, status }, ...getRequestMeta(req),
+    });
+  });
+  const branch = (await query(`${branchSelect} WHERE b.id = $1`, [id])).rows[0];
+  return res.json({ success: true, branch });
+}
+
+// The period of a Kadiwa chart: from and to as YYYY-MM-DD, at most a year apart.
+function readAnalyticsPeriod(source) {
+  const from = String(source.from || '');
+  const to = String(source.to || '');
+  if (!isValidDateOnly(from) || !isValidDateOnly(to) || from > to) throw badRequest('Choose a valid period: from and to as YYYY-MM-DD, from not after to.');
+  if ((Date.parse(to) - Date.parse(from)) / 86400000 > 366) throw badRequest('Choose a period of at most one year.');
+  return { from, to };
+}
+
+// GET /api/kadiwa/analytics?from&to&branch=all|<id>  The sales, expenses and net
+// income chart and the products (best sellers, running out) of one branch or all.
+export async function getKadiwaAnalytics(req, res) {
+  const { from, to } = readAnalyticsPeriod(req.query);
+  const branchId = readBranchFilter(req.query.branch);
+  const [sales, products] = await Promise.all([kadiwaSalesTrend(from, to, branchId), kadiwaProductAnalytics(from, to, branchId)]);
+  return res.json({ success: true, sales, products });
+}
+
+// GET /api/vendor/kadiwa/analytics?from&to  The same, for the vendor's own branch only.
+export async function getVendorKadiwaAnalytics(req, res) {
+  const { from, to } = readAnalyticsPeriod(req.query);
+  const branch = await vendorBranch({ query }, req);
+  const branchId = branch?.id ?? MAIN_BRANCH_ID;
+  const [sales, products] = await Promise.all([kadiwaSalesTrend(from, to, branchId), kadiwaProductAnalytics(from, to, branchId)]);
+  return res.json({ success: true, branch, sales, products });
+}
+
+// GET /api/vendor/kadiwa/sales?from&to  The vendor's own sales of those days,
+// newest first, each with its status: waiting, confirmed, or rejected with the reason.
+export async function listVendorSales(req, res) {
+  const { from, to } = readAnalyticsPeriod(req.query);
+  const sales = (await query(
+    `${salesSelect} WHERE s.created_by = $1 AND s.sale_date BETWEEN $2::date AND $3::date ORDER BY s.sale_date DESC, s.created_at DESC, s.id DESC LIMIT 500`,
+    [currentUserId(req), from, to]
+  )).rows;
+  return res.json({ success: true, from, to, sales: sales.map(withLines) });
+}
+
+// GET /api/kadiwa?branch=all|<id>  The inventory, recent sales, today's totals and
+// the vendors' sales to review, for one branch or every branch.
 export async function listKadiwaData(req, res) {
   const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 50, maxLimit: 200 });
-  const [inventory, sales, count, summary, goods, pending] = await Promise.all([
-    query(`${inventorySelect} WHERE deleted_at IS NULL ORDER BY ${inventoryOrder}`),
-    query(`${salesSelect} WHERE s.status = 'completed' ORDER BY ${salesOrder} LIMIT $1 OFFSET $2`, [limit, offset]),
-    query(`SELECT COUNT(*)::int AS total FROM kadiwa_sales WHERE status = 'completed'`),
+  const branchId = readBranchFilter(req.query.branch);
+  const inBranch = (alias = '') => `($1::int IS NULL OR ${alias}branch_id = $1)`;
+  const [inventory, sales, count, summary, goods, pending, branches] = await Promise.all([
+    query(`${inventorySelect} WHERE deleted_at IS NULL AND ${inBranch()} ORDER BY ${inventoryOrder}`, [branchId]),
+    query(`${salesSelect} WHERE s.status = 'completed' AND ${inBranch('s.')} ORDER BY ${salesOrder} LIMIT $2 OFFSET $3`, [branchId, limit, offset]),
+    query(`SELECT COUNT(*)::int AS total FROM kadiwa_sales WHERE status = 'completed' AND ${inBranch()}`, [branchId]),
     query(
       // Today: the goods sold (revenue), their cost and the expenses, and what is left (net income).
       `SELECT COUNT(*) FILTER (WHERE ${TODAY})::int AS "todaySales",
@@ -67,16 +199,18 @@ export async function listKadiwaData(req, res) {
               COALESCE(SUM(total_expenses) FILTER (WHERE ${TODAY}), 0) AS "todayExpenses",
               COALESCE(SUM(net_sales) FILTER (WHERE ${TODAY}), 0) AS "todayNetIncome",
               COALESCE(SUM(net_sales) FILTER (WHERE status = 'completed'), 0) AS "totalNetSales",
-              (SELECT COUNT(*)::int FROM kadiwa_inventory WHERE cost_price IS NULL AND deleted_at IS NULL) AS "missingCostItems",
+              (SELECT COUNT(*)::int FROM kadiwa_inventory WHERE cost_price IS NULL AND deleted_at IS NULL AND ${inBranch()}) AS "missingCostItems",
               -- Stock at cost price, as the notebook totals it; selling price where no cost is set.
-              (SELECT COALESCE(SUM(ROUND(stock * COALESCE(cost_price, price), 2)), 0) FROM kadiwa_inventory WHERE deleted_at IS NULL) AS "inventoryValue",
-              (SELECT COUNT(*)::int FROM kadiwa_inventory WHERE stock <= reorder_level AND deleted_at IS NULL) AS "lowStockItems"
-       FROM kadiwa_sales`
+              (SELECT COALESCE(SUM(ROUND(stock * COALESCE(cost_price, price), 2)), 0) FROM kadiwa_inventory WHERE deleted_at IS NULL AND ${inBranch()}) AS "inventoryValue",
+              (SELECT COUNT(*)::int FROM kadiwa_inventory WHERE stock <= reorder_level AND deleted_at IS NULL AND ${inBranch()}) AS "lowStockItems"
+       FROM kadiwa_sales WHERE ${inBranch()}`,
+      [branchId]
     ),
     goodsForForm({ query }),
-    query(`${salesSelect} WHERE s.status = 'pending' ORDER BY s.created_at, s.id LIMIT 200`),
+    query(`${salesSelect} WHERE s.status = 'pending' AND ${inBranch('s.')} ORDER BY s.created_at, s.id LIMIT 200`, [branchId]),
+    query(`${branchSelect} ORDER BY ${branchOrder}`),
   ]);
-  return res.json({ success: true, inventory: inventory.rows, sales: sales.rows.map(withLines), pagination: paginationMeta(page, limit, count.rows[0].total), summary: summary.rows[0], goods, pendingSales: pending.rows.map(withLines) });
+  return res.json({ success: true, inventory: inventory.rows, sales: sales.rows.map(withLines), pagination: paginationMeta(page, limit, count.rows[0].total), summary: summary.rows[0], goods, pendingSales: pending.rows.map(withLines), branches: branches.rows });
 }
 
 // Sales from `from` to `to` (YYYY-MM-DD, inclusive): each sale with its lines,
@@ -84,16 +218,17 @@ export async function listKadiwaData(req, res) {
 export async function listKadiwaSales(req, res) {
   // overall=true: every sale, from the first one to today (Sales History > Overall).
   const overall = req.query.overall === 'true';
+  const branchId = readBranchFilter(req.query.branch);
   let from = String(req.query.from || '');
   let to = String(req.query.to || '');
   if (overall) {
     to = todayDateOnly();
-    const first = (await query(`SELECT TO_CHAR(MIN(sale_date), 'YYYY-MM-DD') AS first FROM kadiwa_sales WHERE status = 'completed'`)).rows[0].first;
+    const first = (await query(`SELECT TO_CHAR(MIN(sale_date), 'YYYY-MM-DD') AS first FROM kadiwa_sales WHERE status = 'completed' AND ($1::int IS NULL OR branch_id = $1)`, [branchId])).rows[0].first;
     from = first && first < to ? first : to;
   }
   if (!isValidDateOnly(from) || !isValidDateOnly(to) || from > to) throw badRequest('Choose a valid period: from and to as YYYY-MM-DD, from not after to.');
   if (!overall && (Date.parse(to) - Date.parse(from)) / 86400000 > 366) throw badRequest('Choose a period of at most one year.');
-  const sales = (await query(`${salesSelect} WHERE s.sale_date BETWEEN $1::date AND $2::date AND s.status = 'completed' ORDER BY ${salesOrder} LIMIT 5000`, [from, to])).rows;
+  const sales = (await query(`${salesSelect} WHERE s.sale_date BETWEEN $1::date AND $2::date AND s.status = 'completed' AND ($3::int IS NULL OR s.branch_id = $3) ORDER BY ${salesOrder} LIMIT 5000`, [from, to, branchId])).rows;
   return res.json({ success: true, from, to, sales: sales.map(withLines), report: salesReport(sales) });
 }
 
@@ -104,7 +239,8 @@ export async function listKadiwaSales(req, res) {
 // memberPurchases: [{ memberId, amountCents }], the members who bought that day
 // and for how much (their patronage business); together never more than the day's sales.
 // pending: a vendor's sale, counted nowhere until an administrator confirms it.
-export async function insertKadiwaSale(client, req, { encoderName, saleDate = null, manual, expensesCents, items, goods = [], expenseLines = [], memberPurchases = [], pending = false }) {
+// branchId: the branch where it was sold; store items come from its stock only.
+export async function insertKadiwaSale(client, req, { encoderName, saleDate = null, manual, expensesCents, items, goods = [], expenseLines = [], memberPurchases = [], pending = false, branchId = MAIN_BRANCH_ID }) {
   const totals = { ...manual };
   for (const good of goods) totals[good.category] = (totals[good.category] || 0) + toCents(good.amount);
   const lines = [];
@@ -112,14 +248,14 @@ export async function insertKadiwaSale(client, req, { encoderName, saleDate = nu
   // oversell or deadlock.
   const ids = [...new Set(items.map((item) => item.inventoryId))].sort();
   const products = ids.length
-    ? (await client.query('SELECT id, name, size_value, size_unit, category, unit, stock, price, cost_price FROM kadiwa_inventory WHERE id = ANY($1::varchar[]) AND deleted_at IS NULL ORDER BY id FOR UPDATE', [ids])).rows
+    ? (await client.query('SELECT id, name, size_value, size_unit, category, unit, stock, price, cost_price FROM kadiwa_inventory WHERE id = ANY($1::varchar[]) AND deleted_at IS NULL AND branch_id = $2 ORDER BY id FOR UPDATE', [ids, branchId])).rows
     : [];
   for (const product of products) product.label = productLabel(product.name, product.size_value, product.size_unit);
   const byId = new Map(products.map((product) => [product.id, product]));
   const requested = new Map();
   for (const item of items) {
     const product = byId.get(item.inventoryId);
-    if (!product) throw notFound('A selected product no longer exists.');
+    if (!product) throw notFound('A selected product is not in this branch\'s stock, or no longer exists.');
     requested.set(product.id, (requested.get(product.id) || 0) + toCents(item.quantity));
   }
   for (const [id, quantityCents] of requested) {
@@ -162,12 +298,12 @@ export async function insertKadiwaSale(client, req, { encoderName, saleDate = nu
 
   const id = (await client.query(
     `WITH day AS (SELECT COALESCE($8::date, ${SQL_TODAY}) AS sale_date)
-     INSERT INTO kadiwa_sales (id, sale_date, encoder_name, groceries, vegetables, meat, total_expenses, cost_of_goods, net_sales, created_by, status)
+     INSERT INTO kadiwa_sales (id, sale_date, encoder_name, groceries, vegetables, meat, total_expenses, cost_of_goods, net_sales, created_by, status, branch_id)
      SELECT 'S-' || TO_CHAR(day.sale_date, 'YYYY') || '-' || LPAD(nextval('kadiwa_sale_seq')::text, 5, '0'), day.sale_date,
-            $1, $2::numeric, $3::numeric, $4::numeric, $5::numeric, $9::numeric, $6::numeric, $7, $10
+            $1, $2::numeric, $3::numeric, $4::numeric, $5::numeric, $9::numeric, $6::numeric, $7, $10, $11
        FROM day
      RETURNING id`,
-    [encoderName, centsToString(groceries), centsToString(totals.Vegetables || 0), centsToString(totals.Meat || 0), centsToString(expensesCents), centsToString(net), currentUserId(req), saleDate, centsToString(costCents), pending ? 'pending' : 'completed']
+    [encoderName, centsToString(groceries), centsToString(totals.Vegetables || 0), centsToString(totals.Meat || 0), centsToString(expensesCents), centsToString(net), currentUserId(req), saleDate, centsToString(costCents), pending ? 'pending' : 'completed', branchId]
   )).rows[0].id;
 
   if (goods.length) {
@@ -223,7 +359,7 @@ export async function insertKadiwaSale(client, req, { encoderName, saleDate = nu
     entityId: id,
     description: pending ? `Vendor ${encoderName} sent Kadiwa sale ${id} for review` : `Recorded Kadiwa sale ${id}${encoderName ? ` by ${encoderName}` : ''}`,
     newValues: {
-      seller: encoderName, sale_date: saleDate, total_expenses: centsToString(expensesCents), cost_of_goods: centsToString(costCents), net_sales: centsToString(net),
+      seller: encoderName, branch_id: branchId, sale_date: saleDate, total_expenses: centsToString(expensesCents), cost_of_goods: centsToString(costCents), net_sales: centsToString(net),
       // The capital changes only when the sale counts: now, or when an administrator confirms a vendor's sale.
       ...(pending ? { status: 'pending' } : { capital_change: capitalChange(net) }),
       goods: goods.map((good) => ({ name: good.name, amount: good.amount })),
@@ -234,7 +370,8 @@ export async function insertKadiwaSale(client, req, { encoderName, saleDate = nu
     ...getRequestMeta(req),
   });
   if (lowStock.length) {
-    await notifyAdmins(client, { type: 'low_stock', title: 'Kadiwa stock is low', message: `${lowStock.join(', ')} ${lowStock.length === 1 ? 'is' : 'are'} at or below the reorder level.`, severity: 'warning', link: '/kadiwa', entityType: 'kadiwa_sale', entityId: id, dedupeKey: `low-stock-${id}` });
+    const branchName = (await client.query('SELECT name FROM kadiwa_branches WHERE id = $1', [branchId])).rows[0]?.name;
+    await notifyAdmins(client, { type: 'low_stock', title: 'Kadiwa stock is low', message: `${branchName ? `${branchName}: ` : ''}${lowStock.join(', ')} ${lowStock.length === 1 ? 'is' : 'are'} at or below the reorder level.`, severity: 'warning', link: '/kadiwa', entityType: 'kadiwa_sale', entityId: id, dedupeKey: `low-stock-${id}` });
   }
   return id;
 }
@@ -328,7 +465,10 @@ export async function createKadiwaSale(req, res) {
   if (!goods.length && !items.length && Object.values(manual).every((cents) => cents === 0)) throw badRequest('Enter the amount of at least one good sold.');
   const memberPurchases = parseMemberPurchases(body.memberPurchases);
 
-  const saleId = await withTransaction((client) => insertKadiwaSale(client, req, { encoderName: sellerName, saleDate, manual, expensesCents, items, goods, expenseLines, memberPurchases }));
+  const saleId = await withTransaction(async (client) => {
+    const branch = await openBranch(client, body.branchId);
+    return insertKadiwaSale(client, req, { encoderName: sellerName, saleDate, manual, expensesCents, items, goods, expenseLines, memberPurchases, branchId: branch.id });
+  });
   const sale = await query(`${salesSelect} WHERE s.id = $1`, [saleId]);
   return res.status(201).json({ success: true, sale: withLines(sale.rows[0]) });
 }
@@ -341,15 +481,24 @@ export async function createKadiwaSale(req, res) {
 // sent, so two sales cannot sell the same stock; a rejected sale puts them back.
 
 const vendorName = (user) => cleanString(user?.full_name ?? '', 200) || cleanString(user?.username ?? '', 200);
+// The branch the signed-in vendor sells at (the main store when none was set).
+async function vendorBranch(db, req) {
+  return (await db.query(
+    `SELECT b.id, b.name, b.address, b.status FROM users u JOIN kadiwa_branches b ON b.id = COALESCE(u.kadiwa_branch_id, ${MAIN_BRANCH_ID}) WHERE u.id = $1`,
+    [currentUserId(req)]
+  )).rows[0] || null;
+}
 
 // GET /api/vendor/kadiwa  The goods and store items for the form, and the vendor's own sales, newest first.
 export async function listVendorKadiwa(req, res) {
+  const branch = await vendorBranch({ query }, req);
   const [goods, sales, inventory] = await Promise.all([
     goodsForForm({ query }),
     query(`${salesSelect} WHERE s.created_by = $1 ORDER BY s.created_at DESC, s.id DESC LIMIT 60`, [currentUserId(req)]),
-    query(`${inventorySelect} WHERE deleted_at IS NULL ORDER BY ${inventoryOrder}`),
+    // Only the stock of the vendor's own branch.
+    query(`${inventorySelect} WHERE deleted_at IS NULL AND branch_id = $1 ORDER BY ${inventoryOrder}`, [branch?.id ?? MAIN_BRANCH_ID]),
   ]);
-  return res.json({ success: true, goods, inventory: inventory.rows, sales: sales.rows.map(withLines) });
+  return res.json({ success: true, goods, inventory: inventory.rows, sales: sales.rows.map(withLines), branch });
 }
 
 // POST /api/vendor/kadiwa/sales { saleDate, goods, items, expenses, memberPurchases }
@@ -362,10 +511,12 @@ export async function createVendorKadiwaSale(req, res) {
   const memberPurchases = parseMemberPurchases(body.memberPurchases);
   const encoderName = vendorName(req.user);
   const saleId = await withTransaction(async (client) => {
-    const id = await insertKadiwaSale(client, req, { encoderName, saleDate, manual: {}, expensesCents, items, goods, expenseLines, memberPurchases, pending: true });
+    const branch = await vendorBranch(client, req);
+    if (!branch || branch.status !== 'active') throw conflict(`${branch?.name || 'Your branch'} is closed, so sales cannot be sent for it. Please ask the office.`);
+    const id = await insertKadiwaSale(client, req, { encoderName, saleDate, manual: {}, expensesCents, items, goods, expenseLines, memberPurchases, pending: true, branchId: branch.id });
     await notifyAdmins(client, {
       type: 'kadiwa_sale_submitted', title: 'Kadiwa sale to review', severity: 'info', link: '/kadiwa', entityType: 'kadiwa_sale', entityId: id, dedupeKey: `kadiwa-sale-submitted-${id}`,
-      message: `${encoderName} sent the sales and expenses of ${formatDateOnly(saleDate || todayDateOnly())} (${id}) for review.`,
+      message: `${encoderName} (${branch.name}) sent the sales and expenses of ${formatDateOnly(saleDate || todayDateOnly())} (${id}) for review.`,
     });
     return id;
   });
@@ -491,16 +642,16 @@ function parseInventoryInput(body, { prefix = '' } = {}) {
 // the bottle); Toyo 1 L is another product.
 const sameProductKey = (item) => [item.name.toLowerCase(), item.sizeValue === null ? '' : Number(item.sizeValue), item.sizeUnit || '', item.unit.toLowerCase()].join('|');
 
-// The first of `items` already in the inventory (other than `exceptId`), or null.
-async function findExisting(client, items, exceptId = null) {
+// The first of `items` already in the branch's inventory (other than `exceptId`), or null.
+async function findExisting(client, items, exceptId = null, branchId = MAIN_BRANCH_ID) {
   const result = await client.query(
     `SELECT i.ord::int AS ord, k.id
        FROM unnest($1::text[], $2::numeric[], $3::text[], $4::text[]) WITH ORDINALITY AS i(name, size_value, size_unit, unit, ord)
        JOIN kadiwa_inventory k ON LOWER(k.name) = LOWER(i.name) AND k.size_value IS NOT DISTINCT FROM i.size_value
         AND k.size_unit IS NOT DISTINCT FROM i.size_unit AND LOWER(k.unit) = LOWER(i.unit)
-      WHERE k.deleted_at IS NULL AND ($5::varchar IS NULL OR k.id <> $5)
+      WHERE k.deleted_at IS NULL AND ($5::varchar IS NULL OR k.id <> $5) AND k.branch_id = $6
       ORDER BY i.ord LIMIT 1`,
-    [items.map((item) => item.name), items.map((item) => item.sizeValue), items.map((item) => item.sizeUnit), items.map((item) => item.unit), exceptId]
+    [items.map((item) => item.name), items.map((item) => item.sizeValue), items.map((item) => item.sizeUnit), items.map((item) => item.unit), exceptId, branchId]
   );
   return result.rows[0] ? { index: result.rows[0].ord - 1, id: result.rows[0].id } : null;
 }
@@ -510,14 +661,15 @@ async function findExisting(client, items, exceptId = null) {
 export async function createInventoryItem(req, res) {
   const body = req.body || {};
   const rows = Array.isArray(body.items) ? body.items : [body];
-  const created = await withTransaction((client) => insertInventoryItems(client, req, rows));
+  const created = await withTransaction((client) => insertInventoryItems(client, req, rows, { branchId: body.branchId }));
   return res.status(201).json({ success: true, items: created, item: created[0] });
 }
 
 // Checks and adds the rows of an inventory sheet inside the caller's
 // transaction, and returns the products added. Shared by Add Inventory and by
-// OCR-posted Add Inventory forms. `source` is added to the audit description.
-export async function insertInventoryItems(client, req, rows, { source = '' } = {}) {
+// OCR-posted Add Inventory forms. `source` is added to the audit description;
+// `branchId` is the branch whose stock they join (the main store when not given).
+export async function insertInventoryItems(client, req, rows, { source = '', branchId } = {}) {
   if (!rows.length) throw badRequest('Add at least one product.');
   if (rows.length > MAX_SHEET_ROWS) throw badRequest(`Save at most ${MAX_SHEET_ROWS} products at a time.`);
   const rowLabel = (index) => (rows.length > 1 ? `Row ${index + 1}: ` : '');
@@ -531,24 +683,25 @@ export async function insertInventoryItems(client, req, rows, { source = '' } = 
 
   // One add or edit at a time, so two admins cannot add the same product together.
   await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [INVENTORY_LOCK]);
-  const existing = await findExisting(client, items);
+  const branch = await openBranch(client, branchId);
+  const existing = await findExisting(client, items, null, branch.id);
   if (existing) {
     const item = items[existing.index];
-    throw conflict(`${rowLabel(existing.index)}${productLabel(item.name, item.sizeValue, item.sizeUnit)} (${item.unit}) is already in the inventory as ${existing.id}. Use Restock or Edit instead.`);
+    throw conflict(`${rowLabel(existing.index)}${productLabel(item.name, item.sizeValue, item.sizeUnit)} (${item.unit}) is already in the ${branch.name} inventory as ${existing.id}. Use Restock or Edit instead.`);
   }
   const column = (key) => items.map((item) => item[key]);
   const ids = (await client.query(
-    `INSERT INTO kadiwa_inventory (id, name, category, size_value, size_unit, unit, stock, price, cost_price, reorder_level)
-     SELECT 'INV-' || LPAD(nextval('kadiwa_inventory_seq')::text, 4, '0'), r.name, r.category, r.size_value, r.size_unit, r.unit, r.stock, r.price, r.cost_price, r.reorder_level
+    `INSERT INTO kadiwa_inventory (id, name, category, size_value, size_unit, unit, stock, price, cost_price, reorder_level, branch_id)
+     SELECT 'INV-' || LPAD(nextval('kadiwa_inventory_seq')::text, 4, '0'), r.name, r.category, r.size_value, r.size_unit, r.unit, r.stock, r.price, r.cost_price, r.reorder_level, $10
        FROM unnest($1::text[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::numeric[], $7::numeric[], $8::numeric[], $9::numeric[])
             WITH ORDINALITY AS r(name, category, size_value, size_unit, unit, stock, price, cost_price, reorder_level, ord)
       ORDER BY r.ord
      RETURNING id`,
-    [column('name'), column('category'), column('sizeValue'), column('sizeUnit'), column('unit'), column('stock'), column('price'), column('costPrice'), column('reorderLevel')]
+    [column('name'), column('category'), column('sizeValue'), column('sizeUnit'), column('unit'), column('stock'), column('price'), column('costPrice'), column('reorderLevel'), branch.id]
   )).rows.map((row) => row.id);
   const description = `${items.length === 1
     ? `Added inventory item ${productLabel(items[0].name, items[0].sizeValue, items[0].sizeUnit)}`
-    : `Added ${items.length} inventory items`}${source ? ` ${source}` : ''}`;
+    : `Added ${items.length} inventory items`} to ${branch.name}${source ? ` ${source}` : ''}`;
   await createAuditLog({ client, user: req.user, action: 'INVENTORY_CREATED', module: 'Kadiwa', entityType: 'kadiwa_inventory', entityId: ids.length === 1 ? ids[0] : null, description, newValues: items.length === 1 ? { id: ids[0], ...items[0] } : { items: items.map((item, index) => ({ id: ids[index], ...item })) }, ...getRequestMeta(req) });
   return (await client.query(`${inventorySelect} WHERE id = ANY($1::varchar[]) ORDER BY ${inventoryOrder}`, [ids])).rows;
 }
@@ -566,8 +719,8 @@ export async function updateInventoryItem(req, res) {
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [INVENTORY_LOCK]);
     const before = (await client.query(`${inventorySelect} WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`, [id])).rows[0];
     if (!before) throw notFound('Inventory item not found.');
-    const existing = await findExisting(client, [input], id);
-    if (existing) throw conflict(`${productLabel(input.name, input.sizeValue, input.sizeUnit)} (${input.unit}) is already in the inventory as ${existing.id}.`);
+    const existing = await findExisting(client, [input], id, before.branchId);
+    if (existing) throw conflict(`${productLabel(input.name, input.sizeValue, input.sizeUnit)} (${input.unit}) is already in this branch's inventory as ${existing.id}.`);
     const stockChanged = counted !== null && toCents(counted) !== toCents(before.stock);
     if (stockChanged && (!QUANTITY_PATTERN.test(expected) || toCents(expected) !== toCents(before.stock))) {
       throw conflict(`The quantity of ${productLabel(before.name, before.sizeValue, before.sizeUnit)} is now ${Number(before.stock)} ${before.unit}: a sale or restock was saved while you were editing. Open it again to enter the count.`);
@@ -612,6 +765,52 @@ export async function deleteInventoryItem(req, res) {
       oldValues: before, newValues: { deleted: true, kept_for_past_sales: pastSales > 0, past_sales: pastSales }, ...getRequestMeta(req),
     });
     return { id, name, keptForPastSales: pastSales > 0, pastSales };
+  });
+  return res.json({ success: true, ...result });
+}
+
+// POST /api/kadiwa/inventory/:id/transfer { branchId, quantity }
+// Sends stock from one branch's inventory (usually the office's main store) to
+// another open branch: it leaves this product's stock and joins the same
+// product at that branch (name, size and counting unit), which is added there
+// with the same prices when the branch does not have it yet.
+export async function transferInventoryItem(req, res) {
+  const id = cleanString(req.params.id, 30);
+  const quantity = String(req.body?.quantity ?? '').trim();
+  if (!QUANTITY_PATTERN.test(quantity) || Number(quantity) <= 0) throw badRequest('Enter the quantity to send, greater than zero.');
+  const result = await withTransaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [INVENTORY_LOCK]);
+    const source = (await client.query('SELECT * FROM kadiwa_inventory WHERE id = $1 AND deleted_at IS NULL FOR UPDATE', [id])).rows[0];
+    if (!source) throw notFound('Inventory item not found.');
+    const target = await openBranch(client, req.body?.branchId, { fallback: null });
+    if (Number(target.id) === Number(source.branch_id)) throw badRequest('Choose another branch: the product is already in this one.');
+    const name = productLabel(source.name, source.size_value, source.size_unit);
+    if (toCents(quantity) > toCents(source.stock)) throw conflict(`Only ${Number(source.stock)} ${source.unit} of ${name} is in stock.`);
+    const from = (await client.query('SELECT name FROM kadiwa_branches WHERE id = $1', [source.branch_id])).rows[0]?.name || 'the branch';
+
+    const match = await findExisting(client, [{ name: source.name, sizeValue: source.size_value, sizeUnit: source.size_unit, unit: source.unit }], null, target.id);
+    let targetId = match?.id;
+    if (targetId) {
+      await client.query('SELECT id FROM kadiwa_inventory WHERE id = $1 FOR UPDATE', [targetId]);
+      await client.query('UPDATE kadiwa_inventory SET stock = stock + $1::numeric, updated_at = NOW() WHERE id = $2', [quantity, targetId]);
+    } else {
+      targetId = (await client.query(
+        `INSERT INTO kadiwa_inventory (id, name, category, size_value, size_unit, unit, stock, price, cost_price, reorder_level, branch_id)
+         SELECT 'INV-' || LPAD(nextval('kadiwa_inventory_seq')::text, 4, '0'), name, category, size_value, size_unit, unit, $2::numeric, price, cost_price, reorder_level, $3
+           FROM kadiwa_inventory WHERE id = $1
+         RETURNING id`,
+        [id, quantity, target.id]
+      )).rows[0].id;
+    }
+    await client.query('UPDATE kadiwa_inventory SET stock = stock - $1::numeric, updated_at = NOW() WHERE id = $2', [quantity, id]);
+    await createAuditLog({
+      client, user: req.user, action: 'INVENTORY_TRANSFERRED', module: 'Kadiwa', entityType: 'kadiwa_inventory', entityId: id,
+      description: `Sent ${quantity} ${source.unit} of ${name} from ${from} to ${target.name}`,
+      oldValues: { stock: source.stock }, newValues: { quantity, from_branch: from, to_branch: target.name, to_item: targetId, added_to_branch: !match },
+      ...getRequestMeta(req),
+    });
+    const rows = (await client.query(`${inventorySelect} WHERE id = ANY($1::varchar[])`, [[id, targetId]])).rows;
+    return { from: rows.find((row) => row.id === id), to: rows.find((row) => row.id === targetId), addedToBranch: !match };
   });
   return res.json({ success: true, ...result });
 }

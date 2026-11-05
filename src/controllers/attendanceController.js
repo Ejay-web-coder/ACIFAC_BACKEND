@@ -21,11 +21,17 @@ const COUNTED = `a.status = 'completed' AND a.attendance_finalized_at IS NOT NUL
 // Members who could attend an activity held on `date`: their membership began
 // on or before it and was not terminated before it.
 const eligibleOn = (date) => `(m.membership_date <= ${date} AND (m.status <> 'archived' OR (m.archived_at AT TIME ZONE '${TIME_ZONE}')::date > ${date}))`;
+// An activity for selected members only: member m is one of them (`activity`
+// is the SQL for the activity's id).
+const invitedTo = (scope, activity) => (scope === 'selected' ? `EXISTS (SELECT 1 FROM activity_invitees i WHERE i.activity_id = ${activity} AND i.member_id = m.id)` : 'TRUE');
+// Members who must attend: eligible on the date and, for selected members only, chosen.
+const mustAttend = (scope, activity, date) => `(${eligibleOn(date)} AND ${invitedTo(scope, activity)})`;
 
 const activitySelect = `
   SELECT a.id, a.title, a.category, a.activity_date AS "activityDate",
          TO_CHAR(a.start_time, 'HH24:MI') AS "startTime", TO_CHAR(a.end_time, 'HH24:MI') AS "endTime",
-         a.venue, a.description, a.organizer, a.status,
+         a.venue, a.description, a.organizer, a.status, a.attendee_scope AS "attendeeScope",
+         (SELECT COUNT(*) FROM activity_invitees i WHERE i.activity_id = a.id)::int AS "inviteeCount",
          a.attendance_finalized_at AS "finalizedAt", fu.username AS "finalizedBy",
          a.cancelled_at AS "cancelledAt", a.cancellation_reason AS "cancellationReason",
          cu.username AS "createdBy", a.created_at AS "createdAt", a.updated_at AS "updatedAt",
@@ -176,26 +182,51 @@ export async function listActivities(req, res) {
 export async function getActivity(req, res) {
   const id = parseId(req.params.id, 'activity ID');
   const activity = await loadActivity(id);
-  const counts = (await query(
-    `SELECT COUNT(*) FILTER (WHERE ${eligibleOn('$2::date')} OR r.id IS NOT NULL)::int AS listed,
-            COUNT(*) FILTER (WHERE r.id IS NULL AND ${eligibleOn('$2::date')})::int AS unmarked,
-            COUNT(*) FILTER (WHERE r.id IS NULL AND m.status = 'active' AND ${eligibleOn('$2::date')})::int AS "toMarkAbsent"
-       FROM members m
-       LEFT JOIN activity_attendance r ON r.member_id = m.id AND r.activity_id = $1`,
-    [id, activity.activityDate]
-  )).rows[0];
+  const must = mustAttend(activity.attendeeScope, '$1', '$2::date');
+  const [countRows, inviteeRows] = await Promise.all([
+    query(
+      `SELECT COUNT(*) FILTER (WHERE ${must} OR r.id IS NOT NULL)::int AS listed,
+              COUNT(*) FILTER (WHERE r.id IS NULL AND ${must})::int AS unmarked,
+              COUNT(*) FILTER (WHERE r.id IS NULL AND m.status = 'active' AND ${must})::int AS "toMarkAbsent"
+         FROM members m
+         LEFT JOIN activity_attendance r ON r.member_id = m.id AND r.activity_id = $1`,
+      [id, activity.activityDate]
+    ),
+    // The members chosen to attend, for the activity form.
+    activity.attendeeScope === 'selected'
+      ? query(`SELECT m.id, m.member_number AS "memberNumber", ${MEMBER_NAME} AS name FROM activity_invitees i JOIN members m ON m.id = i.member_id WHERE i.activity_id = $1 ORDER BY LOWER(m.last_name), LOWER(m.first_name), m.id`, [id])
+      : { rows: [] },
+  ]);
+  const counts = countRows.rows[0];
   const today = todayDateOnly();
   const recordable = activity.status !== 'cancelled' && activity.activityDate <= today;
   return res.json({
     success: true,
-    data: { ...activity, members: counts.listed, unmarked: counts.unmarked, toMarkAbsent: counts.toMarkAbsent, recordable, canFinalize: recordable && !activity.final, today },
+    data: { ...activity, invitees: inviteeRows.rows, members: counts.listed, unmarked: counts.unmarked, toMarkAbsent: counts.toMarkAbsent, recordable, canFinalize: recordable && !activity.final, today },
   });
 }
 
 const activityAuditValues = (row) => ({
   title: row.title, category: row.category, activity_date: row.activity_date, start_time: String(row.start_time).slice(0, 5), end_time: String(row.end_time).slice(0, 5),
   venue: row.venue, description: row.description, organizer: row.organizer, status: row.status, cancellation_reason: row.cancellation_reason ?? null,
+  attendee_scope: row.attendee_scope,
 });
+
+// Replaces the members an activity is mandatory for (selected members only);
+// none are kept for an activity open to all members. Returns how many there are.
+async function saveInvitees(client, activityId, scope, memberIds) {
+  if (scope !== 'selected') {
+    await client.query('DELETE FROM activity_invitees WHERE activity_id = $1', [activityId]);
+    return 0;
+  }
+  if (!memberIds) return (await client.query('SELECT COUNT(*)::int AS count FROM activity_invitees WHERE activity_id = $1', [activityId])).rows[0].count;
+  const found = (await client.query('SELECT COUNT(*)::int AS count FROM members WHERE id = ANY($1::int[])', [memberIds])).rows[0].count;
+  if (found !== memberIds.length) throw badRequest('Some of the members who must attend were not found.');
+  await client.query('DELETE FROM activity_invitees WHERE activity_id = $1 AND NOT (member_id = ANY($2::int[]))', [activityId, memberIds]);
+  await client.query('INSERT INTO activity_invitees (activity_id, member_id) SELECT $1, UNNEST($2::int[]) ON CONFLICT DO NOTHING', [activityId, memberIds]);
+  return memberIds.length;
+}
+const scopeText = (scope, count) => (scope === 'selected' ? `${count} selected ${count === 1 ? 'member' : 'members'}` : 'all members');
 
 // POST /api/attendance/activities
 export async function createActivity(req, res) {
@@ -204,14 +235,15 @@ export async function createActivity(req, res) {
   const userId = currentUserId(req);
   const id = await withTransaction(async (client) => {
     const row = (await client.query(
-      `INSERT INTO activities (title, category, activity_date, start_time, end_time, venue, description, organizer, status, created_by, updated_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) RETURNING *`,
-      [values.title, values.category, values.activityDate, values.startTime, values.endTime, values.venue, values.description, values.organizer, values.status, userId]
+      `INSERT INTO activities (title, category, activity_date, start_time, end_time, venue, description, organizer, status, attendee_scope, created_by, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11) RETURNING *`,
+      [values.title, values.category, values.activityDate, values.startTime, values.endTime, values.venue, values.description, values.organizer, values.status, values.attendeeScope, userId]
     )).rows[0];
+    const invitees = await saveInvitees(client, row.id, values.attendeeScope, values.memberIds);
     await createAuditLog({
       client, user: req.user, action: 'ACTIVITY_CREATED', module: MODULE, entityType: 'activity', entityId: String(row.id),
-      description: `Created the ${ACTIVITY_CATEGORIES[row.category].toLowerCase()} activity "${row.title}" on ${formatDateOnly(row.activity_date)}`,
-      newValues: activityAuditValues(row), ...getRequestMeta(req),
+      description: `Created the ${ACTIVITY_CATEGORIES[row.category].toLowerCase()} activity "${row.title}" on ${formatDateOnly(row.activity_date)}, mandatory for ${scopeText(values.attendeeScope, invitees)}`,
+      newValues: { ...activityAuditValues(row), invitees }, ...getRequestMeta(req),
     });
     return row.id;
   });
@@ -229,25 +261,31 @@ export async function updateActivity(req, res) {
     const hasRecords = (await client.query('SELECT EXISTS (SELECT 1 FROM activity_attendance WHERE activity_id = $1) AS has', [id])).rows[0].has;
     const { errors, values } = validateActivityInput(req.body, { today: todayDateOnly(), existing, hasRecords });
     if (errors.length) throw badRequest(errors[0], errors);
+    const before = (await client.query('SELECT ARRAY_AGG(member_id ORDER BY member_id) AS ids FROM activity_invitees WHERE activity_id = $1', [id])).rows[0].ids || [];
+    if (existing.attendance_finalized_at && values.memberIds && values.attendeeScope === 'selected'
+      && [...values.memberIds].sort((a, b) => a - b).join(',') !== before.join(',')) {
+      throw badRequest('Attendance for this activity is final, so who must attend cannot be changed.');
+    }
     const cancelling = values.status === 'cancelled' && existing.status !== 'cancelled';
     const restoring = values.status !== 'cancelled' && existing.status === 'cancelled';
     const updated = (await client.query(
       `UPDATE activities
-          SET title = $2, category = $3, activity_date = $4, start_time = $5, end_time = $6, venue = $7, description = $8, organizer = $9, status = $10::varchar,
+          SET title = $2, category = $3, activity_date = $4, start_time = $5, end_time = $6, venue = $7, description = $8, organizer = $9, status = $10::varchar, attendee_scope = $13,
               cancelled_at = CASE WHEN $10::varchar = 'cancelled' THEN COALESCE(cancelled_at, NOW()) END,
               cancelled_by = CASE WHEN $10::varchar = 'cancelled' THEN CASE WHEN cancelled_at IS NULL THEN $11 ELSE cancelled_by END END,
               cancellation_reason = CASE WHEN $10::varchar = 'cancelled' THEN COALESCE(NULLIF($12, ''), cancellation_reason) END,
               updated_by = $11, updated_at = NOW()
         WHERE id = $1
         RETURNING *`,
-      [id, values.title, values.category, values.activityDate, values.startTime, values.endTime, values.venue, values.description, values.organizer, values.status, userId, values.cancellationReason]
+      [id, values.title, values.category, values.activityDate, values.startTime, values.endTime, values.venue, values.description, values.organizer, values.status, userId, values.cancellationReason, values.attendeeScope]
     )).rows[0];
+    const invitees = await saveInvitees(client, id, values.attendeeScope, values.memberIds);
     const action = cancelling ? 'ACTIVITY_CANCELLED' : restoring ? 'ACTIVITY_RESTORED' : 'ACTIVITY_UPDATED';
     const verb = cancelling ? 'Cancelled' : restoring ? 'Restored' : 'Updated';
     await createAuditLog({
       client, user: req.user, action, module: MODULE, entityType: 'activity', entityId: String(id),
       description: `${verb} the activity "${updated.title}" on ${formatDateOnly(updated.activity_date)}`,
-      oldValues: activityAuditValues(existing), newValues: activityAuditValues(updated), ...getRequestMeta(req),
+      oldValues: { ...activityAuditValues(existing), invitees: before.length }, newValues: { ...activityAuditValues(updated), invitees }, ...getRequestMeta(req),
     });
   });
   return res.json({ success: true, message: 'Activity updated.', data: await loadActivity(id) });
@@ -282,10 +320,10 @@ export async function cancelActivity(req, res) {
 // already recorded, each with their attendance record if there is one.
 export async function listActivityMembers(req, res) {
   const id = parseId(req.params.id, 'activity ID');
-  const activity = (await query('SELECT activity_date FROM activities WHERE id = $1', [id])).rows[0];
+  const activity = (await query('SELECT activity_date, attendee_scope FROM activities WHERE id = $1', [id])).rows[0];
   if (!activity) throw notFound('Activity not found.');
   const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 25, maxLimit: 100 });
-  const builder = conditionBuilder([id, activity.activity_date], [`(${eligibleOn('$2::date')} OR r.id IS NOT NULL)`]);
+  const builder = conditionBuilder([id, activity.activity_date], [`(${mustAttend(activity.attendee_scope, '$1', '$2::date')} OR r.id IS NOT NULL)`]);
   const search = cleanString(req.query.search, 100);
   if (search) {
     builder.add(`(m.member_number ILIKE $? OR ${MEMBER_NAME} ILIKE $? OR TRIM(CONCAT_WS(' ', m.first_name, m.last_name)) ILIKE $? OR TRIM(CONCAT_WS(' ', m.last_name, m.first_name)) ILIKE $?)`, `%${search}%`);
@@ -338,7 +376,7 @@ export async function saveAttendance(req, res) {
     if (final && reason.length < 3) throw badRequest('Attendance for this activity is final. Give the reason for the correction.');
 
     const members = (await client.query(
-      `SELECT m.id, m.member_number, ${MEMBER_NAME} AS name, ${eligibleOn('$2::date')} AS eligible,
+      `SELECT m.id, m.member_number, ${MEMBER_NAME} AS name, ${eligibleOn('$2::date')} AS eligible, ${invitedTo(activity.attendee_scope, '$1')} AS invited,
               r.id AS record_id, r.attendance_status, TO_CHAR(r.check_in_time, 'HH24:MI') AS check_in_time, r.remarks
          FROM members m
          LEFT JOIN activity_attendance r ON r.member_id = m.id AND r.activity_id = $1
@@ -349,6 +387,8 @@ export async function saveAttendance(req, res) {
     if (records.some((record) => !byId.has(record.memberId))) throw badRequest('Some of the members were not found.');
     const notEligible = records.find((record) => !byId.get(record.memberId).record_id && !byId.get(record.memberId).eligible);
     if (notEligible) throw badRequest(`${byId.get(notEligible.memberId).name} was not a member on the activity date.`);
+    const notInvited = records.find((record) => !byId.get(record.memberId).record_id && !byId.get(record.memberId).invited);
+    if (notInvited) throw badRequest(`${byId.get(notInvited.memberId).name} is not one of the members who must attend this activity.`);
 
     const added = [];
     const changed = [];
@@ -421,7 +461,7 @@ export async function finalizeAttendance(req, res) {
       `INSERT INTO activity_attendance (activity_id, member_id, attendance_status, source, recorded_by, updated_by)
        SELECT $1, m.id, 'absent', 'finalization', $3, $3
          FROM members m
-        WHERE m.status = 'active' AND ${eligibleOn('$2::date')}
+        WHERE m.status = 'active' AND ${mustAttend(activity.attendee_scope, '$1', '$2::date')}
           AND NOT EXISTS (SELECT 1 FROM activity_attendance r WHERE r.activity_id = $1 AND r.member_id = m.id)`,
       [id, activity.activity_date, userId]
     );
@@ -593,7 +633,13 @@ async function participationProfile(memberId) {
         LIMIT 500`,
       [memberId]
     ),
-    query(`${activitySelect} WHERE a.status = 'scheduled' AND a.activity_date >= ${SQL_TODAY} ORDER BY a.activity_date, a.start_time, a.id LIMIT 5`),
+    // Activities for all members, and those for selected members this member is one of.
+    query(
+      `${activitySelect} WHERE a.status = 'scheduled' AND a.activity_date >= ${SQL_TODAY}
+         AND (a.attendee_scope = 'all' OR EXISTS (SELECT 1 FROM activity_invitees i WHERE i.activity_id = a.id AND i.member_id = $1))
+       ORDER BY a.activity_date, a.start_time, a.id LIMIT 5`,
+      [memberId]
+    ),
   ]);
   if (!member.rows[0]) throw notFound('Member not found.');
   const records = history.rows.map((row) => ({ ...row, categoryLabel: ACTIVITY_CATEGORIES[row.category] }));

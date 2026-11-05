@@ -14,7 +14,7 @@ const ACTIONS = {
   LOGIN_FAILURE: ['security', 'Failed sign-in attempt'],
   LOGIN_LOCKED: ['security', 'Sign-in locked after failed attempts'],
   LOGIN_BLOCKED: ['security', 'Sign-in attempt while locked'],
-  SESSION_EXPIRED: ['security', 'Signed out after inactivity'],
+  SESSION_EXPIRED: ['security', 'Signed out automatically'],
   PASSWORD_CHANGED: ['security', 'Password changed'],
   PASSWORD_RESET_REQUESTED: ['security', 'Password reset requested'],
   PASSWORD_RESET_CODE_SENT: ['security', 'Password reset code sent'],
@@ -58,6 +58,26 @@ export const ACTIVITY_CATEGORIES = {
   loans: 'Loans & payments',
   machinery: 'Machinery rentals',
 };
+
+// Plain words for the member, instead of the office's audit wording; actions
+// not listed keep their recorded description. `mine`: the member did it.
+const FRIENDLY = {
+  LOGIN: (mine, username) => (username ? `You signed in as ${username}.` : 'You signed in.'),
+  LOGOUT: () => 'You signed out.',
+  SESSION_EXPIRED: () => 'No activity for 20 minutes, so you were signed out to keep your account safe.',
+  LOGIN_FAILURE: () => 'Someone tried to sign in to your account with a wrong password.',
+  LOGIN_LOCKED: () => 'Too many wrong passwords, so signing in was locked for a while.',
+  PASSWORD_CHANGED: () => 'Your password was changed.',
+  PAYMENT_CREATED: () => 'The office recorded a payment on your loan.',
+  SAVINGS_DEPOSIT_CREATED: () => 'The office recorded a deposit to your savings.',
+  SAVINGS_WITHDRAWAL_CREATED: () => 'The office recorded a withdrawal from your savings.',
+  SHARE_CONTRIBUTION_CREATED: () => 'The office recorded a share capital contribution.',
+  LOAN_CREATED: () => 'Your loan was released.',
+  LOAN_APPLICATION_SUBMITTED: (mine) => (mine ? 'You applied for a loan.' : 'The office sent a loan application for you.'),
+  RENTAL_REQUESTED: (mine) => (mine ? 'You asked to rent a machine.' : 'The office booked a machine for you.'),
+};
+// Actions with an amount of money, shown beside the entry.
+const MONEY_ACTIONS = new Set(['PAYMENT_CREATED', 'SAVINGS_DEPOSIT_CREATED', 'SAVINGS_WITHDRAWAL_CREATED', 'SHARE_CONTRIBUTION_CREATED', 'LOAN_CREATED', 'LOAN_APPLICATION_SUBMITTED']);
 
 const actionsIn = (category) => Object.entries(ACTIONS).filter(([, [group]]) => group === category).map(([action]) => action);
 
@@ -155,7 +175,8 @@ export async function getMyActivity(req, res) {
     query(`SELECT COUNT(*)::int AS total FROM audit_logs al WHERE ${where}`, params),
     query(
       `SELECT MAX(created_at) FILTER (WHERE action = 'LOGIN') AS "lastSignIn",
-              COUNT(*) FILTER (WHERE action = 'LOGIN_FAILURE' AND created_at > NOW() - INTERVAL '30 days')::int AS "failedSignIns30Days"
+              COUNT(*) FILTER (WHERE action = 'LOGIN_FAILURE' AND created_at > NOW() - INTERVAL '30 days')::int AS "failedSignIns30Days",
+              (SELECT user_agent FROM audit_logs WHERE user_id = $1::bigint AND action = 'LOGIN' ORDER BY created_at DESC, id DESC LIMIT 1) AS "lastSignInAgent"
        FROM audit_logs WHERE user_id = $1::bigint`,
       [userId]
     ),
@@ -172,7 +193,8 @@ export async function getMyActivity(req, res) {
       category: categoryKey,
       actor: mine ? 'you' : 'office',
       status: row.status === 'FAILED' ? 'failed' : 'success',
-      description: row.description || '',
+      description: FRIENDLY[row.action] ? FRIENDLY[row.action](mine, req.user?.username) : row.description || '',
+      amount: MONEY_ACTIONS.has(row.action) && row.new_values?.amount !== undefined && row.new_values?.amount !== null ? Number(row.new_values.amount) : null,
       changes: ['PROFILE_UPDATED', 'MEMBER_UPDATED', 'NOTIFICATION_PREFERENCES_UPDATED'].includes(row.action) ? changedFields(row.old_values, row.new_values) : [],
       // Where the member signed in from; never shown for office actions.
       device: mine ? describeDevice(row.user_agent) : null,
@@ -184,7 +206,11 @@ export async function getMyActivity(req, res) {
     success: true,
     data,
     pagination: paginationMeta(page, limit, count.rows[0].total),
-    summary: summary.rows[0],
+    summary: {
+      lastSignIn: summary.rows[0].lastSignIn,
+      lastSignInDevice: describeDevice(summary.rows[0].lastSignInAgent),
+      failedSignIns30Days: summary.rows[0].failedSignIns30Days,
+    },
     categories: ACTIVITY_CATEGORIES,
   });
 }

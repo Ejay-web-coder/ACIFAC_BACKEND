@@ -91,6 +91,18 @@ export async function refreshRentalStatuses(db = null) {
        AND o.status <> 'completed' AND o.start_date <= ${SQL_TODAY} AND o.end_date >= ${SQL_TODAY}
      ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`
   );
+  // The member who rented is reminded on the last day of the booking that the
+  // machine is due back, once per booking (a non-member has no account).
+  await run(
+    `INSERT INTO notifications (user_id, type, title, message, severity, link, entity_type, entity_id, dedupe_key)
+     SELECT u.id, 'rental_return_due', 'Time to return the machine',
+            format('Your rental of %s ends today, %s. Please return the machine to the ACIFAC office.', o.machinery_name, to_char(o.end_date, 'FMMonth DD, YYYY')),
+            'warning', '/rental-booking', 'machinery_operation', o.id::text, 'rental-return-' || o.id
+     FROM machinery_operations o
+     JOIN users u ON u.member_id = o.member_id AND u.account_status = 'ACTIVE'
+     WHERE o.rental_request_id IS NOT NULL AND o.status <> 'completed' AND o.end_date = ${SQL_TODAY}
+     ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`
+  );
 }
 
 async function assertNoOverlap(client, machineryId, startDate, endDate, excludeRequestId = null) {

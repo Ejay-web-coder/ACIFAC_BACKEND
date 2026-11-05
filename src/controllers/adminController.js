@@ -33,10 +33,13 @@ export async function listAccounts(req, res) {
             u.created_at AS account_created_at, u.password_changed_at,
             -- An administrator's name and office, who made the account, and their latest action in the audit log.
             u.full_name, u.position, NULLIF(TRIM(COALESCE(cb.full_name, cb.username)), '') AS created_by_name,
-            CASE WHEN u.role = 'ADMIN' THEN (SELECT MAX(al.created_at) FROM audit_logs al WHERE al.user_id = u.id) END AS last_activity_at
+            CASE WHEN u.role = 'ADMIN' THEN (SELECT MAX(al.created_at) FROM audit_logs al WHERE al.user_id = u.id) END AS last_activity_at,
+            -- A Kadiwa vendor's branch.
+            CASE WHEN u.role = 'VENDOR' THEN COALESCE(u.kadiwa_branch_id, 1) END AS kadiwa_branch_id, kb.name AS kadiwa_branch_name
      FROM users u
      LEFT JOIN members m ON m.id = u.member_id
      LEFT JOIN users cb ON cb.id = u.created_by
+     LEFT JOIN kadiwa_branches kb ON u.role = 'VENDOR' AND kb.id = COALESCE(u.kadiwa_branch_id, 1)
      ORDER BY (u.role = 'ADMIN') DESC, (u.role = 'VENDOR') DESC, u.created_at DESC`,
     []
   );

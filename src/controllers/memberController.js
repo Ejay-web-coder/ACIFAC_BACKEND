@@ -444,7 +444,7 @@ async function insertSavingsTransaction(client, req, { kind, memberId, amountCen
     title: details.title,
     message: `A savings ${details.label} of ${pesos(centsToString(amountCents))} was recorded. Your total savings are ${pesos(newTotal)}.`,
     severity: 'success',
-    link: '/member-profile',
+    link: '/member/savings',
     entityType: 'savings_transaction',
     entityId: inserted.id,
     dedupeKey: `savings-${inserted.id}`,

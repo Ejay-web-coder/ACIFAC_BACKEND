@@ -18,6 +18,9 @@ export const ACTIVITY_STATUSES = ['scheduled', 'completed', 'cancelled'];
 export const ATTENDANCE_STATUSES = ['present', 'late', 'absent', 'excused'];
 export const ATTENDED_STATUSES = ['present', 'late'];
 export const MAX_RECORDS_PER_SAVE = 500;
+// all: every member on the activity date must attend; selected: only the members chosen.
+export const ATTENDEE_SCOPES = ['all', 'selected'];
+export const MAX_INVITEES = 5000;
 
 const CLOCK = /^([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?$/;
 
@@ -30,7 +33,8 @@ export function parseClock(value) {
 
 // The activity form. `existing` is the activity being edited (null when new),
 // `today` the cooperative's date (YYYY-MM-DD), `hasRecords` whether attendance
-// was recorded for it.
+// was recorded for it. memberIds (the members who must attend, when
+// attendeeScope is 'selected') is null when the request leaves them unchanged.
 export function validateActivityInput(body, { today, existing = null, hasRecords = false } = {}) {
   const errors = [];
   const values = {
@@ -44,7 +48,18 @@ export function validateActivityInput(body, { today, existing = null, hasRecords
     organizer: cleanString(body?.organizer, 200),
     status: cleanString(body?.status, 20) || existing?.status || 'scheduled',
     cancellationReason: cleanString(body?.cancellationReason, 500),
+    attendeeScope: cleanString(body?.attendeeScope, 10) || existing?.attendee_scope || 'all',
+    memberIds: null,
   };
+  if (body?.memberIds !== undefined && body?.memberIds !== null) {
+    if (!Array.isArray(body.memberIds)) errors.push('The members who must attend are not a list.');
+    else {
+      const ids = [...new Set(body.memberIds.map(Number))];
+      if (ids.some((id) => !Number.isInteger(id) || id <= 0)) errors.push('Some of the members who must attend are not valid.');
+      else if (ids.length > MAX_INVITEES) errors.push(`Choose at most ${MAX_INVITEES} members.`);
+      else values.memberIds = ids;
+    }
+  }
   if (!values.title) errors.push('Activity title is required.');
   if (!ACTIVITY_CATEGORIES[values.category]) errors.push('Choose the category: Community Development, Educational and Training, or Meeting.');
   if (!isValidDateOnly(values.activityDate)) errors.push('A valid activity date is required.');
@@ -53,6 +68,11 @@ export function validateActivityInput(body, { today, existing = null, hasRecords
   if (values.startTime && values.endTime && values.endTime <= values.startTime) errors.push('The end time must be later than the start time.');
   if (!values.venue) errors.push('Venue is required.');
   if (!ACTIVITY_STATUSES.includes(values.status)) errors.push('Status must be scheduled, completed or cancelled.');
+  if (!ATTENDEE_SCOPES.includes(values.attendeeScope)) errors.push('Choose who must attend: all members or selected members.');
+  // A new activity for selected members needs them; an edit may keep the ones it has.
+  if (values.attendeeScope === 'selected' && (values.memberIds ? !values.memberIds.length : !existing || existing.attendee_scope !== 'selected')) {
+    errors.push('Choose at least one member who must attend.');
+  }
   if (errors.length) return { errors, values };
 
   const future = values.activityDate > today;
@@ -62,6 +82,7 @@ export function validateActivityInput(body, { today, existing = null, hasRecords
   if (finalized) {
     if (values.status !== 'completed') errors.push('Attendance for this activity is final, so it stays completed.');
     if (values.activityDate !== existing.activity_date) errors.push('Attendance for this activity is final, so its date cannot be changed.');
+    if (values.attendeeScope !== (existing.attendee_scope || 'all')) errors.push('Attendance for this activity is final, so who must attend cannot be changed.');
   } else if (hasRecords && future && values.activityDate !== existing?.activity_date) {
     errors.push('Attendance was already recorded for this activity, so it cannot move to a future date.');
   }

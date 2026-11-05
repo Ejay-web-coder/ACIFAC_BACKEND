@@ -250,6 +250,16 @@ function readVendorName(value) {
   return fullName;
 }
 
+// The branch a vendor sells at: an open branch (the main store when not given).
+async function readVendorBranch(client, value) {
+  const id = value === undefined || value === null || value === '' ? 1 : Number(value);
+  if (!Number.isInteger(id) || id <= 0) throw badRequest('Choose the vendor\'s branch.');
+  const branch = (await client.query('SELECT id, name, status FROM kadiwa_branches WHERE id = $1', [id])).rows[0];
+  if (!branch) throw notFound('Branch not found.');
+  if (branch.status !== 'active') throw badRequest(`${branch.name} is closed. Choose an open branch.`);
+  return branch;
+}
+
 async function lockVendor(client, id) {
   const vendor = (await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [id])).rows[0];
   if (!vendor) throw notFound('Account not found.');
@@ -269,15 +279,16 @@ export async function createVendorAccount(req, res) {
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['admin-account-create']);
     const problem = await usernameConflict(username, client);
     if (problem) throw conflict(problem);
+    const branch = await readVendorBranch(client, body.branchId);
     const user = (await client.query(
-      `INSERT INTO users (username, password_hash, role, account_status, must_change_password, full_name, position, created_by, created_at, updated_at)
-       VALUES ($1, $2, 'VENDOR', 'ACTIVE', FALSE, $3, 'Kadiwa Store Vendor', $4, NOW(), NOW()) RETURNING *`,
-      [username, passwordHash, fullName, currentUserId(req)]
+      `INSERT INTO users (username, password_hash, role, account_status, must_change_password, full_name, position, created_by, created_at, updated_at, kadiwa_branch_id)
+       VALUES ($1, $2, 'VENDOR', 'ACTIVE', FALSE, $3, 'Kadiwa Store Vendor', $4, NOW(), NOW(), $5) RETURNING *`,
+      [username, passwordHash, fullName, currentUserId(req), branch.id]
     )).rows[0];
     await createAuditLog({
       client, user: req.user, action: 'VENDOR_ACCOUNT_CREATED', module: 'Accounts', entityType: 'user', entityId: String(user.id),
-      description: `Created the Kadiwa vendor account of ${fullName}`,
-      newValues: { username, full_name: fullName, role: 'VENDOR' },
+      description: `Created the Kadiwa vendor account of ${fullName} for ${branch.name}`,
+      newValues: { username, full_name: fullName, role: 'VENDOR', branch: branch.name },
       targetUserId: user.id, ...getRequestMeta(req),
     });
     return user;
@@ -288,23 +299,29 @@ export async function createVendorAccount(req, res) {
   });
 }
 
-// PATCH /api/admin/accounts/vendors/:id { fullName }
+// PATCH /api/admin/accounts/vendors/:id { fullName, branchId? }
+// branchId moves the vendor to another open branch; left out, the branch stays.
 export async function updateVendorAccount(req, res) {
   const id = parseId(req.params.id, 'account ID');
   const fullName = readVendorName(req.body?.fullName);
+  const branchGiven = req.body?.branchId !== undefined && req.body?.branchId !== null && req.body?.branchId !== '';
   const updated = await withTransaction(async (client) => {
     const vendor = await lockVendor(client, id);
-    if (vendor.full_name === fullName) return vendor;
-    const row = (await client.query('UPDATE users SET full_name = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [fullName, id])).rows[0];
+    const branch = branchGiven ? await readVendorBranch(client, req.body.branchId) : null;
+    const branchId = branch ? branch.id : vendor.kadiwa_branch_id;
+    if (vendor.full_name === fullName && Number(vendor.kadiwa_branch_id) === Number(branchId)) return vendor;
+    const row = (await client.query('UPDATE users SET full_name = $1, kadiwa_branch_id = $3, updated_at = NOW() WHERE id = $2 RETURNING *', [fullName, id, branchId])).rows[0];
+    const renamed = vendor.full_name !== fullName;
+    const moved = Number(vendor.kadiwa_branch_id) !== Number(branchId);
     await createAuditLog({
       client, user: req.user, action: 'VENDOR_ACCOUNT_UPDATED', module: 'Accounts', entityType: 'user', entityId: String(id),
-      description: `Renamed Kadiwa vendor ${vendor.full_name || vendor.username} to ${fullName}`,
-      oldValues: { full_name: vendor.full_name }, newValues: { full_name: fullName },
+      description: [renamed && `Renamed Kadiwa vendor ${vendor.full_name || vendor.username} to ${fullName}`, moved && `Moved Kadiwa vendor ${fullName} to ${branch?.name}`].filter(Boolean).join('; '),
+      oldValues: { full_name: vendor.full_name, kadiwa_branch_id: vendor.kadiwa_branch_id }, newValues: { full_name: fullName, kadiwa_branch_id: branchId },
       targetUserId: id, ...getRequestMeta(req),
     });
     return row;
   });
-  return res.status(200).json({ success: true, user: sanitizeUser(updated), message: 'Vendor name saved.' });
+  return res.status(200).json({ success: true, user: sanitizeUser(updated), message: 'Vendor saved.' });
 }
 
 // POST /api/admin/accounts/vendors/:id/password { password, confirmPassword }

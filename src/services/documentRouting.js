@@ -898,10 +898,11 @@ function checkLoanAmounts(data, add) {
   add('term', 'Loan term', 'pass', `Every loan is for ${DEFAULT_LOAN_TERM} months, repaid in one payment of the whole amount by the due date.`);
 }
 
-// The printed Kadiwa forms, as Add Inventory and New Sale would save them.
+// The printed Kadiwa forms, as Add Inventory and New Sale would save them,
+// for the main store (branch 1): scanned forms do not say the branch.
 const inventoryProducts = async (db) => (await db.query(
   `SELECT id, name, size_value AS "sizeValue", size_unit AS "sizeUnit", price, stock, cost_price AS "costPrice"
-     FROM kadiwa_inventory WHERE deleted_at IS NULL ORDER BY LOWER(name), size_value NULLS FIRST, id`
+     FROM kadiwa_inventory WHERE deleted_at IS NULL AND branch_id = 1 ORDER BY LOWER(name), size_value NULLS FIRST, id`
 )).rows.map((product) => ({ ...product, label: product.sizeValue === null || !product.sizeUnit ? product.name : `${product.name} ${Number(product.sizeValue)} ${product.sizeUnit}` }));
 
 async function readKadiwaInventory(db, data) {

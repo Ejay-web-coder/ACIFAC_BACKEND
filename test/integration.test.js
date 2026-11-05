@@ -836,6 +836,20 @@ test('machinery: catalogue, request, approve, overlap protection, member status'
   assert.equal(maintenance.data.machinery.status, 'maintenance');
   const blocked = await member.post('/api/machinery/requests', { machineryId: created.data.machinery.id, startDate: plus(1), endDate: plus(1), purpose: 'x' });
   assert.equal(blocked.status, 409);
+
+  // On the booking's last day the member is reminded, once, that the machine is due back.
+  const { refreshRentalStatuses } = await import('../src/controllers/machineryController.js');
+  const operation = (await pool.query('SELECT id, member_id FROM machinery_operations WHERE rental_request_id = $1', [request.data.request.id])).rows[0];
+  await pool.query('UPDATE machinery_operations SET start_date = $2::date, end_date = $2::date WHERE id = $1', [operation.id, today]);
+  await refreshRentalStatuses();
+  await refreshRentalStatuses();
+  const reminders = (await pool.query(
+    `SELECT n.title, n.message, n.link FROM notifications n JOIN users u ON u.id = n.user_id WHERE u.member_id = $1 AND n.dedupe_key = $2`,
+    [operation.member_id, `rental-return-${operation.id}`]
+  )).rows;
+  assert.equal(reminders.length, 1);
+  assert.deepEqual([reminders[0].title, reminders[0].link], ['Time to return the machine', '/rental-booking']);
+  assert.match(reminders[0].message, new RegExp(`Your rental of ${machine.name} ends today`));
 });
 
 test('machinery: the office rents to a non-member by name only', { skip }, async () => {
@@ -1274,12 +1288,12 @@ test('kadiwa: inventory is added as a sheet of products with size, quantity, pri
   assert.deepEqual([Number(tunaRow.stock), Number(tunaRow.price), Number(tunaRow.costPrice), Number(tunaRow.reorderLevel)], [13, 38, 35, 5]);
   assert.equal(Number(saved['Century Tuna 180g'].costPrice), 36);
   const audit = await pool.query(`SELECT description FROM audit_logs WHERE action = 'INVENTORY_CREATED' ORDER BY id DESC LIMIT 1`);
-  assert.equal(audit.rows[0].description, 'Added 3 inventory items');
+  assert.equal(audit.rows[0].description, 'Added 3 inventory items to Main Store');
 
   // The same product again is refused; another size of it was not.
   const again = await admin.post('/api/kadiwa/inventory', tuna);
   assert.equal(again.status, 409);
-  assert.match(again.data.message, /Century Tuna 150 g \(pc\) is already in the inventory/);
+  assert.match(again.data.message, /Century Tuna 150 g \(pc\) is already in the Main Store inventory/);
 
   // The stock is valued at cost, like the notebook total; at the selling price when no cost is set.
   const after = await admin.get('/api/kadiwa');
@@ -1699,6 +1713,126 @@ test('kadiwa vendors: an administrator makes the account; the vendor\'s sales co
   await admin.post(`/api/kadiwa/sales/${third.data.sale.id}/review`, { decision: 'reject', notes: 'Test' });
   await admin.post(`/api/kadiwa/sales/${storeOnly.data.sale.id}/review`, { decision: 'reject', notes: 'Test' });
   assert.equal(await stockOf(), startStock);
+});
+
+test('kadiwa branches: each branch has its own stock, sales and vendors; totals add up every branch', { skip }, async () => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const today = todayDateOnly();
+
+  // The store there was is branch 1, Main Store; another branch is added by name.
+  assert.equal((await admin.post('/api/kadiwa/branches', { name: '' })).status, 400);
+  assert.equal((await member.post('/api/kadiwa/branches', { name: 'Nope' })).status, 403);
+  const created = await admin.post('/api/kadiwa/branches', { name: 'Barahan Branch', address: 'Barahan, Sta. Cruz' });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const branchId = created.data.branch.id;
+  assert.equal((await admin.post('/api/kadiwa/branches', { name: 'barahan branch' })).status, 409, 'names are unique');
+  const listed = (await admin.get('/api/kadiwa/branches')).data.branches;
+  assert.deepEqual(listed.map((branch) => branch.name).slice(0, 2), ['Main Store', 'Barahan Branch']);
+
+  // Each branch keeps its own stock: the same product can be in both, but only once in each.
+  const product = { name: 'Branch Rice', category: 'Groceries', unit: 'kg', stock: '20', price: '50', costPrice: '40', reorderLevel: '5' };
+  const atBranch = await admin.post('/api/kadiwa/inventory', { branchId, items: [product] });
+  assert.equal(atBranch.status, 201, JSON.stringify(atBranch.data));
+  const branchItem = atBranch.data.item;
+  assert.deepEqual([branchItem.branchId, branchItem.branchName], [branchId, 'Barahan Branch']);
+  assert.equal((await admin.post('/api/kadiwa/inventory', { branchId, items: [product] })).status, 409);
+  const atMain = await admin.post('/api/kadiwa/inventory', { items: [{ ...product, stock: '3' }] });
+  assert.equal(atMain.status, 201, 'the same product at the main store');
+  assert.equal(atMain.data.item.branchId, 1);
+  const branchView = (await admin.get(`/api/kadiwa?branch=${branchId}`)).data;
+  assert.deepEqual(branchView.inventory.map((item) => item.id), [branchItem.id]);
+  assert.ok(!(await admin.get('/api/kadiwa?branch=1')).data.inventory.some((item) => item.id === branchItem.id));
+  assert.ok((await admin.get('/api/kadiwa')).data.inventory.some((item) => item.id === branchItem.id), 'all branches');
+
+  // A sale takes store items from its own branch's stock only.
+  const wrongBranch = await admin.post('/api/kadiwa/sales', { encoderName: 'Tester', branchId: 1, items: [{ inventoryId: branchItem.id, quantity: '2' }], totalExpenses: '0' });
+  assert.equal(wrongBranch.status, 404);
+  const sale = await admin.post('/api/kadiwa/sales', { encoderName: 'Tester', branchId, items: [{ inventoryId: branchItem.id, quantity: '2' }], totalExpenses: '0' });
+  assert.equal(sale.status, 201, JSON.stringify(sale.data));
+  assert.deepEqual([sale.data.sale.branchId, sale.data.sale.branchName], [branchId, 'Barahan Branch']);
+  assert.equal(Number((await pool.query('SELECT stock FROM kadiwa_inventory WHERE id = $1', [branchItem.id])).rows[0].stock), 18);
+  const branchSales = (await admin.get(`/api/kadiwa/sales?from=${today}&to=${today}&branch=${branchId}`)).data.sales;
+  assert.deepEqual(branchSales.map((row) => row.id), [sale.data.sale.id]);
+  const allSales = (await admin.get(`/api/kadiwa/sales?from=${today}&to=${today}`)).data.sales;
+  assert.ok(allSales.length > branchSales.length && allSales.some((row) => row.id === sale.data.sale.id));
+  assert.equal(Number((await admin.get(`/api/kadiwa?branch=${branchId}`)).data.summary.todaySales), 1);
+  // Each branch has its own chart and products in Analytics.
+  const branchAnalytics = (await admin.get(`/api/kadiwa/analytics?from=${today}&to=${today}&branch=${branchId}`)).data;
+  assert.equal(branchAnalytics.sales.reduce((sum, row) => sum + row.gross, 0), 100);
+  assert.deepEqual(branchAnalytics.products.bestSellers.map((row) => row.name), ['Branch Rice']);
+  const mainAnalytics = (await admin.get(`/api/kadiwa/analytics?from=${today}&to=${today}&branch=1`)).data;
+  assert.ok(!mainAnalytics.products.bestSellers.some((row) => row.name === 'Branch Rice'));
+  assert.equal((await admin.get('/api/kadiwa/analytics?from=2026-01-01&to=2028-01-01')).status, 400);
+
+  // A vendor sells at one branch: they see its stock, and their sales are for it.
+  const account = { fullName: 'Barahan Vendor', username: 'barahan.vendor', password: 'Vendor123!', confirmPassword: 'Vendor123!', branchId };
+  const vendorAccount = await admin.post('/api/admin/accounts/vendors', account);
+  assert.equal(vendorAccount.status, 201, JSON.stringify(vendorAccount.data));
+  const row = (await admin.get('/api/admin/accounts')).data.accounts.find((entry) => entry.user_id === vendorAccount.data.user.id);
+  assert.deepEqual([row.kadiwa_branch_id, row.kadiwa_branch_name], [branchId, 'Barahan Branch']);
+  const vendor = new Client();
+  assert.equal((await vendor.post('/api/auth/login', { usernameOrEmail: 'barahan.vendor', password: 'Vendor123!' })).status, 200);
+  const page = (await vendor.get('/api/vendor/kadiwa')).data;
+  assert.equal(page.branch.name, 'Barahan Branch');
+  // The vendor's Analytics: their own branch only.
+  const vendorAnalytics = await vendor.get(`/api/vendor/kadiwa/analytics?from=${today}&to=${today}`);
+  assert.equal(vendorAnalytics.status, 200, JSON.stringify(vendorAnalytics.data));
+  assert.equal(vendorAnalytics.data.branch.name, 'Barahan Branch');
+  assert.equal(vendorAnalytics.data.sales.reduce((sum, row) => sum + row.gross, 0), 100);
+  assert.equal((await vendor.get(`/api/kadiwa/analytics?from=${today}&to=${today}`)).status, 403, 'not the other branches');
+  assert.deepEqual(page.inventory.map((item) => item.id), [branchItem.id]);
+  const sent = await vendor.post('/api/vendor/kadiwa/sales', { saleDate: today, items: [{ inventoryId: branchItem.id, quantity: '1' }], expenses: [] });
+  assert.equal(sent.status, 201, JSON.stringify(sent.data));
+  assert.equal(sent.data.sale.branchId, branchId);
+  assert.ok((await admin.get(`/api/kadiwa?branch=${branchId}`)).data.pendingSales.some((pending) => pending.id === sent.data.sale.id));
+  assert.ok(!(await admin.get('/api/kadiwa?branch=1')).data.pendingSales.some((pending) => pending.id === sent.data.sale.id));
+  assert.equal((await admin.post(`/api/kadiwa/sales/${sent.data.sale.id}/review`, { decision: 'reject', notes: 'Test' })).status, 200);
+  // The vendor's History: their own sales of the day with the office's decision.
+  const history = await vendor.get(`/api/vendor/kadiwa/sales?from=${today}&to=${today}`);
+  assert.equal(history.status, 200, JSON.stringify(history.data));
+  assert.deepEqual(history.data.sales.map((row) => [row.id, row.status, row.reviewNotes]), [[sent.data.sale.id, 'rejected', 'Test']]);
+  // Their activity log: the sale sent, and the office rejecting it (no administrator name).
+  const activity = await vendor.get('/api/vendor/activity?limit=50');
+  assert.equal(activity.status, 200, JSON.stringify(activity.data));
+  const actions = activity.data.data.map((entry) => entry.action);
+  for (const action of ['LOGIN', 'KADIWA_SALE_SUBMITTED', 'KADIWA_SALE_REJECTED', 'VENDOR_ACCOUNT_CREATED']) assert.ok(actions.includes(action), action);
+  const rejected = activity.data.data.find((entry) => entry.action === 'KADIWA_SALE_REJECTED');
+  assert.deepEqual([rejected.actor, rejected.status, rejected.description], ['office', 'failed', `The office rejected your sale ${sent.data.sale.id}: Test`]);
+  assert.ok(!JSON.stringify(activity.data).includes('testadmin'), 'administrator names are never shown');
+  assert.ok((await vendor.get('/api/vendor/activity?category=sales')).data.data.every((entry) => entry.category === 'sales'));
+  assert.equal((await member.get('/api/vendor/activity')).status, 403);
+  // Moving the vendor to the main store.
+  assert.equal((await admin.patch(`/api/admin/accounts/vendors/${vendorAccount.data.user.id}`, { fullName: 'Barahan Vendor', branchId: 1 })).status, 200);
+  assert.equal((await vendor.get('/api/vendor/kadiwa')).data.branch.name, 'Main Store');
+  await admin.patch(`/api/admin/accounts/vendors/${vendorAccount.data.user.id}`, { fullName: 'Barahan Vendor', branchId });
+
+  // Stock sent from the main store to the branch joins the same product there, or adds it with the same prices.
+  const mainRice = atMain.data.item;
+  assert.equal((await admin.post(`/api/kadiwa/inventory/${mainRice.id}/transfer`, { branchId, quantity: '5' })).status, 409, 'only 3 in stock');
+  assert.equal((await admin.post(`/api/kadiwa/inventory/${mainRice.id}/transfer`, { branchId: 1, quantity: '1' })).status, 400, 'same branch');
+  const sentRice = await admin.post(`/api/kadiwa/inventory/${mainRice.id}/transfer`, { branchId, quantity: '2' });
+  assert.equal(sentRice.status, 200, JSON.stringify(sentRice.data));
+  assert.deepEqual([Number(sentRice.data.from.stock), sentRice.data.to.id, sentRice.data.addedToBranch], [1, branchItem.id, false]);
+  assert.equal(Number((await pool.query('SELECT stock FROM kadiwa_inventory WHERE id = $1', [branchItem.id])).rows[0].stock), 20, '18 left after the sale, plus 2 sent');
+  const mainOnly = (await admin.post('/api/kadiwa/inventory', { items: [{ ...product, name: 'Main Only Sugar', stock: '10' }] })).data.item;
+  const sentSugar = await admin.post(`/api/kadiwa/inventory/${mainOnly.id}/transfer`, { branchId, quantity: '4' });
+  assert.equal(sentSugar.status, 200, JSON.stringify(sentSugar.data));
+  assert.deepEqual([sentSugar.data.addedToBranch, sentSugar.data.to.branchId, Number(sentSugar.data.to.stock), Number(sentSugar.data.to.costPrice)], [true, branchId, 4, 40]);
+  assert.equal(Number(sentSugar.data.from.stock), 6);
+  await pool.query('DELETE FROM kadiwa_inventory WHERE id = ANY($1::varchar[])', [[mainOnly.id, sentSugar.data.to.id]]);
+
+  // A closed branch keeps its records but takes no new sales or products; the last open branch cannot close.
+  assert.equal((await admin.patch(`/api/kadiwa/branches/${branchId}`, { name: 'Barahan Branch', status: 'closed' })).status, 200);
+  assert.equal((await admin.post('/api/kadiwa/sales', { encoderName: 'Tester', branchId, items: [{ inventoryId: branchItem.id, quantity: '1' }], totalExpenses: '0' })).status, 409);
+  assert.equal((await admin.post('/api/kadiwa/inventory', { branchId, items: [{ ...product, name: 'Other' }] })).status, 409);
+  assert.equal((await vendor.post('/api/vendor/kadiwa/sales', { saleDate: today, items: [{ inventoryId: branchItem.id, quantity: '1' }], expenses: [] })).status, 409);
+  assert.equal((await admin.patch('/api/kadiwa/branches/1', { name: 'Main Store', status: 'closed' })).status, 409);
+  assert.equal((await admin.get(`/api/kadiwa/sales?from=${today}&to=${today}&branch=${branchId}`)).data.sales.length, 1, 'its sales stay');
+  // Renamed and reopened.
+  const reopened = await admin.patch(`/api/kadiwa/branches/${branchId}`, { name: 'Barahan Store', address: 'Barahan', status: 'active' });
+  assert.deepEqual([reopened.status, reopened.data.branch.name, reopened.data.branch.status], [200, 'Barahan Store', 'active']);
+  // Leave the main store's stock as it was for later tests.
+  await pool.query('DELETE FROM kadiwa_inventory WHERE id = $1', [atMain.data.item.id]);
 });
 
 test('loans: applications typed into the app need the borrower and co-maker IDs with 3 signatures', { skip }, async () => {
@@ -2185,7 +2319,7 @@ test('ocr: the printed Kadiwa forms add products to the inventory and record a s
   const again = await scan(inventoryForm({ date: '2026-01-21', line1Product: 'OCR Corned Beef', line1Size: '150 g', line1Quantity: '5', line1Unit: 'can', line1SellingPrice: '45', line1CostPrice: '40', line1Total: '200' }));
   assert.equal(again.posted, null);
   assert.equal(again.verification.status, 'failed');
-  assert.match(check(again, 'rules').message, /already in the inventory/);
+  assert.match(check(again, 'rules').message, /already in the Main Store inventory/);
 
   // The daily sales form: goods, a store item by its printed code, and the expenses.
   const salesForm = (extractedData) => ({
@@ -2653,6 +2787,33 @@ test('notifications, announcements and live updates', { skip }, async () => {
   assert.equal((await member.patch(`/api/notifications/${adminNote.id}/read`)).status, 404, 'cannot touch another user\'s notification');
   await member.patch('/api/notifications/read-all');
   assert.equal((await member.get('/api/notifications')).data.unreadCount, 0);
+
+  // Audiences: All, Members Only, Admins Only, Vendors Only; each is listed and notified only to its own accounts.
+  assert.equal((await admin.post('/api/announcements', { title: 'x', message: 'y', audience: 'Nobody' })).status, 400);
+  assert.equal((await admin.post('/api/admin/accounts/vendors', { fullName: 'Ann Vendor', username: 'ann.vendor', password: 'Vendor123!', confirmPassword: 'Vendor123!' })).status, 201);
+  const vendor = new Client();
+  assert.equal((await vendor.post('/api/auth/login', { usernameOrEmail: 'ann.vendor', password: 'Vendor123!' })).status, 200);
+  const posted = {};
+  for (const audience of ['All', 'Members Only', 'Admins Only', 'Vendors Only']) {
+    const response = await admin.post('/api/announcements', { title: `For ${audience}`, message: 'Hello', audience });
+    assert.equal(response.status, 201, JSON.stringify(response.data));
+    assert.equal(response.data.data.audience, audience);
+    posted[audience] = response.data.data.id;
+  }
+  const sees = async (client) => {
+    const ids = (await client.get('/api/announcements?limit=100')).data.data.map((row) => row.id);
+    return Object.keys(posted).filter((audience) => ids.includes(posted[audience]));
+  };
+  assert.deepEqual(await sees(member), ['All', 'Members Only']);
+  assert.deepEqual(await sees(vendor), ['All', 'Vendors Only']);
+  assert.deepEqual(await sees(admin), ['All', 'Members Only', 'Admins Only', 'Vendors Only']);
+  const notified = async (client) => {
+    const ids = (await client.get('/api/notifications?limit=100')).data.data.filter((note) => note.entityType === 'announcement').map((note) => String(note.entityId));
+    return Object.keys(posted).filter((audience) => ids.includes(String(posted[audience])));
+  };
+  assert.deepEqual(await notified(member), ['All', 'Members Only']);
+  assert.deepEqual(await notified(vendor), ['All', 'Vendors Only']);
+  for (const id of Object.values(posted)) await admin.patch(`/api/announcements/${id}/done`);
 });
 
 test('dashboard and analytics use real data', { skip }, async () => {
@@ -3040,6 +3201,12 @@ test('member activity log: own actions, office actions, filters, privacy', { ski
   assert.equal(office.actor, 'office');
   assert.equal(office.device, null);
   assert.equal(office.ipAddress, null);
+  // Plain words for the member, and the amount beside money entries.
+  assert.equal(office.description, 'The office recorded a deposit to your savings.');
+  assert.equal(typeof office.amount, 'number');
+  assert.equal(all.data.data.find((entry) => entry.action === 'PROFILE_UPDATED').amount, null);
+  assert.match(all.data.data.find((entry) => entry.action === 'LOGIN').description, /^You signed in/);
+  assert.ok('lastSignInDevice' in all.data.summary);
   assert.ok(!JSON.stringify(all.data).includes('testadmin'), 'administrator names are never shown');
   assert.ok(!JSON.stringify(all.data).includes(second.data.data.member_number), 'no entries about other members');
   assert.ok(all.data.summary.lastSignIn);
@@ -3666,6 +3833,61 @@ test('attendance: activities, recording, duplicates, finalization, rates, cancel
   assert.equal(canReceiveEvent(anaUser, { table: 'activity_attendance', memberId: ana }), true);
   assert.equal(canReceiveEvent(anaUser, { table: 'activity_attendance', memberId: ben }), false);
   assert.equal(canReceiveEvent(anaUser, { table: 'activities' }), true);
+});
+
+test('attendance: an activity mandatory for selected members only', { skip }, async () => {
+  const { hashPassword } = await import('../src/utils/password.js');
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const shift = (days) => new Date(Date.parse(`${todayDateOnly()}T00:00:00Z`) + days * 86400000).toISOString().slice(0, 10);
+  const addMember = async (number, first) => (await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status)
+     VALUES ($1, $2, 'Selected', $3, '09170000000', 'Purok 3', '2020-01-01', 0, 'active') RETURNING id`,
+    [number, first, `${first.toLowerCase()}.sel@example.com`]
+  )).rows[0].id;
+  const [eva, fe, gil] = [await addMember('SEL-001', 'Eva'), await addMember('SEL-002', 'Fe'), await addMember('SEL-003', 'Gil')];
+  await pool.query(`INSERT INTO users (member_id, username, email, password_hash, role, account_status) VALUES ($1, 'gil.sel', NULL, $2, 'MEMBER', 'ACTIVE')`, [gil, await hashPassword('GilPass1!')]);
+  const office = new Client('10.0.11.1');
+  const gilClient = new Client('10.0.11.2');
+  assert.equal((await office.post('/api/auth/login', { usernameOrEmail: 'testadmin', password: 'AdminPass1!' })).status, 200);
+  assert.equal((await gilClient.post('/api/auth/login', { usernameOrEmail: 'gil.sel', password: 'GilPass1!' })).status, 200);
+
+  const training = { title: 'Officers Training', category: 'education_training', activityDate: shift(-2), startTime: '08:00', endTime: '10:00', venue: 'ACIFAC Hall', attendeeScope: 'selected' };
+  const none = await office.post('/api/attendance/activities', { ...training, memberIds: [] });
+  assert.deepEqual([none.status, none.data.message], [400, 'Choose at least one member who must attend.']);
+  assert.equal((await office.post('/api/attendance/activities', { ...training, memberIds: [eva, 999999] })).status, 400);
+  const created = await office.post('/api/attendance/activities', { ...training, memberIds: [eva, fe, eva] });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const id = created.data.data.id;
+  assert.deepEqual([created.data.data.attendeeScope, created.data.data.inviteeCount], ['selected', 2]);
+
+  // Only the chosen members are listed, counted and can be recorded.
+  const details = (await office.get(`/api/attendance/activities/${id}`)).data.data;
+  assert.deepEqual([details.members, details.toMarkAbsent, details.invitees.map((member) => member.id).sort()], [2, 2, [eva, fe].sort()]);
+  assert.deepEqual((await office.get(`/api/attendance/activities/${id}/members`)).data.data.map((row) => row.memberId).sort(), [eva, fe].sort());
+  const save = (records) => office.request('PUT', `/api/attendance/activities/${id}/attendance`, { body: { records } });
+  const outsider = await save([{ memberId: gil, status: 'present' }]);
+  assert.deepEqual([outsider.status, outsider.data.message], [400, 'Gil Selected is not one of the members who must attend this activity.']);
+  assert.equal((await save([{ memberId: eva, status: 'present' }])).status, 200);
+
+  // Finalizing marks only the chosen members absent; who must attend then stays.
+  const finalized = await office.post(`/api/attendance/activities/${id}/finalize`);
+  assert.equal(finalized.data.data.markedAbsent, 1);
+  const rows = (await pool.query('SELECT member_id, attendance_status FROM activity_attendance WHERE activity_id = $1 ORDER BY member_id', [id])).rows;
+  assert.deepEqual(rows.map((row) => [row.member_id, row.attendance_status]), [[eva, 'present'], [fe, 'absent']]);
+  assert.equal((await office.put(`/api/attendance/activities/${id}`, { ...training, status: 'completed', memberIds: [eva, gil] })).status, 400);
+  assert.equal((await office.put(`/api/attendance/activities/${id}`, { ...training, status: 'completed', attendeeScope: 'all' })).status, 400);
+  assert.equal((await office.put(`/api/attendance/activities/${id}`, { ...training, status: 'completed', venue: 'Barangay Hall' })).status, 200);
+
+  // A member sees an upcoming activity for selected members only when chosen.
+  const future = { ...training, title: 'Board Planning', activityDate: shift(5), memberIds: [eva] };
+  const planning = (await office.post('/api/attendance/activities', future)).data.data.id;
+  const upcomingTitles = async () => (await gilClient.get('/api/members/me/attendance')).data.data.upcoming.map((activity) => activity.title);
+  assert.ok(!(await upcomingTitles()).includes('Board Planning'));
+  assert.equal((await office.put(`/api/attendance/activities/${planning}`, { ...future, memberIds: [eva, gil] })).status, 200);
+  assert.ok((await upcomingTitles()).includes('Board Planning'));
+  // Back to all members: the chosen list is dropped.
+  assert.equal((await office.put(`/api/attendance/activities/${planning}`, { ...future, attendeeScope: 'all', memberIds: undefined })).status, 200);
+  assert.equal(Number((await pool.query('SELECT COUNT(*) FROM activity_invitees WHERE activity_id = $1', [planning])).rows[0].count), 0);
 });
 
 test('loans: restructuring after 80% paid deducts the balance from a new loan and stays in the credit history', { skip }, async () => {

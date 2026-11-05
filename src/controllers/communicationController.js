@@ -37,19 +37,26 @@ export async function markAllNotificationsRead(req, res) {
 }
 
 // ----- Announcements ------------------------------------------------------
+// The audience: All (every account), Members Only, Admins Only or Vendors Only.
+// "All Members", the older name of All, is still accepted.
+const AUDIENCES = ['All', 'Members Only', 'Admins Only', 'Vendors Only'];
+const AUDIENCE_ROLE = { 'Members Only': 'MEMBER', 'Admins Only': 'ADMIN', 'Vendors Only': 'VENDOR' };
+const readAudience = (value) => (value === 'All Members' ? 'All' : AUDIENCES.includes(value) ? value : null);
+// The audiences a role sees: an administrator sees every announcement.
+export const audiencesFor = (role) => (role === 'ADMIN' ? AUDIENCES : ['All', ...Object.keys(AUDIENCE_ROLE).filter((audience) => AUDIENCE_ROLE[audience] === role)]);
 
 export async function listAnnouncements(req, res) {
   const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 20, maxLimit: 100 });
-  const audienceFilter = req.user.role === 'ADMIN' ? '' : `AND a.audience = 'All Members'`;
+  const audiences = audiencesFor(req.user.role);
   const [rows, count] = await Promise.all([
     query(
       `SELECT a.id, a.title, a.message, a.audience, a.created_at AS "postedAt", COALESCE(u.full_name, u.username) AS "postedBy"
        FROM announcements a LEFT JOIN users u ON u.id = a.created_by
-       WHERE a.archived_at IS NULL ${audienceFilter}
+       WHERE a.archived_at IS NULL AND a.audience = ANY($3::text[])
        ORDER BY a.created_at DESC, a.id DESC LIMIT $1 OFFSET $2`,
-      [limit, offset]
+      [limit, offset, audiences]
     ),
-    query(`SELECT COUNT(*)::int AS total FROM announcements a WHERE a.archived_at IS NULL ${audienceFilter}`),
+    query(`SELECT COUNT(*)::int AS total FROM announcements a WHERE a.archived_at IS NULL AND a.audience = ANY($1::text[])`, [audiences]),
   ]);
   return res.json({ success: true, data: rows.rows, pagination: paginationMeta(page, limit, count.rows[0].total) });
 }
@@ -57,7 +64,8 @@ export async function listAnnouncements(req, res) {
 export async function createAnnouncement(req, res) {
   const title = cleanString(req.body?.title, 200);
   const message = cleanString(req.body?.message, 5000);
-  const audience = req.body?.audience === 'Admins Only' ? 'Admins Only' : 'All Members';
+  const audience = req.body?.audience === undefined || req.body?.audience === '' ? 'All' : readAudience(req.body.audience);
+  if (!audience) throw badRequest('Choose who the announcement is for: All, Members Only, Admins Only or Vendors Only.');
   if (!title || !message) throw badRequest('Please complete the announcement title and message.');
 
   const announcement = await withTransaction(async (client) => {
@@ -67,10 +75,8 @@ export async function createAnnouncement(req, res) {
       [title, message, audience, currentUserId(req)]
     )).rows[0];
     const recipients = await client.query(
-      audience === 'All Members'
-        ? `SELECT id FROM users WHERE account_status = 'ACTIVE' AND id <> $1`
-        : `SELECT id FROM users WHERE account_status = 'ACTIVE' AND role = 'ADMIN' AND id <> $1`,
-      [currentUserId(req)]
+      `SELECT id FROM users WHERE account_status = 'ACTIVE' AND id <> $1 AND ($2::text IS NULL OR role = $2)`,
+      [currentUserId(req), AUDIENCE_ROLE[audience] ?? null]
     );
     await createNotifications(client, recipients.rows.map((row) => row.id), {
       type: 'announcement',

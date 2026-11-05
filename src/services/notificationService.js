@@ -32,7 +32,8 @@ export async function backfillAnnouncementNotifications(db, userId, role) {
             CASE WHEN LENGTH(a.message) > 240 THEN LEFT(a.message, 237) || '...' ELSE a.message END,
             'info', NULL, 'announcement', a.id::text, 'announcement-' || a.id, a.created_at
      FROM announcements a
-     WHERE a.archived_at IS NULL AND (a.audience = 'All Members' OR $2 = 'ADMIN')
+     WHERE a.archived_at IS NULL
+       AND (a.audience = 'All' OR $2 = 'ADMIN' OR (a.audience = 'Members Only' AND $2 = 'MEMBER') OR (a.audience = 'Vendors Only' AND $2 = 'VENDOR'))
      ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`,
     [userId, role]
   );
