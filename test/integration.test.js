@@ -4020,3 +4020,25 @@ test('members: the email is optional; members without one do not clash', { skip 
   assert.equal(badEmail.status, 400, 'a typed email must still be valid');
   await pool.query('DELETE FROM members WHERE id = ANY($1::int[])', [[first.data.data.id, second.data.data.id]]);
 });
+
+test('organizational chart: administrators edit it, everyone signed in sees it', { skip }, async () => {
+  // Fresh sessions: earlier tests sign the shared clients out.
+  const admin = new Client('10.0.12.2');
+  const member = new Client('10.0.12.3');
+  assert.equal((await admin.post('/api/auth/login', { usernameOrEmail: 'testadmin', password: 'AdminPass1!' })).status, 200);
+  assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'gil.sel', password: 'GilPass1!' })).status, 200);
+  const empty = await member.get('/api/org-chart');
+  assert.equal(empty.status, 200, JSON.stringify(empty.data));
+  assert.deepEqual(empty.data.positions, {});
+  assert.equal((await member.request('PUT', '/api/org-chart', { body: { positions: { 'bod.chair': 'Me' } } })).status, 403);
+  assert.equal((await admin.request('PUT', '/api/org-chart', { body: { positions: { 'nope.chair': 'X' } } })).status, 400);
+  const saved = await admin.request('PUT', '/api/org-chart', { body: { positions: { 'bod.chair': 'Juan Dela Cruz', 'staff.manager': 'Maria Santos', 'gad.vice': '' } } });
+  assert.equal(saved.status, 200, JSON.stringify(saved.data));
+  assert.deepEqual(saved.data.positions, { 'bod.chair': 'Juan Dela Cruz', 'staff.manager': 'Maria Santos' });
+  // Clearing a name leaves the position vacant.
+  await admin.request('PUT', '/api/org-chart', { body: { positions: { 'staff.manager': '' } } });
+  assert.deepEqual((await member.get('/api/org-chart')).data.positions, { 'bod.chair': 'Juan Dela Cruz' });
+  assert.equal((await new Client('10.0.12.1').get('/api/org-chart')).status, 401);
+  const audit = (await pool.query(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE action = 'ORG_CHART_UPDATED'`)).rows[0].n;
+  assert.equal(audit, 2);
+});

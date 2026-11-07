@@ -15,6 +15,7 @@ import vendorRoutes from './routes/vendorRoutes.js';
 import ocrRoutes from './routes/ocrRoutes.js';
 import loanRoutes from './routes/loanRoutes.js';
 import attendanceRoutes from './routes/attendanceRoutes.js';
+import orgChartRoutes from './routes/orgChartRoutes.js';
 import { announcementRoutes, eventRoutes, legalDocumentRoutes, notificationRoutes } from './routes/communicationRoutes.js';
 import { isListening } from './services/events.js';
 import { refreshLoanStatuses } from './services/loanService.js';
@@ -89,6 +90,7 @@ export function createApp() {
   app.use('/api/vendor', vendorRoutes);
   app.use('/api/ocr', ocrRoutes);
   app.use('/api/attendance', attendanceRoutes);
+  app.use('/api/org-chart', orgChartRoutes);
   app.use('/api/notifications', notificationRoutes);
   app.use('/api/announcements', announcementRoutes);
   app.use('/api/legal-documents', legalDocumentRoutes);
