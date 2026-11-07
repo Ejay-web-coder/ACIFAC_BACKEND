@@ -74,7 +74,7 @@ export const FORM_DEFINITIONS = {
     fields: [
       f('lastName', 'Last Name', { required: true }), f('firstName', 'First Name', { required: true }), f('middleName', 'Middle Name'), f('suffix', 'Suffix (Jr., Sr., III)'),
       f('dateOfBirth', 'Birthday', { kind: 'date', required: true }), f('age', 'Age', { kind: 'integer' }), f('civilStatus', 'Civil Status'), f('gender', 'Gender'),
-      f('phone', 'CP No.', { kind: 'phone', required: true }), f('email', 'Email (not on the paper form)', { required: true, typedIn: true }),
+      f('phone', 'CP No.', { kind: 'phone', required: true }), f('email', 'Email (optional, not on the paper form)', { typedIn: true }),
       f('education', 'Highest Educational Attainment'), f('idType', 'ID Type'), f('idNumber', 'ID No.'),
       f('rsbsaNo', 'RSBSA No.', { kind: 'rsbsa' }), f('farmAreaHa', 'Farm Area (ha)', { kind: 'number' }),
       f('address', 'Permanent Address (house, street, sitio or purok)'),

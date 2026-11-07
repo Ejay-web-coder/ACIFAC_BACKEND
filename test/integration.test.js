@@ -4008,3 +4008,15 @@ test('loans: restructuring after 80% paid deducts the balance from a new loan an
   assert.ok(loanHistory.payments.some((row) => row.loanNumber === 'L-RS-002' && row.amount === '2050.00'), 'the deduction is in the payment history');
   assert.equal((await admin.get('/api/admin/members/999999/loan-history')).status, 404);
 });
+
+test('members: the email is optional; members without one do not clash', { skip }, async () => {
+  const noEmail = (first, phone) => memberForm({ first_name: first, last_name: 'Walang Email', email: '', phone, date_of_birth: '1990-02-02', share_capital: '0' });
+  const first = await admin.request('POST', '/api/members', { form: await noEmail('Pedro', '09181111111') });
+  assert.equal(first.status, 201, JSON.stringify(first.data));
+  assert.equal(first.data.data.email, null);
+  const second = await admin.request('POST', '/api/members', { form: await noEmail('Pablo', '09182222222') });
+  assert.equal(second.status, 201, JSON.stringify(second.data));
+  const badEmail = await admin.request('POST', '/api/members', { form: await memberForm({ first_name: 'Bad', last_name: 'Email', email: 'not-an-email', date_of_birth: '1991-03-03' }) });
+  assert.equal(badEmail.status, 400, 'a typed email must still be valid');
+  await pool.query('DELETE FROM members WHERE id = ANY($1::int[])', [[first.data.data.id, second.data.data.id]]);
+});

@@ -99,7 +99,8 @@ export function validateMemberInput(body) {
   const values = {
     firstName: cleanString(body.first_name, 100),
     lastName: cleanString(body.last_name, 100),
-    email: cleanString(body.email, 255).toLowerCase(),
+    // Optional: a member without one signs in with their mobile number. Blank is saved as none (emails are unique).
+    email: cleanString(body.email, 255).toLowerCase() || null,
     phone: cleanString(body.phone, 50),
     address: cleanString(body.address, 2000),
     membershipDate: cleanString(body.membership_date, 10),
@@ -109,8 +110,7 @@ export function validateMemberInput(body) {
   if (!values.lastName) errors.push('Last name is required.');
   if (!isValidDateOnly(values.membershipDate)) errors.push('A valid membership date is required.');
   else if (values.membershipDate > todayDateOnly()) errors.push('Membership date cannot be in the future.');
-  if (!values.email) errors.push('Email is required.');
-  else if (!EMAIL_PATTERN.test(values.email)) errors.push('Email format is invalid.');
+  if (values.email && !EMAIL_PATTERN.test(values.email)) errors.push('Email format is invalid.');
   if (!values.phone) errors.push('Phone number is required.');
   else if (!PHONE_PATTERN.test(values.phone)) errors.push('Phone number format is invalid.');
   if (!values.address) errors.push('Address is required.');
