@@ -12,9 +12,9 @@ export default async function seedAnnouncements(ctx) {
   }
   const meeting = addDays(today, 10);
   const announcements = [
-    [30, 'All Members', 'Loan payment hours', `Loan payments are received at the office ${paymentHours().label}. Bring your loan number, and keep your official receipt.`],
-    [12, 'All Members', 'Harvester bookings are open', 'Members can now book the harvester for the coming harvest at the office or through the Machinery page. Members are served first.'],
-    [2, 'All Members', 'Pre-Harvest Planning Meeting', `All members are invited to the pre-harvest planning meeting on ${formatDateOnly(meeting)}, 8:00 AM, at the ACIFAC Multi-Purpose Hall. We will set the harvester schedule and the palay buying price.`],
+    [30, 'All', 'Loan payment hours', `Loan payments are received at the office ${paymentHours().label}. Bring your loan number, and keep your official receipt.`],
+    [12, 'Members Only', 'Harvester bookings are open', 'Members can now book the harvester for the coming harvest at the office or through the Machinery page. Members are served first.'],
+    [2, 'Members Only', 'Pre-Harvest Planning Meeting', `All members are invited to the pre-harvest planning meeting on ${formatDateOnly(meeting)}, 8:00 AM, at the ACIFAC Multi-Purpose Hall. We will set the harvester schedule and the palay buying price.`],
     [5, 'Admins Only', 'Board meeting notes', 'Review the overdue loans list before the next board meeting and prepare the restructuring requests.'],
   ];
   for (const [daysAgo, audience, title, message] of announcements) {
