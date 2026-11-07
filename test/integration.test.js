@@ -1943,36 +1943,16 @@ test('loans: applications typed into the app need the borrower and co-maker IDs 
   await pool.query('DELETE FROM loans WHERE id = ANY($1::int[])', [[approved.data.loanId, released.data.loan.databaseId]]);
 });
 
-test('loans: payments are received on weekdays during office hours; due dates skip closed days', { skip }, async () => {
+test('loans: payments are recorded any day and time; due dates skip closed days', { skip }, async () => {
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const isoDay = (date) => ((new Date(`${date}T00:00:00Z`).getUTCDay() + 6) % 7) + 1;
   const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date());
-  // The most recent date (today or before) on the given ISO weekday.
-  const lastDay = (iso) => { const date = new Date(`${today}T00:00:00Z`); while (isoDay(date.toISOString().slice(0, 10)) !== iso) date.setUTCDate(date.getUTCDate() - 1); return date.toISOString().slice(0, 10); };
-  const pay = (paymentDate) => admin.post(`/api/admin/loans/${state.loanId}/payments`, { amount: '1', paymentDate });
   try {
     delete process.env.LOAN_PAYMENT_HOURS;
     const policy = await member.get('/api/loans/policy');
     assert.equal(policy.status, 200);
     assert.deepEqual({ days: policy.data.policy.paymentHours.days, open: policy.data.policy.paymentHours.open, close: policy.data.policy.paymentHours.close, label: policy.data.policy.paymentHours.label },
       { days: [1, 2, 3, 4, 5], open: 480, close: 1020, label: 'Monday to Friday, 8:00 AM to 5:00 PM' });
-    assert.equal(typeof policy.data.policy.paymentHours.openNow, 'boolean');
-
-    // A payment dated a Saturday or Sunday is refused.
-    process.env.LOAN_PAYMENT_HOURS = 'Mon-Fri 00:00-24:00';
-    for (const weekend of [lastDay(6), lastDay(7)]) {
-      const refused = await pay(weekend);
-      assert.equal(refused.status, 400, JSON.stringify(refused.data));
-      assert.match(refused.data.message, /Loan payments are received Monday to Friday, any time only\. .* is a (Saturday|Sunday)\./);
-    }
-
-    // Outside office hours nothing can be recorded, whatever the payment date.
-    const other = (isoDay(today) % 7) + 1;
-    process.env.LOAN_PAYMENT_HOURS = `${DAYS[other - 1]} 00:00-24:00`;
-    const closed = await pay(lastDay(other));
-    assert.equal(closed.status, 400, JSON.stringify(closed.data));
-    assert.match(closed.data.message, /only during office hours/);
-    assert.equal((await member.get('/api/loans/policy')).data.policy.paymentHours.openNow, false);
 
     // New loans: the one payment falls due on a day the office receives payments.
     process.env.LOAN_PAYMENT_HOURS = 'Mon-Fri 08:00-17:00';
@@ -1987,6 +1967,12 @@ test('loans: payments are received on weekdays during office hours; due dates sk
     assert.equal(dueDates.length, 1);
     assert.ok(dueDates.every((date) => isoDay(date) <= 5), JSON.stringify(dueDates));
     assert.equal(detail.data.loan.dueDate, dueDates.at(-1), 'the loan is due with its last installment');
+
+    // A payment is recorded whenever it is entered: on a day the office is closed, outside office hours.
+    const other = (isoDay(today) % 7) + 1;
+    process.env.LOAN_PAYMENT_HOURS = `${DAYS[other - 1]} 08:00-09:00`;
+    const anyTime = await admin.post(`/api/admin/loans/${loanId}/payments`, { amount: '1', paymentDate: today });
+    assert.equal(anyTime.status, 201, JSON.stringify(anyTime.data));
     await pool.query('DELETE FROM loans WHERE id = $1', [loanId]);
   } finally {
     process.env.LOAN_PAYMENT_HOURS = 'Mon-Sun 00:00-24:00';
