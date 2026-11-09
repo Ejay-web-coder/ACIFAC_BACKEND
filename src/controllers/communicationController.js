@@ -122,18 +122,34 @@ export async function deleteAnnouncement(req, res) {
   return res.json({ success: true, data: result, message: 'Announcement deleted.' });
 }
 
-// ----- Cooperative legal documents (admin) ---------------------------------
+// ----- Cooperative policy and legal documents (About page) ----------------
+// Administrators upload and remove them and choose which ones members see.
 
-const LEGAL_CATEGORIES = ['Registration', 'Governance', 'Compliance', 'Financial', 'Other'];
+const LEGAL_CATEGORIES = ['Policy', 'Registration', 'Governance', 'Compliance', 'Financial', 'Other'];
+const isAdmin = (req) => req.user?.role === 'ADMIN';
+// Two lists on the About page: Legal Documents ('legal') and Others ('others').
+const DOCUMENT_SECTIONS = ['legal', 'others'];
+const sectionOf = (value) => (DOCUMENT_SECTIONS.includes(value) ? value : 'legal');
+const LEGAL_COLUMNS = `d.id, d.name, d.category, d.section, d.original_file_name AS "fileName", d.mime_type AS "mimeType", d.file_size AS "fileSize",
+            d.shown_to_members AS "shownToMembers", d.created_at AS "uploadedAt"`;
+const toLegalDocument = (row, admin) => {
+  const document = { ...row, fileSize: Number(row.fileSize) };
+  if (!admin) delete document.uploadedBy;
+  return document;
+};
 
 export async function listLegalDocuments(req, res) {
+  const admin = isAdmin(req);
+  // ?section=others lists the Others tab (by title); the default is Legal Documents.
+  const section = sectionOf(req.query.section);
   const rows = await query(
-    `SELECT d.id, d.name, d.category, d.original_file_name AS "fileName", d.mime_type AS "mimeType", d.file_size AS "fileSize",
-            d.created_at AS "uploadedAt", u.username AS "uploadedBy"
+    `SELECT ${LEGAL_COLUMNS}, u.username AS "uploadedBy"
      FROM legal_documents d LEFT JOIN users u ON u.id = d.uploaded_by
-     WHERE d.deleted_at IS NULL ORDER BY d.created_at DESC LIMIT 200`
+     WHERE d.deleted_at IS NULL AND d.section = $1 ${admin ? '' : 'AND d.shown_to_members'}
+     ORDER BY ${section === 'others' ? 'lower(d.name), d.id' : 'd.created_at DESC'} LIMIT 500`,
+    [section]
   );
-  return res.json({ success: true, data: rows.rows.map((row) => ({ ...row, fileSize: Number(row.fileSize) })) });
+  return res.json({ success: true, data: rows.rows.map((row) => toLegalDocument(row, admin)) });
 }
 
 export async function uploadLegalDocument(req, res) {
@@ -141,15 +157,18 @@ export async function uploadLegalDocument(req, res) {
   assertValidUpload(file, DOCUMENT_TYPES, 'document');
   const category = LEGAL_CATEGORIES.includes(req.body?.category) ? req.body.category : 'Other';
   const name = cleanString(req.body?.name, 255) || safeOriginalName(file.originalname).replace(/\.[^.]+$/, '');
+  const shownToMembers = req.body?.shownToMembers === 'true' || req.body?.shownToMembers === true;
+  const section = sectionOf(req.body?.section);
   const reference = await uploadFile({ bucket: BUCKETS.legalDocuments, folder: 'legal', file });
   try {
     const document = await withTransaction(async (client) => {
       const row = (await client.query(
-        `INSERT INTO legal_documents (name, category, original_file_name, stored_file_path, mime_type, file_size, uploaded_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, name, category, original_file_name AS "fileName", mime_type AS "mimeType", file_size AS "fileSize", created_at AS "uploadedAt"`,
-        [name, category, safeOriginalName(file.originalname), reference, file.mimetype, file.size, currentUserId(req)]
+        `INSERT INTO legal_documents (name, category, original_file_name, stored_file_path, mime_type, file_size, uploaded_by, shown_to_members, section)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, name, category, section, original_file_name AS "fileName", mime_type AS "mimeType", file_size AS "fileSize",
+           shown_to_members AS "shownToMembers", created_at AS "uploadedAt"`,
+        [name, category, safeOriginalName(file.originalname), reference, file.mimetype, file.size, currentUserId(req), shownToMembers, section]
       )).rows[0];
-      await createAuditLog({ client, user: req.user, action: 'LEGAL_DOCUMENT_UPLOADED', module: 'Settings', entityType: 'legal_document', entityId: String(row.id), description: `Uploaded legal document ${name}`, newValues: { name, category }, ...getRequestMeta(req) });
+      await createAuditLog({ client, user: req.user, action: 'LEGAL_DOCUMENT_UPLOADED', module: 'Settings', entityType: 'legal_document', entityId: String(row.id), description: `Uploaded legal document ${name}${shownToMembers ? ' (shown to members)' : ''}`, newValues: { name, category, shownToMembers }, ...getRequestMeta(req) });
       return row;
     });
     return res.status(201).json({ success: true, data: { ...document, fileSize: Number(document.fileSize) } });
@@ -161,11 +180,43 @@ export async function uploadLegalDocument(req, res) {
 
 export async function downloadLegalDocument(req, res) {
   const id = parseId(req.params.id, 'document ID');
-  const row = (await query(`SELECT stored_file_path, mime_type, original_file_name FROM legal_documents WHERE id = $1 AND deleted_at IS NULL`, [id])).rows[0];
+  // Members open only the documents shown to them.
+  const row = (await query(
+    `SELECT stored_file_path, mime_type, original_file_name FROM legal_documents WHERE id = $1 AND deleted_at IS NULL ${isAdmin(req) ? '' : 'AND shown_to_members'}`,
+    [id]
+  )).rows[0];
   if (!row) throw notFound('Document not found.');
   const sent = await sendStoredFile(res, { reference: row.stored_file_path, mimeType: row.mime_type, fileName: row.original_file_name });
   if (!sent) throw notFound('The stored file is no longer available.');
   return undefined;
+}
+
+// PATCH /api/legal-documents/:id { name?, category?, shownToMembers? }
+export async function updateLegalDocument(req, res) {
+  const id = parseId(req.params.id, 'document ID');
+  const body = req.body ?? {};
+  const name = body.name === undefined ? undefined : cleanString(body.name, 255);
+  if (name !== undefined && !name) throw badRequest('Enter the name of the document.');
+  if (body.category !== undefined && !LEGAL_CATEGORIES.includes(body.category)) throw badRequest('Choose a category from the list.');
+  if (body.shownToMembers !== undefined && typeof body.shownToMembers !== 'boolean') throw badRequest('shownToMembers must be true or false.');
+  const document = await withTransaction(async (client) => {
+    const before = (await client.query('SELECT * FROM legal_documents WHERE id = $1 AND deleted_at IS NULL FOR UPDATE', [id])).rows[0];
+    if (!before) throw notFound('Document not found.');
+    const next = { name: name ?? before.name, category: body.category ?? before.category, shownToMembers: body.shownToMembers ?? before.shown_to_members };
+    const row = (await client.query(
+      `UPDATE legal_documents d SET name = $2, category = $3, shown_to_members = $4 WHERE d.id = $1
+       RETURNING ${LEGAL_COLUMNS}, (SELECT username FROM users WHERE id = d.uploaded_by) AS "uploadedBy"`,
+      [id, next.name, next.category, next.shownToMembers]
+    )).rows[0];
+    const sharing = next.shownToMembers === before.shown_to_members ? '' : next.shownToMembers ? ' (now shown to members)' : ' (now hidden from members)';
+    await createAuditLog({
+      client, user: req.user, action: 'LEGAL_DOCUMENT_UPDATED', module: 'Settings', entityType: 'legal_document', entityId: String(id),
+      description: `Updated legal document ${next.name}${sharing}`,
+      oldValues: { name: before.name, category: before.category, shownToMembers: before.shown_to_members }, newValues: next, ...getRequestMeta(req),
+    });
+    return row;
+  });
+  return res.json({ success: true, data: toLegalDocument(document, true) });
 }
 
 export async function deleteLegalDocument(req, res) {

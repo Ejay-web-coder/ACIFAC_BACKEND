@@ -18,9 +18,8 @@ import { isSmsConfigured, sendSmsSafely } from '../services/smsService.js';
 // and they are proved with a one-time code sent to each (the number only when
 // text messages are set up).
 
-// The cooperative's offices, offered in the form; another position can be typed in.
-export const ADMIN_POSITIONS = ['Chairperson', 'Vice Chairperson', 'Secretary', 'Treasurer', 'General Manager', 'Bookkeeper', 'Cashier',
-  'Board Member', 'Audit Committee Chair', 'Credit Committee Chair', 'Education Committee Chair', 'Election Committee Chair', 'Kadiwa Store Manager', 'Machinery Officer'];
+// The cooperative's offices offered in the form; any other position is typed in ("Other").
+export const ADMIN_POSITIONS = ['Chairperson', 'Vice Chairperson', 'Secretary'];
 const USERNAME = /^[a-z0-9._-]{3,100}$/;
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const CODE_TTL_MINUTES = 10;

@@ -2958,9 +2958,9 @@ test('dashboard and analytics use real data', { skip }, async () => {
   assert.equal(Math.round(capital.total * 100), capital.parts.reduce((sum, part) => sum + Math.round(part.amount * 100), 0));
 
   // A member's dividend: this year's net income, less 30% statutory funds, half
-  // of the surplus shared by share capital.
+  // of the surplus shared by share capital. Confidential: only the office sees it.
   const cents = (amount) => Math.round(amount * 100);
-  const dividend = await member.get('/api/members/me/dividend');
+  const dividend = await admin.get(`/api/members/${state.memberId}/dividend`);
   assert.equal(dividend.status, 200, JSON.stringify(dividend.data));
   const d = dividend.data.data;
   assert.equal(d.year, Number(d.asOf.slice(0, 4)));
@@ -3009,12 +3009,14 @@ test('dashboard and analytics use real data', { skip }, async () => {
   }
   assert.equal(p.businessRefund, Math.round(p.businessPool * p.businessShare * 100) / 100);
   assert.equal(cents(p.refund), cents(p.businessRefund) + cents(p.participationRefund));
-  const lastYear = await member.get(`/api/members/me/dividend?year=${d.year - 1}`);
+  const lastYear = await admin.get(`/api/members/${state.memberId}/dividend?year=${d.year - 1}`);
   assert.equal(lastYear.status, 200);
   assert.equal(lastYear.data.data.asOf, `${d.year - 1}-12-31`);
   assert.equal(lastYear.data.data.yearComplete, true);
-  for (const year of ['1999', String(d.year + 1), 'abc']) assert.equal((await member.get(`/api/members/me/dividend?year=${year}`)).status, 400, year);
-  assert.equal((await admin.get('/api/members/me/dividend')).status, 403, 'only a member sees their own dividend');
+  for (const year of ['1999', String(d.year + 1), 'abc']) assert.equal((await admin.get(`/api/members/${state.memberId}/dividend?year=${year}`)).status, 400, year);
+  assert.equal((await admin.get('/api/members/999999/dividend')).status, 404);
+  assert.equal((await member.get('/api/members/me/dividend')).status, 403, 'members do not see dividends');
+  assert.equal((await member.get(`/api/members/${state.memberId}/dividend`)).status, 403, 'not even their own');
 
   // The loan summary and history: the member sees in their account what the admin opens from Loans & Payments.
   const mine = await member.get('/api/members/me/loan-history');
@@ -3103,7 +3105,8 @@ test('administrator accounts: name and position required, email and mobile verif
   assert.match(check.data.username.problem, /taken/);
   assert.equal(check.data.phone.problem, null);
   assert.equal(check.data.smsAvailable, true);
-  assert.ok(check.data.positions.includes('Treasurer'));
+  // Offered: the three officers; any other position (like Treasurer below) is typed in.
+  assert.deepEqual(check.data.positions, ['Chairperson', 'Vice Chairperson', 'Secretary']);
   assert.equal((await admin.post('/api/admin/accounts/admin-verifications', { channel: 'email', value: memberEmail })).status, 409);
 
   // The email: a code is sent, a wrong one is refused, the right one verifies it.
@@ -4021,24 +4024,173 @@ test('members: the email is optional; members without one do not clash', { skip 
   await pool.query('DELETE FROM members WHERE id = ANY($1::int[])', [[first.data.data.id, second.data.data.id]]);
 });
 
-test('organizational chart: administrators edit it, everyone signed in sees it', { skip }, async () => {
+test('organizational chart: positions with names and 2x2 pictures; the office adds positions', { skip }, async () => {
   // Fresh sessions: earlier tests sign the shared clients out.
   const admin = new Client('10.0.12.2');
   const member = new Client('10.0.12.3');
   assert.equal((await admin.post('/api/auth/login', { usernameOrEmail: 'testadmin', password: 'AdminPass1!' })).status, 200);
   assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'gil.sel', password: 'GilPass1!' })).status, 200);
-  const empty = await member.get('/api/org-chart');
-  assert.equal(empty.status, 200, JSON.stringify(empty.data));
-  assert.deepEqual(empty.data.positions, {});
-  assert.equal((await member.request('PUT', '/api/org-chart', { body: { positions: { 'bod.chair': 'Me' } } })).status, 403);
-  assert.equal((await admin.request('PUT', '/api/org-chart', { body: { positions: { 'nope.chair': 'X' } } })).status, 400);
-  const saved = await admin.request('PUT', '/api/org-chart', { body: { positions: { 'bod.chair': 'Juan Dela Cruz', 'staff.manager': 'Maria Santos', 'gad.vice': '' } } });
+
+  // The printed chart's positions are there from the start, all vacant.
+  const start = await member.get('/api/org-chart');
+  assert.equal(start.status, 200, JSON.stringify(start.data));
+  assert.equal(start.data.entries.length, 30);
+  assert.ok(start.data.entries.every((entry) => entry.name === '' && !entry.custom));
+  const asSent = (entries) => entries.map(({ id, group, role, name }) => ({ id, group, role, name }));
+  assert.equal((await member.request('PUT', '/api/org-chart', { body: { entries: asSent(start.data.entries) } })).status, 403);
+
+  // Names, and a fourth director added to the board.
+  const chair = start.data.entries.find((entry) => entry.group === 'bod' && entry.role === 'Chairperson');
+  const edited = asSent(start.data.entries).map((entry) => (entry.id === chair.id ? { ...entry, name: 'Juan Dela Cruz' } : entry));
+  edited.push({ group: 'bod', role: 'Director', name: 'Pedro Penduko' });
+  const saved = await admin.request('PUT', '/api/org-chart', { body: { entries: edited } });
   assert.equal(saved.status, 200, JSON.stringify(saved.data));
-  assert.deepEqual(saved.data.positions, { 'bod.chair': 'Juan Dela Cruz', 'staff.manager': 'Maria Santos' });
-  // Clearing a name leaves the position vacant.
-  await admin.request('PUT', '/api/org-chart', { body: { positions: { 'staff.manager': '' } } });
-  assert.deepEqual((await member.get('/api/org-chart')).data.positions, { 'bod.chair': 'Juan Dela Cruz' });
+  assert.equal(saved.data.entries.length, 31);
+  const added = saved.data.entries.find((entry) => entry.name === 'Pedro Penduko');
+  assert.deepEqual([added.group, added.custom], ['bod', true]);
+  assert.equal(saved.data.entries.find((entry) => entry.id === chair.id).name, 'Juan Dela Cruz');
+  assert.equal((await admin.request('PUT', '/api/org-chart', { body: { entries: [...edited, { group: 'nowhere', role: 'X', name: '' }] } })).status, 400);
+  // A printed position cannot be removed; an added one can.
+  assert.equal((await admin.request('PUT', '/api/org-chart', { body: { entries: asSent(saved.data.entries).filter((entry) => entry.id !== chair.id) } })).status, 400);
+
+  // The 2x2 picture: uploaded by the office, seen by everyone signed in.
+  const form = new FormData();
+  form.append('photo', new Blob([PNG], { type: 'image/png' }), '2x2.png');
+  const uploaded = await admin.request('POST', `/api/org-chart/${chair.id}/photo`, { form });
+  assert.equal(uploaded.status, 200, JSON.stringify(uploaded.data));
+  assert.equal(uploaded.data.entries.find((entry) => entry.id === chair.id).hasPhoto, true);
+  const picture = await member.request('GET', `/api/org-chart/${chair.id}/photo`, { raw: true });
+  assert.equal(picture.status, 200);
+  assert.deepEqual(Buffer.from(await picture.arrayBuffer()), PNG);
+  const memberForm = new FormData();
+  memberForm.append('photo', new Blob([PNG], { type: 'image/png' }), '2x2.png');
+  assert.equal((await member.request('POST', `/api/org-chart/${chair.id}/photo`, { form: memberForm })).status, 403);
+  assert.equal((await admin.request('DELETE', `/api/org-chart/${chair.id}/photo`)).status, 200);
+  assert.equal((await member.request('GET', `/api/org-chart/${chair.id}/photo`, { raw: true })).status, 404);
+
+  const removed = await admin.request('PUT', '/api/org-chart', { body: { entries: asSent(saved.data.entries).filter((entry) => entry.id !== added.id) } });
+  assert.equal(removed.status, 200, JSON.stringify(removed.data));
+  assert.equal(removed.data.entries.length, 30);
   assert.equal((await new Client('10.0.12.1').get('/api/org-chart')).status, 401);
-  const audit = (await pool.query(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE action = 'ORG_CHART_UPDATED'`)).rows[0].n;
-  assert.equal(audit, 2);
+});
+
+test('About page: mission and vision by the office; members see only the documents shown to them', { skip }, async () => {
+  const admin = new Client('10.0.12.4');
+  const member = new Client('10.0.12.5');
+  assert.equal((await admin.post('/api/auth/login', { usernameOrEmail: 'testadmin', password: 'AdminPass1!' })).status, 200);
+  assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'gil.sel', password: 'GilPass1!' })).status, 200);
+
+  // The mission and vision on the office signs are there from the start.
+  const start = await member.get('/api/about');
+  assert.equal(start.status, 200, JSON.stringify(start.data));
+  assert.equal(start.data.mission, 'Naglilingkod nang may katapatan at disiplina.\n\nServing with Loyalty and Discipline.');
+  assert.equal(start.data.vision, 'Kooperatibang matatag, maunlad at maaasahan.\n\nStrong Cooperative, Progressive and Reliable.');
+  assert.equal(start.data.coreValues, '');
+  assert.equal((await member.request('PUT', '/api/about', { body: { mission: 'X' } })).status, 403);
+  const saved = await admin.request('PUT', '/api/about', { body: { mission: '  Serve the farmers.  ', vision: 'A strong cooperative.\r\nFor all.', coreValues: 'Honesty\nUnity' } });
+  assert.equal(saved.status, 200, JSON.stringify(saved.data));
+  assert.deepEqual([saved.data.mission, saved.data.vision, saved.data.coreValues], ['Serve the farmers.', 'A strong cooperative.\nFor all.', 'Honesty\nUnity']);
+  assert.ok(saved.data.updatedBy);
+  const read = await member.get('/api/about');
+  assert.equal(read.data.mission, 'Serve the farmers.');
+  assert.equal(read.data.updatedBy, null, 'who changed it is for the office');
+  assert.equal((await admin.request('PUT', '/api/about', { body: { mission: 'x'.repeat(5001) } })).status, 400);
+
+  const upload = async (name, shown) => {
+    const form = new FormData();
+    form.append('document', new Blob([Buffer.from('%PDF-1.4 test')], { type: 'application/pdf' }), `${name}.pdf`);
+    form.append('category', 'Policy');
+    if (shown !== undefined) form.append('shownToMembers', String(shown));
+    const result = await admin.request('POST', '/api/legal-documents', { form });
+    assert.equal(result.status, 201, JSON.stringify(result.data));
+    return result.data.data;
+  };
+  const policy = await upload('loan-policy', true);
+  const internal = await upload('audit-report');
+  assert.deepEqual([policy.shownToMembers, internal.shownToMembers], [true, false]);
+
+  const seen = await member.get('/api/legal-documents');
+  assert.equal(seen.status, 200);
+  assert.deepEqual(seen.data.data.map((document) => document.id), [policy.id]);
+  assert.equal(seen.data.data[0].uploadedBy, undefined);
+  assert.equal((await member.request('GET', `/api/legal-documents/${policy.id}/file`, { raw: true })).status, 200);
+  assert.equal((await member.request('GET', `/api/legal-documents/${internal.id}/file`, { raw: true })).status, 404);
+  assert.equal((await member.request('PATCH', `/api/legal-documents/${internal.id}`, { body: { shownToMembers: true } })).status, 403);
+  assert.equal((await member.request('DELETE', `/api/legal-documents/${policy.id}`)).status, 403);
+  const memberForm = new FormData();
+  memberForm.append('document', new Blob([Buffer.from('%PDF-1.4 test')], { type: 'application/pdf' }), 'x.pdf');
+  assert.equal((await member.request('POST', '/api/legal-documents', { form: memberForm })).status, 403);
+
+  // The office shows the second one; then hides the first.
+  const shown = await admin.request('PATCH', `/api/legal-documents/${internal.id}`, { body: { shownToMembers: true } });
+  assert.equal(shown.status, 200, JSON.stringify(shown.data));
+  assert.equal(shown.data.data.shownToMembers, true);
+  assert.equal((await admin.request('PATCH', `/api/legal-documents/${policy.id}`, { body: { shownToMembers: false } })).status, 200);
+  assert.deepEqual((await member.get('/api/legal-documents')).data.data.map((document) => document.id), [internal.id]);
+  assert.equal((await admin.request('PATCH', `/api/legal-documents/${policy.id}`, { body: { category: 'Nowhere' } })).status, 400);
+  assert.equal((await admin.get('/api/legal-documents')).data.data.length, 2);
+
+  for (const document of [policy, internal]) assert.equal((await admin.request('DELETE', `/api/legal-documents/${document.id}`)).status, 200);
+
+  // Others: a separate, searchable list (by title), not mixed with the legal documents.
+  const other = async (name, shown) => {
+    const form = new FormData();
+    form.append('document', new Blob([Buffer.from('%PDF-1.4 test')], { type: 'application/pdf' }), `${name}.pdf`);
+    form.append('section', 'others');
+    form.append('shownToMembers', String(shown));
+    const result = await admin.request('POST', '/api/legal-documents', { form });
+    assert.equal(result.status, 201, JSON.stringify(result.data));
+    assert.equal(result.data.data.section, 'others');
+    return result.data.data;
+  };
+  const bylaws = await other('By-Laws', true);
+  const articles = await other('Articles of Cooperation', true);
+  const audit = await other('Audited Financial Statements 2022', false);
+  assert.deepEqual((await admin.get('/api/legal-documents?section=others')).data.data.map((document) => document.name), ['Articles of Cooperation', 'Audited Financial Statements 2022', 'By-Laws']);
+  assert.deepEqual((await member.get('/api/legal-documents?section=others')).data.data.map((document) => document.name), ['Articles of Cooperation', 'By-Laws']);
+  assert.equal((await admin.get('/api/legal-documents')).data.data.length, 0, 'Others are not on the Legal Documents tab');
+  assert.equal((await member.request('GET', `/api/legal-documents/${bylaws.id}/file`, { raw: true })).status, 200);
+  for (const document of [bylaws, articles, audit]) assert.equal((await admin.request('DELETE', `/api/legal-documents/${document.id}`)).status, 200);
+  assert.equal((await new Client('10.0.12.1').get('/api/about')).status, 401);
+});
+
+test('About page policies: the printed policies as text; the office adds, changes and removes them', { skip }, async () => {
+  const admin = new Client('10.0.12.6');
+  const member = new Client('10.0.12.7');
+  assert.equal((await admin.post('/api/auth/login', { usernameOrEmail: 'testadmin', password: 'AdminPass1!' })).status, 200);
+  assert.equal((await member.post('/api/auth/login', { usernameOrEmail: 'gil.sel', password: 'GilPass1!' })).status, 200);
+
+  const start = await member.get('/api/policies');
+  assert.equal(start.status, 200, JSON.stringify(start.data));
+  assert.deepEqual(start.data.data.map((policy) => [policy.title, policy.items.length]), [['Membership Policy', 16], ['Board Meeting Policy', 12], ['Polisiya para sa Combined Harvester', 15], ['Polisiya sa Pagpapautang (ALERT-ARBOs)', 13]]);
+  const loan = start.data.data[3];
+  assert.ok(loan.intro.startsWith('Vision: Isang kooperatibang') && loan.intro.includes('\n\nMission: Makahiram'), loan.intro);
+  assert.ok(loan.items[9].includes("limampu't isang libo"));
+  assert.equal(start.data.data[0].intro, '');
+  assert.equal(start.data.data[0].items[1], 'Magbayad ng membership fee na 300.00 pesos.');
+  assert.equal(start.data.data[2].items[4], 'Hunos sa panahon ng tag-araw:\nMember: 100/9 with 5 commission\nNon-member: 100/10');
+  assert.equal(start.data.data[0].updatedBy, undefined);
+
+  assert.equal((await member.post('/api/policies', { title: 'X', items: ['Y'] })).status, 403);
+  assert.equal((await admin.post('/api/policies', { title: '  ', items: ['Y'] })).status, 400);
+  assert.equal((await admin.post('/api/policies', { title: 'Loan Policy', items: ['  ', ''] })).status, 400);
+  const created = await admin.post('/api/policies', { title: ' Loan Policy ', intro: '  First line  \n\n\n\nSecond  ', items: ['  Up to 3x share capital. ', '', 'Line one\r\n  line two  '] });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  assert.equal(created.data.data.intro, 'First line\n\nSecond');
+  assert.deepEqual([created.data.data.title, created.data.data.items], ['Loan Policy', ['Up to 3x share capital.', 'Line one\nline two']]);
+  const id = created.data.data.id;
+
+  assert.equal((await member.request('PUT', `/api/policies/${id}`, { body: { title: 'Loan Policy', items: ['Z'] } })).status, 403);
+  const changed = await admin.request('PUT', `/api/policies/${id}`, { body: { title: 'Loan Policy', items: ['Up to 2x share capital.'] } });
+  assert.equal(changed.status, 200, JSON.stringify(changed.data));
+  assert.deepEqual(changed.data.data.items, ['Up to 2x share capital.']);
+  const list = (await member.get('/api/policies')).data.data;
+  assert.equal(list.length, 5);
+  assert.equal(list[4].title, 'Loan Policy', 'a new policy goes last');
+
+  assert.equal((await member.request('DELETE', `/api/policies/${id}`)).status, 403);
+  assert.equal((await admin.request('DELETE', `/api/policies/${id}`)).status, 200);
+  assert.equal((await admin.request('DELETE', `/api/policies/${id}`)).status, 404);
+  assert.equal((await member.get('/api/policies')).data.data.length, 4);
+  assert.equal((await new Client('10.0.12.1').get('/api/policies')).status, 401);
 });

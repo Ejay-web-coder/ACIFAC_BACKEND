@@ -1,6 +1,6 @@
 import { query } from '../config/db.js';
 import { todayDateOnly } from '../utils/dates.js';
-import { badRequest, notFound } from '../utils/http.js';
+import { badRequest, notFound, parseId } from '../utils/http.js';
 import { toCents } from '../utils/money.js';
 import { centsToNumber, netIncomeCents } from '../services/netIncome.js';
 import { computeDividend, DIVIDEND_POOL_PERCENT, PATRONAGE_POOL_PERCENT, STATUTORY_PERCENT } from '../services/dividends.js';
@@ -43,15 +43,14 @@ const PATRONAGE_SQL = `
     (SELECT COALESCE(json_object_agg(category, n), '{}') FROM
       (SELECT category, COUNT(*)::int AS n FROM attended WHERE member_id IN (SELECT id FROM current_members) GROUP BY category) t) AS "totalAttended"`;
 
-// GET /api/members/me/dividend?year=YYYY
-// The signed-in member's dividend for a calendar year (default: this year, to
-// date), from the year's net income and the paid-up share capital at the end
-// of the year, and their patronage refund from the business they did with the
-// cooperative and the activities they attended that year. Estimates from the
-// records: the General Assembly declares the actual dividend and refund.
-export async function getMyDividend(req, res) {
-  const memberId = Number(req.user?.member_id);
-  if (!Number.isInteger(memberId) || memberId <= 0) throw notFound('No member record is linked to this account.');
+// GET /api/members/:id/dividend?year=YYYY (admin only: confidential, members do not see it)
+// A member's dividend for a calendar year (default: this year, to date), from
+// the year's net income and the paid-up share capital at the end of the year,
+// and their patronage refund from the business they did with the cooperative
+// and the activities they attended that year. Estimates from the records: the
+// General Assembly declares the actual dividend and refund.
+export async function getMemberDividend(req, res) {
+  const memberId = parseId(req.params.id, 'member');
   const today = todayDateOnly();
   const thisYear = Number(today.slice(0, 4));
   const year = req.query.year === undefined || req.query.year === '' ? thisYear : Number(req.query.year);
@@ -73,7 +72,7 @@ export async function getMyDividend(req, res) {
     netIncomeCents({ from, to: asOf }),
     query(PATRONAGE_SQL, [from, asOf, memberId]),
   ]);
-  if (!member.rows[0]) throw notFound('Linked member record not found.');
+  if (!member.rows[0]) throw notFound('Member not found.');
 
   const result = computeDividend({ netIncomeCents: income.total, memberShareCents: toCents(shares.rows[0].member), totalShareCents: toCents(shares.rows[0].total) });
   const activity = patronageRows.rows[0];
