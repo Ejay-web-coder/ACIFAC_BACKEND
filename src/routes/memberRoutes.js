@@ -61,6 +61,7 @@ router.post('/', memberDocumentUpload.fields([
   { name: 'idDocument', maxCount: 1 },
   { name: 'profilePhoto', maxCount: 1 },
   { name: 'signatures', maxCount: 3 },
+  { name: 'rsbsaDocument', maxCount: 1 },
 ]), createMember);
 router.get('/:id', getMember);
 router.get('/:id/savings', getMemberSavings);
@@ -73,6 +74,7 @@ router.post('/:id/documents', memberDocumentUpload.fields([
   { name: 'signature1', maxCount: 1 },
   { name: 'signature2', maxCount: 1 },
   { name: 'signature3', maxCount: 1 },
+  { name: 'rsbsaDocument', maxCount: 1 },
 ]), replaceMemberDocuments);
 router.post('/:id/share-contributions', addShareContribution);
 router.put('/:id', updateMember);

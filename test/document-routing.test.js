@@ -49,7 +49,10 @@ test('authenticity assessment is sanitised', () => {
 
 test('analysis prompt lists every form key and adapts to camera captures', () => {
   const prompt = buildAnalysisPrompt('upload');
-  for (const key of ['memberNumber', 'grandTotal', 'machinery', 'membershipDate', 'referenceNumber']) assert.ok(prompt.includes(key), key);
+  for (const key of ['memberNumber', 'grandTotal', 'membershipDate', 'coMakerName']) assert.ok(prompt.includes(key), key);
+  // The Savings and Machinery forms are no longer read by the OCR Scanner.
+  assert.doesNotMatch(prompt, /"Savings Form"|"Machinery Form"/);
+  assert.doesNotMatch(buildCrossCheckPrompt(), /"Savings Form"|"Machinery Form"/);
   assert.ok(prompt.includes('authenticity'));
   assert.ok(!prompt.includes('phone camera'));
   assert.ok(buildAnalysisPrompt('camera').includes('phone camera'));

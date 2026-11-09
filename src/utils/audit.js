@@ -26,6 +26,7 @@ const SENSITIVE_FIELD_NAMES = new Set([
   'accesstoken',
   'token_digest',
   'id_document_path',
+  'rsbsa_document_path',
   'stored_file_path',
 ]);
 

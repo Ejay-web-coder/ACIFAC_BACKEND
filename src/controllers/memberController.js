@@ -13,7 +13,6 @@ import { DOCUMENT_TYPES, IMAGE_TYPES } from '../middleware/upload.js';
 import { loanSelect, paymentSelect, requestSelect } from './loanController.js';
 import { refreshLoanStatusesInBackground } from '../services/loanService.js';
 import { photoMimeType } from './profilePhotoController.js';
-import { checkSubmittedMemberId } from './memberIdController.js';
 
 const STATUSES = ['active', 'inactive', 'suspended', 'archived'];
 const EDITABLE_STATUSES = ['active', 'inactive', 'suspended'];
@@ -32,6 +31,7 @@ const memberSelect = `
          m.yearly_income, m.spouse_name, m.spouse_age, m.spouse_contact, m.children,
          m.emergency_contact, m.id_document_name, m.id_document_type, m.id_document_size,
          (m.id_document_path IS NOT NULL) AS has_id_document, (m.profile_photo IS NOT NULL) AS has_profile_photo,
+         m.rsbsa_document_name, (m.rsbsa_document_path IS NOT NULL) AS has_rsbsa_document,
          COALESCE(cardinality(m.signature_paths), 0) AS signature_count,
          m.membership_date, m.share_capital, m.status, m.archived_at, m.archived_by, m.additional_info,
          archived_user.username AS archived_by_username, m.created_at, m.updated_at,
@@ -215,15 +215,22 @@ export async function downloadMemberDocument(req, res) {
   const kind = req.params.kind;
   // signature-1 to signature-3: the specimen signatures, in the order they were signed.
   const signatureIndex = /^signature-[1-3]$/.test(kind) ? Number(kind.slice(-1)) : 0;
-  if (!signatureIndex && !['id-document', 'photo', 'avatar'].includes(kind)) throw notFound('Document not found.');
+  if (!signatureIndex && !['id-document', 'rsbsa-document', 'photo', 'avatar'].includes(kind)) throw notFound('Document not found.');
   // "avatar": the picture the member chose for their account, else their 2x2 photo.
   const result = await query(
     `SELECT m.id_document_path, m.id_document_name, m.id_document_type, m.profile_photo, m.signature_paths,
+            m.rsbsa_document_path, m.rsbsa_document_name, m.rsbsa_document_type,
             (SELECT u.profile_photo FROM users u WHERE u.member_id = m.id AND u.profile_photo IS NOT NULL ORDER BY u.id LIMIT 1) AS account_photo
      FROM members m WHERE m.id = $1`,
     [id]
   );
   const row = result.rows[0];
+  if (kind === 'rsbsa-document') {
+    if (!row?.rsbsa_document_path) throw notFound('Document not found.');
+    const sentRsbsa = await sendStoredFile(res, { reference: row.rsbsa_document_path, mimeType: row.rsbsa_document_type, fileName: row.rsbsa_document_name || 'rsbsa-enrollment' });
+    if (!sentRsbsa) throw notFound('The stored file could not be found.');
+    return undefined;
+  }
   const reference = signatureIndex ? row?.signature_paths?.[signatureIndex - 1]
     : kind === 'id-document' ? row?.id_document_path : kind === 'avatar' ? (row?.account_photo || row?.profile_photo) : row?.profile_photo;
   if (!reference) throw notFound('Document not found.');
@@ -718,33 +725,46 @@ export async function createMember(req, res) {
   const idDocument = req.files?.idDocument?.[0] || null;
   const profilePhoto = req.files?.profilePhoto?.[0] || null;
   const signatures = req.files?.signatures || [];
+  // Required: a picture or scan of the RSBSA Enrollment Client's Copy.
+  const rsbsaDocument = req.files?.rsbsaDocument?.[0] || null;
   const { errors, values } = validateMemberInput(body);
   const shareCapitalCents = parseShareCapital(body, errors);
   if (errors.length) throw badRequest(errors[0], errors);
   assertValidUpload(idDocument, DOCUMENT_TYPES, 'ID document');
   if (profilePhoto) assertValidUpload(profilePhoto, IMAGE_TYPES, 'profile photo');
+  if (!rsbsaDocument) throw badRequest('Upload or take a picture of the RSBSA Enrollment Client\'s Copy.');
+  assertValidUpload(rsbsaDocument, DOCUMENT_TYPES, 'RSBSA enrollment copy');
   signatures.forEach((signature) => assertValidUpload(signature, IMAGE_TYPES, 'signature'));
-  // The valid ID: a back-to-back copy with the applicant's 3 specimen signatures, read by AI in the form.
-  await checkSubmittedMemberId(req, idDocument, {
-    firstName: values.firstName, middleName: cleanString(body.middle_name, 100), lastName: values.lastName, suffix: cleanString(body.suffix, 20),
-    dateOfBirth: cleanString(body.date_of_birth, 10), idNumber: cleanString(body.id_number, 100),
-  });
+  // The valid ID: a back-to-back copy with the applicant's 3 specimen signatures.
+  // It is stored as submitted; AI does not read it (the office checks it).
 
   // Upload first; if the database transaction fails the files are removed again.
   const folder = `members/${todayDateOnly().slice(0, 7)}`;
   const idDocumentRef = await uploadFile({ bucket: BUCKETS.memberDocuments, folder, file: idDocument });
   const photoRef = profilePhoto ? await uploadFile({ bucket: BUCKETS.memberPhotos, folder, file: profilePhoto }) : null;
   const signatureRefs = [];
+  let rsbsaRef = null;
 
   try {
     for (const signature of signatures) signatureRefs.push(await uploadFile({ bucket: BUCKETS.memberDocuments, folder, file: signature }));
-    const { id: memberId } = await withTransaction((client) => insertMemberRecord(client, req, { body, values, shareCapitalCents, idDocument, idDocumentRef, photoRef, signatureRefs }));
+    if (rsbsaDocument) rsbsaRef = await uploadFile({ bucket: BUCKETS.memberDocuments, folder, file: rsbsaDocument });
+    const { id: memberId } = await withTransaction(async (client) => {
+      const inserted = await insertMemberRecord(client, req, { body, values, shareCapitalCents, idDocument, idDocumentRef, photoRef, signatureRefs });
+      if (rsbsaRef) {
+        await client.query(
+          'UPDATE members SET rsbsa_document_path = $2, rsbsa_document_name = $3, rsbsa_document_type = $4, rsbsa_document_size = $5 WHERE id = $1',
+          [inserted.id, rsbsaRef, safeOriginalName(rsbsaDocument.originalname), rsbsaDocument.mimetype, rsbsaDocument.size]
+        );
+      }
+      return inserted;
+    });
     const created = await query(`${memberSelect} WHERE m.id = $1`, [memberId]);
     void emailMember(memberId, welcomeMemberEmail({ memberName: created.rows[0].full_name, memberNumber: created.rows[0].member_number, membershipDate: created.rows[0].membership_date }));
     return res.status(201).json({ success: true, data: mapMember(created.rows[0]), message: 'Member created successfully.' });
   } catch (error) {
     await removeFile(idDocumentRef);
     if (photoRef) await removeFile(photoRef);
+    if (rsbsaRef) await removeFile(rsbsaRef);
     for (const reference of signatureRefs) await removeFile(reference);
     throw error;
   }
@@ -844,19 +864,12 @@ export async function replaceMemberDocuments(req, res) {
   const idDocument = req.files?.idDocument?.[0] || null;
   const profilePhoto = req.files?.profilePhoto?.[0] || null;
   const signatures = [1, 2, 3].map((number) => req.files?.[`signature${number}`]?.[0] || null);
-  if (!idDocument && !profilePhoto && !signatures.some(Boolean)) throw badRequest('No files were provided.');
+  const rsbsaDocument = req.files?.rsbsaDocument?.[0] || null;
+  if (!idDocument && !profilePhoto && !rsbsaDocument && !signatures.some(Boolean)) throw badRequest('No files were provided.');
   if (idDocument) assertValidUpload(idDocument, DOCUMENT_TYPES, 'ID document');
   if (profilePhoto) assertValidUpload(profilePhoto, IMAGE_TYPES, 'profile photo');
+  if (rsbsaDocument) assertValidUpload(rsbsaDocument, DOCUMENT_TYPES, 'RSBSA enrollment copy');
   signatures.forEach((signature) => { if (signature) assertValidUpload(signature, IMAGE_TYPES, 'signature'); });
-  // A new valid ID is checked against the member's saved name, birthday and ID No., like one in Add Member.
-  if (idDocument) {
-    const saved = (await query('SELECT first_name, middle_name, last_name, suffix, date_of_birth, id_number FROM members WHERE id = $1', [id])).rows[0];
-    if (!saved) throw notFound('Member not found.');
-    await checkSubmittedMemberId(req, idDocument, {
-      firstName: saved.first_name, middleName: saved.middle_name, lastName: saved.last_name, suffix: saved.suffix,
-      dateOfBirth: saved.date_of_birth || '', idNumber: saved.id_number,
-    });
-  }
 
   const folder = `members/${todayDateOnly().slice(0, 7)}`;
   const stored = [];
@@ -871,11 +884,12 @@ export async function replaceMemberDocuments(req, res) {
   try {
     const idDocumentRef = idDocument ? await store(BUCKETS.memberDocuments, idDocument) : null;
     const photoRef = profilePhoto ? await store(BUCKETS.memberPhotos, profilePhoto) : null;
+    const rsbsaRef = rsbsaDocument ? await store(BUCKETS.memberDocuments, rsbsaDocument) : null;
     const signatureRefs = [];
     for (const signature of signatures) signatureRefs.push(signature ? await store(BUCKETS.memberDocuments, signature) : null);
 
     updated = await withTransaction(async (client) => {
-      const before = (await client.query('SELECT id, member_number, status, id_document_path, profile_photo, signature_paths FROM members WHERE id = $1 FOR UPDATE', [id])).rows[0];
+      const before = (await client.query('SELECT id, member_number, status, id_document_path, profile_photo, signature_paths, rsbsa_document_path FROM members WHERE id = $1 FOR UPDATE', [id])).rows[0];
       if (!before) throw notFound('Member not found.');
       if (before.status === 'archived') throw badRequest('Restore this member before editing.');
       const paths = [...(before.signature_paths || [])];
@@ -901,7 +915,14 @@ export async function replaceMemberDocuments(req, res) {
          WHERE id = $1`,
         [id, idDocumentRef, idDocument ? safeOriginalName(idDocument.originalname) : null, idDocument?.mimetype ?? null, idDocument?.size ?? null, photoRef, signaturePaths]
       );
-      const changed = [idDocument && 'valid ID', profilePhoto && '2x2 photo', ...signatures.map((signature, index) => signature && `signature ${index + 1}`)].filter(Boolean);
+      if (rsbsaRef) {
+        if (before.rsbsa_document_path) replaced.push(before.rsbsa_document_path);
+        await client.query(
+          'UPDATE members SET rsbsa_document_path = $2, rsbsa_document_name = $3, rsbsa_document_type = $4, rsbsa_document_size = $5, updated_at = NOW() WHERE id = $1',
+          [id, rsbsaRef, safeOriginalName(rsbsaDocument.originalname), rsbsaDocument.mimetype, rsbsaDocument.size]
+        );
+      }
+      const changed = [idDocument && 'valid ID', profilePhoto && '2x2 photo', rsbsaDocument && 'RSBSA enrollment copy',...signatures.map((signature, index) => signature && `signature ${index + 1}`)].filter(Boolean);
       await createAuditLog({ client, user: req.user, action: 'MEMBER_DOCUMENTS_UPDATED', module: 'Members', entityType: 'member', entityId: String(id), description: `Replaced ${changed.join(', ')} of member ${before.member_number}`, ...getRequestMeta(req) });
       return (await client.query(`${memberSelect} WHERE m.id = $1`, [id])).rows[0];
     });

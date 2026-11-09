@@ -78,20 +78,17 @@ async function readMemberId(client, reading, file, source = 'upload') {
 // The applicant's ID as AI reads it: in the name and birthday on the form.
 const applicantId = (fields) => ({ ...BORROWER_ID, name: `${fields.first_name} ${fields.last_name}`.toUpperCase(), dateOfBirth: fields.date_of_birth, idNumber: '', address: '' });
 
-// A member as Add Member sends it, with the reading of the ID file. A file
-// that is not a picture or PDF is refused before AI reads it.
-async function memberForm(overrides = {}, file = PNG, signatures = 0) {
+// A member as Add Member sends it: the ID file and the RSBSA enrollment copy.
+// AI does not read the applicant's ID. A file that is not a picture or PDF is refused.
+async function memberForm(overrides = {}, file = PNG, signatures = 0, rsbsa = PNG) {
   const form = new FormData();
   const fields = {
     first_name: 'Juan', last_name: 'Dela Cruz', email: 'juan@example.com', phone: '09171234567', address: 'Purok 1, Amnay',
     membership_date: '2026-01-15', share_capital: '1000', farm_area_ha: '2', date_of_birth: '1980-05-20', status: 'active', ...overrides,
   };
   for (const [key, value] of Object.entries(fields)) form.append(key, value);
-  if (file) {
-    const read = await readMemberId(admin, applicantId(fields), file);
-    if (read.status === 201) form.append('id_document_reading', String(read.data.readingId));
-    form.append('idDocument', new Blob([file], { type: 'image/png' }), 'id.png');
-  }
+  if (file) form.append('idDocument', new Blob([file], { type: 'image/png' }), 'id.png');
+  if (rsbsa) form.append('rsbsaDocument', new Blob([rsbsa], { type: 'image/png' }), 'rsbsa.png');
   for (let index = 1; index <= signatures; index += 1) form.append('signatures', new Blob([PNG], { type: 'image/png' }), `signature-${index}.png`);
   return form;
 }
@@ -439,71 +436,47 @@ test('authorization: members cannot read other members or admin data', { skip },
   assert.equal(anonymous.status, 401);
 });
 
-test('members: Add Member needs the applicant ID as a back-to-back copy with 3 signatures', { skip }, async () => {
+test('members: Add Member needs the applicant ID and the RSBSA enrollment copy; AI does not read the ID', { skip }, async () => {
   const fields = { first_name: 'Lito', last_name: 'Ramos', email: 'lito@example.com', date_of_birth: '1979-08-09', id_number: '5555-6666-7777' };
-  const reading = { ...applicantId(fields), idNumber: '5555-6666-7777' };
-  const post = (file, readingId, extra = {}) => {
+  const post = ({ id = idFile(), rsbsa = idFile() } = {}) => {
     const form = new FormData();
-    for (const [key, value] of Object.entries({ phone: '09170001111', address: 'Purok 4, Amnay', membership_date: '2026-02-01', status: 'active', ...fields, ...extra })) form.append(key, value);
-    if (readingId !== undefined) form.append('id_document_reading', String(readingId));
-    form.append('idDocument', new Blob([file], { type: 'image/png' }), 'id.png');
+    for (const [key, value] of Object.entries({ phone: '09170001111', address: 'Purok 4, Amnay', membership_date: '2026-02-01', status: 'active', ...fields })) form.append(key, value);
+    if (id) form.append('idDocument', new Blob([id], { type: 'image/png' }), 'id.png');
+    if (rsbsa) form.append('rsbsaDocument', new Blob([rsbsa], { type: 'image/png' }), 'rsbsa.png');
     return admin.request('POST', '/api/members', { form });
   };
 
-  // Only admins have an applicant's ID read.
-  assert.equal((await readMemberId(member, reading, idFile())).status, 403);
-
-  // An ID that AI has not read, or not this file: refused.
-  const file = idFile();
-  const unread = await post(file);
-  assert.equal(unread.status, 400);
-  assert.match(unread.data.message, /AI has not read the applicant's ID/);
-  const read = await readMemberId(admin, reading, file);
-  assert.equal(read.status, 201, JSON.stringify(read.data));
-  assert.equal(read.data.reading.signatureCount, 3);
-  const swapped = await post(idFile(), read.data.readingId);
-  assert.equal(swapped.status, 400);
-  assert.match(swapped.data.message, /not the one AI read/);
-
-  // Two signatures, the card itself without signatures, or someone else's ID: refused.
-  for (const [wrong, message] of [
-    [{ ...reading, signatureCount: 2 }, /2 specimen signatures; 3 are required/],
-    [{ ...reading, photocopy: false, physicalCard: true, signatureCount: 0 }, /0 specimen signatures; 3 are required/],
-    [{ ...reading, name: 'MARIA SANTOS' }, /not the applicant/],
-  ]) {
-    const other = idFile();
-    const refused = await post(other, (await readMemberId(admin, wrong, other, 'camera')).data.readingId);
-    assert.equal(refused.status, 422, JSON.stringify(refused.data));
-    assert.match(refused.data.message, message);
-  }
-
-  // The form previews the checks; a birthday that differs must be confirmed.
-  const differs = idFile();
-  const differsRead = await readMemberId(admin, { ...reading, dateOfBirth: '1979-09-08' }, differs);
-  const preview = await admin.post('/api/members/id-checks', { idReading: differsRead.data.readingId, firstName: 'Lito', lastName: 'Ramos', dateOfBirth: '1979-08-09', idNumber: '5555-6666-7777' });
-  assert.equal(preview.status, 200, JSON.stringify(preview.data));
-  assert.deepEqual(Object.fromEntries(preview.data.checks.map((check) => [check.id, check.status])), { idDocument: 'pass', idMatch: 'warn' });
-  const unconfirmed = await post(differs, differsRead.data.readingId);
-  assert.equal(unconfirmed.status, 422);
-  assert.match(unconfirmed.data.message, /Confirm that you compared the flagged ID details/);
+  // Without the ID or without the RSBSA copy: refused, nothing saved.
+  assert.equal((await post({ id: null })).status, 400);
+  const noRsbsa = await post({ rsbsa: null });
+  assert.equal(noRsbsa.status, 400);
+  assert.match(noRsbsa.data.message, /RSBSA Enrollment Client's Copy/);
+  assert.equal((await post({ rsbsa: Buffer.from('not an image') })).status, 400);
   assert.equal((await admin.get('/api/members?search=lito')).data.data.length, 0, 'nothing was saved');
-  const saved = await post(differs, differsRead.data.readingId, { acknowledge_id_warnings: 'true' });
-  assert.equal(saved.status, 201, JSON.stringify(saved.data));
-  assert.equal(saved.data.data.signature_count, 0, 'no signatures are drawn');
 
-  // Edit Member: a new ID is read by AI too, and must be the member's.
+  // An ID that AI never read (or that would not match) is saved as submitted.
+  stubIdReading = { ...applicantId(fields), name: 'MARIA SANTOS', signatureCount: 0 };
+  const rsbsa = idFile();
+  const saved = await post({ rsbsa });
+  assert.equal(saved.status, 201, JSON.stringify(saved.data));
+  assert.equal(saved.data.data.has_rsbsa_document, true);
+  assert.equal(saved.data.data.rsbsa_document_name, 'rsbsa.png');
+  const download = await admin.request('GET', `/api/members/${saved.data.data.id}/documents/rsbsa-document`, { raw: true });
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), rsbsa);
+  assert.equal((await member.request('GET', `/api/members/${saved.data.data.id}/documents/rsbsa-document`, { raw: true })).status, 403, 'other members cannot open it');
+
+  // Edit Member replaces the ID and the RSBSA copy without AI.
   const url = `/api/members/${saved.data.data.id}/documents`;
-  const unreadForm = new FormData();
-  unreadForm.append('idDocument', new Blob([idFile()], { type: 'image/png' }), 'id.png');
-  assert.equal((await admin.request('POST', url, { form: unreadForm })).status, 400);
-  for (const [replacementReading, status] of [[{ ...reading, name: 'MARIA SANTOS' }, 422], [reading, 200]]) {
-    const replacement = idFile();
-    const form = new FormData();
-    form.append('id_document_reading', String((await readMemberId(admin, replacementReading, replacement)).data.readingId));
-    form.append('idDocument', new Blob([replacement], { type: 'image/png' }), 'id.png');
-    const replaced = await admin.request('POST', url, { form });
-    assert.equal(replaced.status, status, JSON.stringify(replaced.data));
-  }
+  const newRsbsa = idFile();
+  const form = new FormData();
+  form.append('idDocument', new Blob([idFile()], { type: 'image/png' }), 'new-id.png');
+  form.append('rsbsaDocument', new Blob([newRsbsa], { type: 'image/png' }), 'new-rsbsa.png');
+  const replaced = await admin.request('POST', url, { form });
+  assert.equal(replaced.status, 200, JSON.stringify(replaced.data));
+  assert.equal(replaced.data.data.id_document_name, 'new-id.png');
+  assert.equal(replaced.data.data.rsbsa_document_name, 'new-rsbsa.png');
+  const again = await admin.request('GET', `/api/members/${saved.data.data.id}/documents/rsbsa-document`, { raw: true });
+  assert.deepEqual(Buffer.from(await again.arrayBuffer()), newRsbsa);
 
   // This member is not part of the counts in the tests that follow.
   await pool.query('DELETE FROM members WHERE id = $1', [saved.data.data.id]);

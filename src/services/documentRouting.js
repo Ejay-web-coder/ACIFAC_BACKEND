@@ -123,8 +123,10 @@ export const FORM_DEFINITIONS = {
       f('term', `Loan Term (months) - always ${LOAN_POLICY.loanTerm}, due at end of term`, { kind: 'integer' }),
     ],
   },
+  // Savings and Machinery forms are no longer read by the OCR Scanner (legacy:
+  // AI is not offered them); scans read before stay openable and postable.
   'Savings Form': {
-    module: 'savings', moduleLabel: 'Savings', signatureExpected: true,
+    module: 'savings', moduleLabel: 'Savings', signatureExpected: true, legacy: true,
     description: 'Savings deposit slip / savings form.',
     fields: [
       f('memberNumber', 'Member ID', { required: true }), f('memberName', 'Member Name', { required: true }),
@@ -133,7 +135,7 @@ export const FORM_DEFINITIONS = {
     ],
   },
   'Machinery Form': {
-    module: 'machinery', moduleLabel: 'Machinery Operations (pending approval)', signatureExpected: true,
+    module: 'machinery', moduleLabel: 'Machinery Operations (pending approval)', signatureExpected: true, legacy: true,
     description: 'Farm machinery rental / booking request form.',
     fields: [
       f('memberNumber', 'Member ID', { required: true }), f('memberName', 'Member Name', { required: true }),
