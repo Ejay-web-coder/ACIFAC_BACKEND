@@ -71,9 +71,10 @@ async function usernameConflict(username, db = { query }) {
 }
 
 // GET /api/admin/accounts/admin-check?email=&phone=&username=
-// Checks as the form is filled in, and says whether the number can get a code.
+// Checks as the form is filled in. The mobile number is not verified by text
+// (smsAvailable is always false): it is only checked against other accounts and members.
 export async function checkAdminContact(req, res) {
-  const result = { smsAvailable: isSmsConfigured(), emailAvailable: isEmailConfigured() };
+  const result = { smsAvailable: false, emailAvailable: isEmailConfigured() };
   const email = cleanString(req.query.email, 255).toLowerCase();
   if (email) result.email = EMAIL.test(email) ? { problem: await emailConflict(email) } : { problem: 'Enter a valid email address.' };
   const rawPhone = cleanString(req.query.phone, 30);
@@ -185,7 +186,6 @@ export async function createAdminAccount(req, res) {
   if (!body.password || body.password !== body.confirmPassword) throw badRequest('The passwords do not match.');
   const policy = validatePasswordPolicy(body.password);
   if (!policy.isValid) throw badRequest(policy.errors[0]);
-  const smsAvailable = isSmsConfigured();
   const requester = Number(currentUserId(req));
   const passwordHash = await hashPassword(body.password);
 
@@ -197,9 +197,7 @@ export async function createAdminAccount(req, res) {
     if (!(await takeVerification(client, { id: Number(body.emailVerificationId), channel: 'email', target: email, requester }))) {
       throw badRequest('Verify the email first: send the code and enter it.');
     }
-    if (smsAvailable && !(await takeVerification(client, { id: Number(body.phoneVerificationId), channel: 'sms', target: phone, requester }))) {
-      throw badRequest('Verify the mobile number first: send the code and enter it.');
-    }
+    // The mobile number is not verified by text, only checked to be free (above).
     const user = (await client.query(
       `INSERT INTO users (username, email, phone, password_hash, role, account_status, must_change_password, full_name, position, created_by, created_at, updated_at)
        VALUES ($1, $2, $3, $4, 'ADMIN', 'ACTIVE', TRUE, $5, $6, $7, NOW(), NOW()) RETURNING *`,
@@ -209,7 +207,7 @@ export async function createAdminAccount(req, res) {
     await createAuditLog({
       client, user: req.user, action: 'ADMIN_ACCOUNT_CREATED', module: 'Accounts', entityType: 'user', entityId: String(user.id),
       description: `Created the administrator account of ${fullName} (${position})`,
-      newValues: { username, full_name: fullName, position, email, phone: maskPhilippineMobile(phone), email_verified: true, phone_verified: smsAvailable },
+      newValues: { username, full_name: fullName, position, email, phone: maskPhilippineMobile(phone), email_verified: true, phone_verified: false },
       targetUserId: user.id, ...getRequestMeta(req),
     });
     await notifyAdmins(client, {

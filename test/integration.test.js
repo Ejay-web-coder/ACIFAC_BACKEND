@@ -3067,7 +3067,7 @@ test('settings: profile, preferences, legal documents', { skip }, async () => {
   if (system) assert.equal(system.user_full_name, null, 'system actions have no person');
 });
 
-test('administrator accounts: name and position required, email and mobile verified and unique, audit log by position', { skip }, async () => {
+test('administrator accounts: name and position required, email verified, email and mobile unique, audit log by position', { skip }, async () => {
   const codeIn = (text) => /(\d{6})/.exec(text)?.[1];
   const memberEmail = (await pool.query('SELECT email FROM members WHERE id = $1', [state.memberId])).rows[0].email;
 
@@ -3077,7 +3077,7 @@ test('administrator accounts: name and position required, email and mobile verif
   assert.match(check.data.email.problem, /already used|record of member/);
   assert.match(check.data.username.problem, /taken/);
   assert.equal(check.data.phone.problem, null);
-  assert.equal(check.data.smsAvailable, true);
+  assert.equal(check.data.smsAvailable, false, 'the mobile number is not verified by text');
   // Offered: the three officers; any other position (like Treasurer below) is typed in.
   assert.deepEqual(check.data.positions, ['Chairperson', 'Vice Chairperson', 'Secretary']);
   assert.equal((await admin.post('/api/admin/accounts/admin-verifications', { channel: 'email', value: memberEmail })).status, 409);
@@ -3095,21 +3095,16 @@ test('administrator accounts: name and position required, email and mobile verif
     fullName: 'Liza Ramos', position: 'Treasurer', username: 'liza.ramos', email: 'treasurer.officer@acifac.ph', phone: '0917 123 9876',
     password: 'Treasurer1!', confirmPassword: 'Treasurer1!', emailVerificationId: emailCode.data.verificationId,
   };
-  // The mobile number must be verified too (text messages are set up here), and the position is required.
-  assert.equal((await admin.post('/api/admin/accounts/admins', account)).status, 400);
+  // The position is required; the mobile number needs no text code.
   assert.equal((await admin.post('/api/admin/accounts/admins', { ...account, position: '' })).status, 400);
-  const smsCode = await admin.post('/api/admin/accounts/admin-verifications', { channel: 'sms', value: '+63 917 123 9876' });
-  assert.equal(smsCode.status, 201, JSON.stringify(smsCode.data));
-  const text = sentTexts.findLast((sent) => sent.recipients?.includes('+639171239876'));
-  assert.ok(text, JSON.stringify(sentTexts.at(-1)));
-  assert.equal((await admin.post(`/api/admin/accounts/admin-verifications/${smsCode.data.verificationId}/confirm`, { code: codeIn(text.message) })).status, 200);
-
-  const created = await admin.post('/api/admin/accounts/admins', { ...account, phoneVerificationId: smsCode.data.verificationId });
+  const textsBefore = sentTexts.length;
+  const created = await admin.post('/api/admin/accounts/admins', account);
+  assert.equal(sentTexts.length, textsBefore, 'no text is sent');
   assert.equal(created.status, 201, JSON.stringify(created.data));
   assert.equal(created.data.user.role, 'ADMIN');
   await waitForMail((sent) => sent.to === 'treasurer.officer@acifac.ph' && /administrator account is ready/i.test(sent.subject) && !sent.text.includes('Treasurer1!'));
   // A verification is used once; the same email or number cannot make a second administrator.
-  assert.equal((await admin.post('/api/admin/accounts/admins', { ...account, username: 'liza2', phoneVerificationId: smsCode.data.verificationId })).status, 409);
+  assert.equal((await admin.post('/api/admin/accounts/admins', { ...account, username: 'liza2' })).status, 409);
   assert.match((await admin.get('/api/admin/accounts/admin-check?phone=09171239876')).data.phone.problem, /Liza Ramos/);
 
   // Listed with the name, position and who made the account.
