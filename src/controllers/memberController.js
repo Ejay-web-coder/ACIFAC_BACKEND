@@ -725,22 +725,21 @@ export async function createMember(req, res) {
   const idDocument = req.files?.idDocument?.[0] || null;
   const profilePhoto = req.files?.profilePhoto?.[0] || null;
   const signatures = req.files?.signatures || [];
-  // Required: a picture or scan of the RSBSA Enrollment Client's Copy.
+  // Optional: a picture or scan of the RSBSA Enrollment Client's Copy.
   const rsbsaDocument = req.files?.rsbsaDocument?.[0] || null;
   const { errors, values } = validateMemberInput(body);
   const shareCapitalCents = parseShareCapital(body, errors);
   if (errors.length) throw badRequest(errors[0], errors);
-  assertValidUpload(idDocument, DOCUMENT_TYPES, 'ID document');
+  if (idDocument) assertValidUpload(idDocument, DOCUMENT_TYPES, 'ID document');
   if (profilePhoto) assertValidUpload(profilePhoto, IMAGE_TYPES, 'profile photo');
-  if (!rsbsaDocument) throw badRequest('Upload or take a picture of the RSBSA Enrollment Client\'s Copy.');
-  assertValidUpload(rsbsaDocument, DOCUMENT_TYPES, 'RSBSA enrollment copy');
+  if (rsbsaDocument) assertValidUpload(rsbsaDocument, DOCUMENT_TYPES, 'RSBSA enrollment copy');
   signatures.forEach((signature) => assertValidUpload(signature, IMAGE_TYPES, 'signature'));
-  // The valid ID: a back-to-back copy with the applicant's 3 specimen signatures.
-  // It is stored as submitted; AI does not read it (the office checks it).
+  // The valid ID (optional): a back-to-back copy with the applicant's 3 specimen
+  // signatures. It is stored as submitted; AI does not read it (the office checks it).
 
   // Upload first; if the database transaction fails the files are removed again.
   const folder = `members/${todayDateOnly().slice(0, 7)}`;
-  const idDocumentRef = await uploadFile({ bucket: BUCKETS.memberDocuments, folder, file: idDocument });
+  const idDocumentRef = idDocument ? await uploadFile({ bucket: BUCKETS.memberDocuments, folder, file: idDocument }) : null;
   const photoRef = profilePhoto ? await uploadFile({ bucket: BUCKETS.memberPhotos, folder, file: profilePhoto }) : null;
   const signatureRefs = [];
   let rsbsaRef = null;
@@ -762,7 +761,7 @@ export async function createMember(req, res) {
     void emailMember(memberId, welcomeMemberEmail({ memberName: created.rows[0].full_name, memberNumber: created.rows[0].member_number, membershipDate: created.rows[0].membership_date }));
     return res.status(201).json({ success: true, data: mapMember(created.rows[0]), message: 'Member created successfully.' });
   } catch (error) {
-    await removeFile(idDocumentRef);
+    if (idDocumentRef) await removeFile(idDocumentRef);
     if (photoRef) await removeFile(photoRef);
     if (rsbsaRef) await removeFile(rsbsaRef);
     for (const reference of signatureRefs) await removeFile(reference);

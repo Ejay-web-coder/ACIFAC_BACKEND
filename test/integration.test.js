@@ -436,23 +436,24 @@ test('authorization: members cannot read other members or admin data', { skip },
   assert.equal(anonymous.status, 401);
 });
 
-test('members: Add Member needs the applicant ID and the RSBSA enrollment copy; AI does not read the ID', { skip }, async () => {
+test('members: Add Member takes the applicant ID and the RSBSA enrollment copy when given (both optional); AI does not read the ID', { skip }, async () => {
   const fields = { first_name: 'Lito', last_name: 'Ramos', email: 'lito@example.com', date_of_birth: '1979-08-09', id_number: '5555-6666-7777' };
-  const post = ({ id = idFile(), rsbsa = idFile() } = {}) => {
+  const post = ({ id = idFile(), rsbsa = idFile(), extra = {} } = {}) => {
     const form = new FormData();
-    for (const [key, value] of Object.entries({ phone: '09170001111', address: 'Purok 4, Amnay', membership_date: '2026-02-01', status: 'active', ...fields })) form.append(key, value);
+    for (const [key, value] of Object.entries({ phone: '09170001111', address: 'Purok 4, Amnay', membership_date: '2026-02-01', status: 'active', ...fields, ...extra })) form.append(key, value);
     if (id) form.append('idDocument', new Blob([id], { type: 'image/png' }), 'id.png');
     if (rsbsa) form.append('rsbsaDocument', new Blob([rsbsa], { type: 'image/png' }), 'rsbsa.png');
     return admin.request('POST', '/api/members', { form });
   };
 
-  // Without the ID or without the RSBSA copy: refused, nothing saved.
-  assert.equal((await post({ id: null })).status, 400);
-  const noRsbsa = await post({ rsbsa: null });
-  assert.equal(noRsbsa.status, 400);
-  assert.match(noRsbsa.data.message, /RSBSA Enrollment Client's Copy/);
+  // A file that is not a valid image or PDF is refused, nothing saved.
   assert.equal((await post({ rsbsa: Buffer.from('not an image') })).status, 400);
+  assert.equal((await post({ id: Buffer.from('not an image') })).status, 400);
   assert.equal((await admin.get('/api/members?search=lito')).data.data.length, 0, 'nothing was saved');
+
+  // Without the ID and the RSBSA copy the member is still added.
+  const bare = await post({ id: null, rsbsa: null, extra: { first_name: 'Nena', last_name: 'Bautista', email: 'nena@example.com', phone: '09170002222', id_number: '1111-2222-3333' } });
+  assert.equal(bare.status, 201, JSON.stringify(bare.data));
 
   // An ID that AI never read (or that would not match) is saved as submitted.
   stubIdReading = { ...applicantId(fields), name: 'MARIA SANTOS', signatureCount: 0 };
@@ -478,8 +479,8 @@ test('members: Add Member needs the applicant ID and the RSBSA enrollment copy; 
   const again = await admin.request('GET', `/api/members/${saved.data.data.id}/documents/rsbsa-document`, { raw: true });
   assert.deepEqual(Buffer.from(await again.arrayBuffer()), newRsbsa);
 
-  // This member is not part of the counts in the tests that follow.
-  await pool.query('DELETE FROM members WHERE id = $1', [saved.data.data.id]);
+  // These members are not part of the counts in the tests that follow.
+  await pool.query('DELETE FROM members WHERE id = ANY($1::int[])', [[saved.data.data.id, bare.data.data.id]]);
 });
 
 test('savings deposits and share capital are separate ledgers', { skip }, async () => {
