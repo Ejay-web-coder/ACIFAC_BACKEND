@@ -12,7 +12,7 @@ import { sendEmailSafely } from '../services/emailService.js';
 import { passwordResetCodeEmail } from '../services/emailTemplates.js';
 import { isSmsConfigured, passwordResetCodeSms, sendSmsSafely } from '../services/smsService.js';
 import { maskPhilippineMobile, normalizePhilippineMobile } from '../utils/phone.js';
-import { notifyUser } from '../services/notificationService.js';
+import { forgetTemporaryPassword, notifyUser } from '../services/notificationService.js';
 import { clearFailures, findActiveLock, registerFailure, throttleKeys } from '../services/loginThrottle.js';
 import { findAccountsByEmail, findAccountsByPhone } from '../services/accountLookup.js';
 import { emailConflict, phoneConflict } from './adminAccountController.js';
@@ -583,6 +583,7 @@ export async function resetPassword(req, res) {
        WHERE id = $2 RETURNING id, username, role, account_status`,
       [newHash, userId]
     );
+    await forgetTemporaryPassword(client, userId);
     // Every outstanding link, code and session of this account ends here.
     await client.query(`UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL`, [userId]);
     await client.query(
@@ -683,6 +684,7 @@ export async function changePassword(req, res) {
       `UPDATE users SET password_hash = $1, password_changed_at = NOW(), must_change_password = FALSE, updated_at = NOW() WHERE id = $2`,
       [newHash, userId]
     );
+    await forgetTemporaryPassword(client, userId);
     await client.query(`UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
     await client.query(`UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL`, [userId]);
     await client.query(

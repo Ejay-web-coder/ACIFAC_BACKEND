@@ -60,3 +60,16 @@ export async function notifyMember(db, memberId, notification) {
 export async function notifyUser(db, userId, notification) {
   return createNotifications(db, [userId], notification);
 }
+
+export const TEMPORARY_PASSWORD_TYPE = 'temporary_password';
+
+// Once the member picks their own password, the temporary one shown to the admin
+// is useless, so it is taken out of the admin's notification.
+// A reset also uses it, so the admin's older notifications stop showing a password that no longer works.
+export async function forgetTemporaryPassword(db, userId, message = 'The member has already set their own password, so the temporary password is no longer shown.') {
+  return runner(db)(
+    `UPDATE notifications SET message = $3
+     WHERE type = $1 AND entity_type = 'user' AND entity_id = $2::text AND message LIKE '%Temporary password: %'`,
+    [TEMPORARY_PASSWORD_TYPE, String(userId), message]
+  );
+}

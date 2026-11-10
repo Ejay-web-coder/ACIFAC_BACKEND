@@ -4059,6 +4059,34 @@ test('organizational chart: positions with names and 2x2 pictures; the office ad
   const removed = await admin.request('PUT', '/api/org-chart', { body: { entries: asSent(saved.data.entries).filter((entry) => entry.id !== added.id) } });
   assert.equal(removed.status, 200, JSON.stringify(removed.data));
   assert.equal(removed.data.entries.length, 30);
+  assert.deepEqual(removed.data.committees, []);
+
+  // The office adds a committee of its own, with positions in it.
+  const base = asSent(removed.data.entries);
+  const committee = { key: 'c-audit2026', title: 'Credit Committee' };
+  assert.equal((await member.request('PUT', '/api/org-chart', { body: { entries: base, committees: [committee] } })).status, 403);
+  const withCommittee = await admin.request('PUT', '/api/org-chart', { body: {
+    entries: [...base, { group: committee.key, role: 'Chairperson', name: 'Maria Clara' }, { group: committee.key, role: 'Member', name: '' }],
+    committees: [committee],
+  } });
+  assert.equal(withCommittee.status, 200, JSON.stringify(withCommittee.data));
+  assert.deepEqual(withCommittee.data.committees, [committee]);
+  assert.deepEqual(withCommittee.data.entries.filter((entry) => entry.group === committee.key).map((entry) => [entry.role, entry.name, entry.custom]), [['Chairperson', 'Maria Clara', true], ['Member', '', true]]);
+  assert.deepEqual((await member.get('/api/org-chart')).data.committees, [committee]);
+  // Saving without committees keeps them; a position in an unknown committee, a bad key or a blank name is refused.
+  const kept = await admin.request('PUT', '/api/org-chart', { body: { entries: asSent(withCommittee.data.entries) } });
+  assert.equal(kept.status, 200, JSON.stringify(kept.data));
+  assert.deepEqual(kept.data.committees, [committee]);
+  assert.equal((await admin.request('PUT', '/api/org-chart', { body: { entries: [...base, { group: 'c-nowhere1', role: 'Chairperson', name: '' }], committees: [committee] } })).status, 400);
+  assert.equal((await admin.request('PUT', '/api/org-chart', { body: { entries: base, committees: [{ key: 'Bad Key', title: 'X' }] } })).status, 400);
+  assert.equal((await admin.request('PUT', '/api/org-chart', { body: { entries: base, committees: [{ key: 'c-blank001', title: '  ' }] } })).status, 400);
+  // Renamed, then removed together with its positions.
+  const renamed = await admin.request('PUT', '/api/org-chart', { body: { entries: asSent(kept.data.entries), committees: [{ ...committee, title: 'Credit & Collection Committee' }] } });
+  assert.equal(renamed.status, 200, JSON.stringify(renamed.data));
+  assert.equal(renamed.data.committees[0].title, 'Credit & Collection Committee');
+  const gone = await admin.request('PUT', '/api/org-chart', { body: { entries: base, committees: [] } });
+  assert.equal(gone.status, 200, JSON.stringify(gone.data));
+  assert.deepEqual([gone.data.committees, gone.data.entries.length], [[], 30]);
   assert.equal((await new Client('10.0.12.1').get('/api/org-chart')).status, 401);
 });
 

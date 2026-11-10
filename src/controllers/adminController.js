@@ -1,13 +1,13 @@
 import { query, withTransaction } from '../config/db.js';
 import { TIME_ZONE } from '../config/env.js';
-import { hashPassword, validatePasswordPolicy } from '../utils/password.js';
+import { generateTemporaryPassword, hashPassword, validatePasswordPolicy } from '../utils/password.js';
 import { createAuditLog } from '../utils/audit.js';
 import { digestToken, generateSecureToken, sanitizeUser } from '../utils/auth.js';
 import { isValidDateOnly } from '../utils/dates.js';
 import { badRequest, cleanString, conflict, currentUserId, forbidden, getRequestMeta, notFound, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { sendEmailSafely, sendTestEmail } from '../services/emailService.js';
-import { accountCreatedEmail, passwordResetEmail } from '../services/emailTemplates.js';
-import { backfillAnnouncementNotifications, notifyUser } from '../services/notificationService.js';
+import { accountCreatedEmail } from '../services/emailTemplates.js';
+import { backfillAnnouncementNotifications, forgetTemporaryPassword, notifyUser, TEMPORARY_PASSWORD_TYPE } from '../services/notificationService.js';
 import { findAccountsByEmail, findAccountsByPhone } from '../services/accountLookup.js';
 import { maskPhilippineMobile, normalizePhilippineMobile } from '../utils/phone.js';
 
@@ -73,8 +73,12 @@ async function usernameFor(client, member) {
 const nameOf = (row) => row.member_name || row.full_name || row.username;
 
 export async function createMemberAccount(req, res) {
-  const { memberId, password, confirmPassword, role = 'MEMBER' } = req.body || {};
+  const { memberId, role = 'MEMBER' } = req.body || {};
   const numericMemberId = parseId(memberId, 'member ID');
+  // With no password given, one is made up and shown to the admin (in the reply and their notifications).
+  const generated = !req.body?.password && !req.body?.confirmPassword;
+  const password = generated ? generateTemporaryPassword() : req.body.password;
+  const confirmPassword = generated ? password : req.body.confirmPassword;
   if (!password || !confirmPassword) throw badRequest('Member and password are required.');
   if (password !== confirmPassword) throw badRequest('Passwords do not match.');
   if (role !== 'MEMBER') throw badRequest('Only MEMBER accounts can be created from the admin console.');
@@ -142,6 +146,19 @@ export async function createMemberAccount(req, res) {
       link: '/settings',
       dedupeKey: `account-created-${createdUser.id}`,
     });
+    if (generated) {
+      const memberName = `${memberRow.first_name || ''} ${memberRow.last_name || ''}`.trim() || username;
+      const signIn = [email, phone && !warnings.length ? memberRow.phone : null].filter(Boolean).join(' or ');
+      await notifyUser(client, currentUserId(req), {
+        type: TEMPORARY_PASSWORD_TYPE,
+        title: `Temporary password for ${memberName}`,
+        message: `${memberName}${memberRow.member_number ? ` (${memberRow.member_number})` : ''} signs in with ${signIn} and must change it on first sign-in. Temporary password: ${password}`,
+        severity: 'info',
+        link: '/admin/accounts',
+        entityType: 'user',
+        entityId: createdUser.id,
+      });
+    }
     return { user: createdUser, member: memberRow, username, warnings };
   });
 
@@ -153,7 +170,7 @@ export async function createMemberAccount(req, res) {
     void sendEmailSafely({ ...email, to: user.email, relatedUserId: user.id, essential: true });
   }
 
-  return res.status(201).json({ success: true, message: 'Member account created successfully.', user: sanitizeUser(user), username, warnings });
+  return res.status(201).json({ success: true, message: 'Member account created successfully.', user: sanitizeUser(user), username, warnings, ...(generated ? { temporaryPassword: password } : {}) });
 }
 
 export async function sendEmailTest(req, res) {
@@ -212,30 +229,28 @@ export async function updateAccountStatus(req, res) {
 
 export async function resetMemberPassword(req, res) {
   const id = parseId(req.params.id, 'account ID');
-  const resetToken = generateSecureToken(32);
-  const unusablePasswordHash = await hashPassword(generateSecureToken(24));
+  // No email: a temporary password is made and shown only to the admin (reply + their notifications).
+  const temporaryPassword = generateTemporaryPassword();
+  const passwordHash = await hashPassword(temporaryPassword);
 
   const targetUser = await withTransaction(async (client) => {
     const targetResult = await client.query(
-      `SELECT u.*, TRIM(CONCAT_WS(' ', m.first_name, m.last_name)) AS member_name FROM users u LEFT JOIN members m ON m.id = u.member_id WHERE u.id = $1 FOR UPDATE OF u`,
+      `SELECT u.*, m.member_number, m.phone AS member_phone, TRIM(CONCAT_WS(' ', m.first_name, m.last_name)) AS member_name
+       FROM users u LEFT JOIN members m ON m.id = u.member_id WHERE u.id = $1 FOR UPDATE OF u`,
       [id]
     );
     const target = targetResult.rows[0];
     if (!target) throw notFound('Account not found.');
     if (target.role !== 'MEMBER') throw forbidden('Only member passwords can be reset from the admin console.');
-    if (!target.email) throw badRequest('This account has no email address, so a reset link cannot be delivered.');
 
     await client.query(
       `UPDATE users SET password_hash = $1, must_change_password = TRUE, password_changed_at = NOW(), updated_at = NOW() WHERE id = $2`,
-      [unusablePasswordHash, target.id]
+      [passwordHash, target.id]
     );
+    // Any older reset link or temporary password stops working.
     await client.query(`UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL`, [target.id]);
-    const digest = digestToken(resetToken);
-    await client.query(
-      `INSERT INTO password_reset_tokens (user_id, token_hash, token_digest, expires_at) VALUES ($1, $2::text, $2::text, NOW() + INTERVAL '24 hours')`,
-      [target.id, digest]
-    );
     await client.query(`UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, [target.id]);
+    await forgetTemporaryPassword(client, target.id, 'A newer temporary password replaced this one.');
     await createAuditLog({
       client,
       user: req.user,
@@ -245,17 +260,29 @@ export async function resetMemberPassword(req, res) {
       entityId: String(target.id),
       description: `Reset password for user ${target.username}`,
       oldValues: { must_change_password: target.must_change_password },
-      newValues: { must_change_password: true },
+      newValues: { must_change_password: true, delivered: 'admin_notification' },
       targetUserId: target.id,
       ...getRequestMeta(req),
+    });
+    const name = nameOf(target);
+    const signIn = [target.email, target.member_phone || target.phone].filter(Boolean).join(' or ') || target.username;
+    await notifyUser(client, currentUserId(req), {
+      type: TEMPORARY_PASSWORD_TYPE,
+      title: `New temporary password for ${name}`,
+      message: `${name}${target.member_number ? ` (${target.member_number})` : ''} signs in with ${signIn} and must change it on first sign-in. Temporary password: ${temporaryPassword}`,
+      severity: 'info',
+      link: '/admin/accounts',
+      entityType: 'user',
+      entityId: target.id,
     });
     return target;
   });
 
-  const email = passwordResetEmail({ name: nameOf(targetUser), token: resetToken, expiresIn: '24 hours' });
-  void sendEmailSafely({ ...email, to: targetUser.email, relatedUserId: targetUser.id, essential: true });
-  if (process.env.NODE_ENV === 'test') res.setHeader('X-Test-Reset-Token', resetToken);
-  return res.status(200).json({ success: true, message: 'Password reset instructions were sent to the member email address.' });
+  return res.status(200).json({
+    success: true,
+    message: `${nameOf(targetUser)}'s password was reset. The temporary password is in your notifications.`,
+    temporaryPassword,
+  });
 }
 
 // Who did each action, by full name: the name kept with the entry, else (for

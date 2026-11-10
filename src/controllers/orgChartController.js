@@ -8,10 +8,14 @@ import { photoMimeType } from './profilePhotoController.js';
 // The organizational chart: each box (group) holds entries, a role, the name
 // of whoever holds it and an optional 2x2 picture. The positions of the printed
 // chart are always there (they can be renamed, not removed); the office can add
-// more to any box. Everyone signed in can read it; administrators change it.
+// more to any box, and add committees of their own (org_chart_committees, each
+// a box whose positions have the committee's key as their group). Everyone
+// signed in can read it; administrators change it.
 
 export const ORG_CHART_GROUPS = ['audit', 'election', 'bod', 'officers', 'ethics', 'education', 'gad', 'mediation', 'manager', 'staff'];
 const MAX_ENTRIES = 200;
+const MAX_COMMITTEES = 20;
+const COMMITTEE_KEY = /^c-[a-z0-9]{4,24}$/;
 
 async function readChart(db = { query }) {
   const rows = (await db.query(
@@ -20,11 +24,17 @@ async function readChart(db = { query }) {
      FROM org_chart_entries e LEFT JOIN users u ON u.id = e.updated_by
      ORDER BY e.group_key, e.sort_order, e.id`
   )).rows;
-  const touched = rows.filter((row) => row.name || row.hasPhoto || row.custom);
+  const committees = (await db.query(
+    `SELECT c.committee_key AS key, c.title, c.updated_at AS "updatedAt", NULLIF(TRIM(COALESCE(u.full_name, u.username)), '') AS "updatedBy", TRUE AS custom
+     FROM org_chart_committees c LEFT JOIN users u ON u.id = c.updated_by
+     ORDER BY c.sort_order, c.committee_key`
+  )).rows;
+  const touched = [...rows.filter((row) => row.name || row.hasPhoto || row.custom), ...committees];
   const latest = touched.reduce((last, row) => (!last || row.updatedAt > last.updatedAt ? row : last), null);
   return {
     // updatedAt per entry lets the pages reload a picture when it changes.
     entries: rows.map(({ updatedBy: _by, ...row }) => row),
+    committees: committees.map(({ key, title }) => ({ key, title })),
     updatedAt: latest?.updatedAt ?? null,
     updatedBy: latest?.updatedBy ?? null,
   };
@@ -35,19 +45,33 @@ export async function getOrgChart(req, res) {
   return res.json({ success: true, ...(await readChart()) });
 }
 
-// PUT /api/org-chart { entries: [{ id?, group, role, name }] }
+// PUT /api/org-chart { entries: [{ id?, group, role, name }], committees?: [{ key, title }] }
 // The whole chart as it should be: entries with an id are updated, entries
 // without one are added, and added entries left out are removed (with their
-// picture). The printed chart's positions cannot be removed.
+// picture). The printed chart's positions cannot be removed. The added
+// committees are sent the same way (a new one with a new key); one left out is
+// removed, so its positions must be left out too. Without committees, the
+// added committees stay as they are.
 export async function updateOrgChart(req, res) {
   const raw = req.body?.entries;
   if (!Array.isArray(raw)) throw badRequest('Send the entries of the chart.');
   if (raw.length > MAX_ENTRIES) throw badRequest(`The chart can have at most ${MAX_ENTRIES} positions.`);
+  const rawCommittees = req.body?.committees;
+  if (rawCommittees !== undefined && !Array.isArray(rawCommittees)) throw badRequest('Send the committees of the chart as a list.');
+  if (rawCommittees && rawCommittees.length > MAX_COMMITTEES) throw badRequest(`The chart can have at most ${MAX_COMMITTEES} added committees.`);
+  const committees = rawCommittees?.map((item, index) => {
+    const key = cleanString(item?.key, 30);
+    if (!COMMITTEE_KEY.test(key)) throw badRequest(`Committee ${index + 1} is not valid.`);
+    const title = cleanString(item?.title, 120);
+    if (!title) throw badRequest(`Committee ${index + 1}: enter its name (for example Audit and Inventory Committee).`);
+    return { key, title, order: index + 1 };
+  });
+  if (committees && new Set(committees.map((committee) => committee.key)).size !== committees.length) throw badRequest('Two committees have the same key.');
   const entries = raw.map((item, index) => {
     const id = item?.id === undefined || item?.id === null || item?.id === '' ? null : Number(item.id);
     if (id !== null && (!Number.isInteger(id) || id <= 0)) throw badRequest(`Position ${index + 1} is not valid.`);
     const group = cleanString(item?.group, 30);
-    if (!ORG_CHART_GROUPS.includes(group)) throw badRequest(`Position ${index + 1}: unknown box of the chart.`);
+    if (!ORG_CHART_GROUPS.includes(group) && !COMMITTEE_KEY.test(group)) throw badRequest(`Position ${index + 1}: unknown box of the chart.`);
     const role = cleanString(item?.role, 120);
     if (!role) throw badRequest(`Position ${index + 1}: enter the position (for example Director).`);
     return { id, group, role, name: cleanString(String(item?.name ?? ''), 200), order: index + 1 };
@@ -56,6 +80,11 @@ export async function updateOrgChart(req, res) {
   const removedPhotos = await withTransaction(async (client) => {
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['acifac-org-chart']);
     const before = (await client.query('SELECT * FROM org_chart_entries FOR UPDATE')).rows;
+    const committeesBefore = (await client.query('SELECT * FROM org_chart_committees FOR UPDATE')).rows;
+    const committeeKeys = new Set((committees ?? committeesBefore).map((row) => row.key ?? row.committee_key));
+    for (const entry of entries) {
+      if (COMMITTEE_KEY.test(entry.group) && !committeeKeys.has(entry.group)) throw badRequest(`${entry.role} is in a committee that is not on the chart. Open the chart again.`);
+    }
     const byId = new Map(before.map((row) => [Number(row.id), row]));
     for (const entry of entries) {
       if (entry.id !== null && !byId.has(entry.id)) throw notFound('A position on the chart was removed meanwhile. Open the chart again.');
@@ -82,6 +111,24 @@ export async function updateOrgChart(req, res) {
     if (removed.length) {
       await client.query('DELETE FROM org_chart_entries WHERE id = ANY($1::int[])', [removed.map((row) => row.id)]);
       for (const row of removed) changes.push(`removed ${row.role}${row.holder_name ? ` (${row.holder_name})` : ''}`);
+    }
+    if (committees) {
+      const oldCommittees = new Map(committeesBefore.map((row) => [row.committee_key, row]));
+      for (const committee of committees) {
+        const old = oldCommittees.get(committee.key);
+        if (!old) {
+          await client.query('INSERT INTO org_chart_committees (committee_key, title, sort_order, updated_by) VALUES ($1, $2, $3, $4)', [committee.key, committee.title, committee.order, userId]);
+          changes.push(`added the committee ${committee.title}`);
+        } else if (old.title !== committee.title || old.sort_order !== committee.order) {
+          await client.query('UPDATE org_chart_committees SET title = $2, sort_order = $3, updated_by = $4, updated_at = NOW() WHERE committee_key = $1', [committee.key, committee.title, committee.order, userId]);
+          if (old.title !== committee.title) changes.push(`renamed the committee ${old.title} -> ${committee.title}`);
+        }
+      }
+      const gone = committeesBefore.filter((row) => !committeeKeys.has(row.committee_key));
+      if (gone.length) {
+        await client.query('DELETE FROM org_chart_committees WHERE committee_key = ANY($1::text[])', [gone.map((row) => row.committee_key)]);
+        for (const row of gone) changes.push(`removed the committee ${row.title}`);
+      }
     }
     if (changes.length) {
       await createAuditLog({
