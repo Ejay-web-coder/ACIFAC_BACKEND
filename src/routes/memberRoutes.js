@@ -26,7 +26,7 @@ import { previewMemberIdChecks, readMemberId } from '../controllers/memberIdCont
 import { getMyActivity } from '../controllers/memberActivityController.js';
 import { getMyAttendance } from '../controllers/attendanceController.js';
 import { requireAdmin, requireAuth, requireMember } from '../middleware/auth.js';
-import { loanApplicationUpload, memberDocumentUpload } from '../middleware/upload.js';
+import { loanApplicationUpload, memberDocumentUpload, memberFileUpload } from '../middleware/upload.js';
 
 const router = express.Router();
 
@@ -57,7 +57,7 @@ router.post('/import', importMembers);
 router.post('/id-reading', memberDocumentUpload.single('idDocument'), readMemberId);
 router.post('/id-checks', previewMemberIdChecks);
 // Add Member sends id_document_reading (the reading of idDocument) and acknowledge_id_warnings.
-router.post('/', memberDocumentUpload.fields([
+router.post('/', memberFileUpload.fields([
   { name: 'idDocument', maxCount: 1 },
   { name: 'profilePhoto', maxCount: 1 },
   { name: 'signatures', maxCount: 3 },
@@ -68,7 +68,7 @@ router.get('/:id/savings', getMemberSavings);
 // A member's dividend and patronage refund for a year: confidential, so the office only (shown under Savings).
 router.get('/:id/dividend', getMemberDividend);
 router.get('/:id/documents/:kind', downloadMemberDocument);
-router.post('/:id/documents', memberDocumentUpload.fields([
+router.post('/:id/documents', memberFileUpload.fields([
   { name: 'idDocument', maxCount: 1 },
   { name: 'profilePhoto', maxCount: 1 },
   { name: 'signature1', maxCount: 1 },

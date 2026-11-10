@@ -9,7 +9,7 @@ import { notifyMember } from '../services/notificationService.js';
 import { emailMember } from '../services/memberEmails.js';
 import { savingsDepositEmail, savingsWithdrawalEmail, shareContributionEmail, welcomeMemberEmail } from '../services/emailTemplates.js';
 import { savingsTypeLabel, signedSavings } from '../services/savingsLedger.js';
-import { DOCUMENT_TYPES, IMAGE_TYPES } from '../middleware/upload.js';
+import { IMAGE_TYPES, MEMBER_FILE_TYPES } from '../middleware/upload.js';
 import { loanSelect, paymentSelect, requestSelect } from './loanController.js';
 import { refreshLoanStatusesInBackground } from '../services/loanService.js';
 import { photoMimeType } from './profilePhotoController.js';
@@ -730,9 +730,9 @@ export async function createMember(req, res) {
   const { errors, values } = validateMemberInput(body);
   const shareCapitalCents = parseShareCapital(body, errors);
   if (errors.length) throw badRequest(errors[0], errors);
-  if (idDocument) assertValidUpload(idDocument, DOCUMENT_TYPES, 'ID document');
+  if (idDocument) assertValidUpload(idDocument, MEMBER_FILE_TYPES, 'ID document');
   if (profilePhoto) assertValidUpload(profilePhoto, IMAGE_TYPES, 'profile photo');
-  if (rsbsaDocument) assertValidUpload(rsbsaDocument, DOCUMENT_TYPES, 'RSBSA enrollment copy');
+  if (rsbsaDocument) assertValidUpload(rsbsaDocument, MEMBER_FILE_TYPES, 'RSBSA enrollment copy');
   signatures.forEach((signature) => assertValidUpload(signature, IMAGE_TYPES, 'signature'));
   // The valid ID (optional): a back-to-back copy with the applicant's 3 specimen
   // signatures. It is stored as submitted; AI does not read it (the office checks it).
@@ -865,9 +865,9 @@ export async function replaceMemberDocuments(req, res) {
   const signatures = [1, 2, 3].map((number) => req.files?.[`signature${number}`]?.[0] || null);
   const rsbsaDocument = req.files?.rsbsaDocument?.[0] || null;
   if (!idDocument && !profilePhoto && !rsbsaDocument && !signatures.some(Boolean)) throw badRequest('No files were provided.');
-  if (idDocument) assertValidUpload(idDocument, DOCUMENT_TYPES, 'ID document');
+  if (idDocument) assertValidUpload(idDocument, MEMBER_FILE_TYPES, 'ID document');
   if (profilePhoto) assertValidUpload(profilePhoto, IMAGE_TYPES, 'profile photo');
-  if (rsbsaDocument) assertValidUpload(rsbsaDocument, DOCUMENT_TYPES, 'RSBSA enrollment copy');
+  if (rsbsaDocument) assertValidUpload(rsbsaDocument, MEMBER_FILE_TYPES, 'RSBSA enrollment copy');
   signatures.forEach((signature) => { if (signature) assertValidUpload(signature, IMAGE_TYPES, 'signature'); });
 
   const folder = `members/${todayDateOnly().slice(0, 7)}`;

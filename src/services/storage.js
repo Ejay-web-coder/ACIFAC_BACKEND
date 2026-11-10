@@ -35,8 +35,11 @@ const SIGNATURES = {
   'image/png': (buffer) => buffer.length > 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
   'image/webp': (buffer) => buffer.length > 12 && buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP',
   'application/pdf': (buffer) => buffer.length > 5 && buffer.subarray(0, 5).toString('ascii') === '%PDF-',
+  // A .docx is a ZIP package holding word/ parts.
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': (buffer) => buffer.length > 30
+    && buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04])) && buffer.includes(Buffer.from('word/')),
 };
-const EXTENSIONS = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'application/pdf': '.pdf' };
+const EXTENSIONS = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'application/pdf': '.pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx' };
 
 // Checks the declared type is allowed AND matches the file's real content.
 export function assertValidUpload(file, allowedTypes, label = 'file') {

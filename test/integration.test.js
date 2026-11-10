@@ -455,6 +455,25 @@ test('members: Add Member takes the applicant ID and the RSBSA enrollment copy w
   const bare = await post({ id: null, rsbsa: null, extra: { first_name: 'Nena', last_name: 'Bautista', email: 'nena@example.com', phone: '09170002222', id_number: '1111-2222-3333' } });
   assert.equal(bare.status, 201, JSON.stringify(bare.data));
 
+  // The RSBSA copy and the valid ID may be Word documents (.docx); a fake one is refused.
+  const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  const docx = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.alloc(26), Buffer.from('word/document.xml'), Buffer.alloc(64)]);
+  const postDocx = (rsbsaBytes, extra) => {
+    const form = new FormData();
+    for (const [key, value] of Object.entries({ phone: '09170003333', address: 'Purok 4, Amnay', membership_date: '2026-02-01', status: 'active', ...fields, ...extra })) form.append(key, value);
+    form.append('idDocument', new Blob([docx], { type: DOCX }), 'id.docx');
+    form.append('rsbsaDocument', new Blob([rsbsaBytes], { type: DOCX }), 'rsbsa.docx');
+    return admin.request('POST', '/api/members', { form });
+  };
+  const docxExtra = { first_name: 'Rosa', last_name: 'Villanueva', email: 'rosa@example.com', id_number: '4444-5555-6666' };
+  assert.equal((await postDocx(Buffer.from('not a word document'), docxExtra)).status, 400);
+  const withDocx = await postDocx(docx, docxExtra);
+  assert.equal(withDocx.status, 201, JSON.stringify(withDocx.data));
+  assert.equal(withDocx.data.data.rsbsa_document_name, 'rsbsa.docx');
+  const docxBack = await admin.request('GET', `/api/members/${withDocx.data.data.id}/documents/rsbsa-document`, { raw: true });
+  assert.equal(docxBack.headers.get('content-type'), DOCX);
+  assert.deepEqual(Buffer.from(await docxBack.arrayBuffer()), docx);
+
   // An ID that AI never read (or that would not match) is saved as submitted.
   stubIdReading = { ...applicantId(fields), name: 'MARIA SANTOS', signatureCount: 0 };
   const rsbsa = idFile();
@@ -480,7 +499,7 @@ test('members: Add Member takes the applicant ID and the RSBSA enrollment copy w
   assert.deepEqual(Buffer.from(await again.arrayBuffer()), newRsbsa);
 
   // These members are not part of the counts in the tests that follow.
-  await pool.query('DELETE FROM members WHERE id = ANY($1::int[])', [[saved.data.data.id, bare.data.data.id]]);
+  await pool.query('DELETE FROM members WHERE id = ANY($1::int[])', [[saved.data.data.id, bare.data.data.id, withDocx.data.data.id]]);
 });
 
 test('savings deposits and share capital are separate ledgers', { skip }, async () => {
