@@ -11,7 +11,8 @@
     "seed": "node scripts/seed.js",
     "test": "node --test --test-concurrency=1",
     "remove-sample-data": "node scripts/remove-sample-data.js",
-    "remove-all-members": "node scripts/remove-all-members.js"
+    "remove-all-members": "node scripts/remove-all-members.js",
+    "remove-machinery-kadiwa": "node scripts/remove-machinery-kadiwa.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.0",
