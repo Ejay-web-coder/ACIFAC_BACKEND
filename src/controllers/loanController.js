@@ -263,6 +263,7 @@ export async function quoteLoan(req, res) {
       amount: centsToString(amountCents),
       term,
       interestRate: LOAN_POLICY.interestRate,
+      monthlyInterestRate: LOAN_POLICY.monthlyInterestRate,
       maximumEligibleAmount: financials.maximum_eligible_amount,
       calculatedInterest: financials.calculated_interest,
       totalRepayment: financials.total_repayment,

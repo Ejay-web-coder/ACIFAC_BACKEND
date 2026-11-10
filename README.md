@@ -112,7 +112,7 @@ and the hourly overdue job run.
 | Area | Rule |
 |---|---|
 | Loan limit | farm area (ha) × ₱50,000 |
-| Interest | 2.5% of principal, flat for the whole term (legacy requests without a rate keep 8%) |
+| Interest | 2.5% of principal a month, flat: 15% for the 6-month term (loans before November 2026 keep 2.5% for the term; legacy requests without a rate keep 8%) |
 | Schedule | `term` equal monthly installments, first due one month after approval; last absorbs rounding |
 | Payments | applied to the oldest unpaid installment, interest portion first |
 | Overdue | a loan is overdue when any installment is unpaid after its due date (no grace period) |

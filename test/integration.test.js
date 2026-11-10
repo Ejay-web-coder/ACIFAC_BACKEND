@@ -630,13 +630,13 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   // Every loan is for 6 months, repaid in one payment of the whole amount (a term sent is ignored).
   const quote = await member.post('/api/loans/quote', { farmArea: '2', amount: '50000', term: 12 });
   assert.deepEqual([quote.data.quote.maximumEligibleAmount, quote.data.quote.calculatedInterest, quote.data.quote.totalRepayment, quote.data.quote.monthlyPayment, quote.data.quote.term],
-    ['100000.00', '1250.00', '51250.00', '51250.00', 6]);
+    ['100000.00', '7500.00', '57500.00', '57500.00', 6]);
 
   const tooMuch = await applyWithIds(member, '/api/members/me/loan-requests', { loanType: 'agricultural', amount: '150000', term: 12, purpose: 'Seeds', farmArea: '2' });
   assert.equal(tooMuch.status, 400);
   const applied = await applyWithIds(member, '/api/members/me/loan-requests', { loanType: 'agricultural', amount: '50000', term: 12, purpose: 'Rice seeds and fertilizer', farmArea: '2', totalRepayment: '1' });
   assert.equal(applied.status, 201, JSON.stringify(applied.data));
-  assert.equal(applied.data.request.totalRepayment, '51250.00', 'client-sent totals are ignored');
+  assert.equal(applied.data.request.totalRepayment, '57500.00', 'client-sent totals are ignored');
   const twice = await applyWithIds(member, '/api/members/me/loan-requests', { loanType: 'agricultural', amount: '1000', term: 12, purpose: 'x', farmArea: '2' });
   assert.equal(twice.status, 409);
 
@@ -647,13 +647,13 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   assert.equal(approve.status, 200, JSON.stringify(approve.data));
   state.loanId = approve.data.loanId;
   const detail = await admin.get(`/api/admin/loans/${state.loanId}`);
-  assert.equal(detail.data.loan.totalAmount, '51250.00');
-  assert.equal(detail.data.loan.balance, '51250.00');
+  assert.equal(detail.data.loan.totalAmount, '57500.00');
+  assert.equal(detail.data.loan.balance, '57500.00');
   assert.equal(detail.data.loan.term, 6);
   assert.equal(detail.data.loan.repayment, 'single');
   // One installment of the whole amount, due 6 months after approval (moved to an office day).
   assert.equal(detail.data.installments.length, 1);
-  assert.equal(detail.data.installments[0].amountDue, '51250.00');
+  assert.equal(detail.data.installments[0].amountDue, '57500.00');
   const dueDays = (Date.parse(detail.data.installments[0].dueDate) - Date.parse(detail.data.loan.dateApproved)) / 86400000;
   assert.ok(dueDays >= 181 && dueDays <= 186, String(dueDays));
   assert.match(detail.data.loan.id, /^L-\d{4}-\d{3}$/);
@@ -675,7 +675,7 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   await refreshLoanStatuses({ force: true });
   const due = await dueNotes();
   assert.equal(due.length, 1, 'one reminder, not repeated');
-  assert.match(due[0].message, /^Your loan L-\d{4}-\d{3} \(PHP 51,250\.00\) is due on /);
+  assert.match(due[0].message, /^Your loan L-\d{4}-\d{3} \(PHP 57,500\.00\) is due on /);
   const { flushSmsOutbox: flushDue } = await import('../src/services/smsService.js');
   await flushDue();
   const dueTexts = sentTexts.filter((text) => text.message.startsWith('Your loan ') && text.message.includes('Please pay at the ACIFAC office.'));
@@ -691,7 +691,7 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   await refreshLoanStatuses({ force: true });
   const overdue = await admin.get(`/api/admin/loans/${state.loanId}`);
   assert.equal(overdue.data.loan.status, 'overdue');
-  assert.equal(overdue.data.loan.overdueAmount, '51250.00');
+  assert.equal(overdue.data.loan.overdueAmount, '57500.00');
   assert.equal(overdue.data.loan.overdueInstallments, 1);
   const overdueNotes = await pool.query(`SELECT COUNT(*)::int AS n FROM notifications WHERE type = 'payment_overdue' AND user_id = $1`, [state.memberUserId]);
   assert.equal(overdueNotes.rows[0].n, overdue.data.loan.overdueInstallments, 'one notification per overdue installment, no duplicates');
@@ -711,13 +711,13 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
 
   const rest = await admin.post(`/api/admin/loans/${state.loanId}/payments`, { amount: overdue.data.loan.balance, paymentDate: overdue.data.loan.dateApproved });
   assert.equal(rest.status, 201, JSON.stringify(rest.data));
-  assert.equal(rest.data.payment.interestPaid, '1250.00');
+  assert.equal(rest.data.payment.interestPaid, '7500.00');
   assert.equal(rest.data.payment.principalPaid, '50000.00');
   assert.equal(rest.data.payment.remainingBalance, '0.00');
   const paid = await admin.get(`/api/admin/loans/${state.loanId}`);
   assert.equal(paid.data.loan.status, 'paid');
   assert.equal(paid.data.loan.balance, '0.00');
-  assert.equal(paid.data.loan.totalPaid, '51250.00');
+  assert.equal(paid.data.loan.totalPaid, '57500.00');
   assert.equal(paid.data.loan.nextPaymentDate, null);
 
   const mine = await member.get('/api/members/me');
@@ -3904,7 +3904,7 @@ test('loans: restructuring after 80% paid deducts the balance from a new loan an
   const created = done.data.loan;
   assert.deepEqual(
     [created.amount, created.totalAmount, created.totalInterest, created.balance, created.term, created.repayment, created.renewedFromLoan, created.renewalDeduction, created.netProceeds, created.restructureCount],
-    ['50000.00', '51250.00', '1250.00', '51250.00', 6, 'single', 'L-RS-001', '2460.00', '47540.00', 0]
+    ['50000.00', '57500.00', '7500.00', '57500.00', 6, 'single', 'L-RS-001', '2460.00', '47540.00', 0]
   );
   const dueDays = (Date.parse(created.dueDate) - Date.parse(today)) / 86400000;
   assert.ok(dueDays >= 181 && dueDays <= 186, String(dueDays));
@@ -3968,7 +3968,7 @@ test('loans: restructuring after 80% paid deducts the balance from a new loan an
   const single = await admin.post(singleUrl, { amount: '20000', farmArea: '1', reason: 'Late harvest' });
   assert.equal(single.status, 201, JSON.stringify(single.data));
   assert.deepEqual([single.data.restructuring.balance_carried, single.data.restructuring.net_proceeds, single.data.restructuring.overdue_installments], ['2050.00', '17950.00', 1]);
-  assert.deepEqual([single.data.previousLoan.status, single.data.loan.totalAmount, single.data.loan.farmArea], ['paid', '20500.00', '1.00']);
+  assert.deepEqual([single.data.previousLoan.status, single.data.loan.totalAmount, single.data.loan.farmArea], ['paid', '23000.00', '1.00']);
 
   // The member's loan summary lists both restructured loans, the new ones, and every payment.
   const loanHistory = (await admin.get(`/api/admin/members/${state.memberId}/loan-history`)).data;

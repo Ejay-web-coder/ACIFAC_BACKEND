@@ -9,10 +9,14 @@ import { paymentHours } from './officeHours.js';
 
 // ACIFAC agricultural loan policy:
 //   * maximum loan = farm area (ha) x PHP 50,000
-//   * interest = 2.5% of the principal, charged once for the whole term (flat)
+//   * interest = 2.5% of the principal for every month of the term (flat):
+//     2.5% x 6 months = 15% of the principal. `interestRate` (and each loan's
+//     interest_rate) is that rate for the whole term.
 //   * total repayment = principal + interest
 //   * a loan is for `loanTerm` (6) months, due in full 6 months after approval
 //     (repayment 'single'); the borrower may pay it in parts before then.
+// Loans made before November 2026 were charged 2.5% once for the whole term;
+// their stored rate (2.5) and totals stay as they were.
 //   * restructuring: once `renewalMinPaidPercent` (80%) of the total is paid,
 //     the borrower may take a new loan; what is still owed on the old one is
 //     deducted from the new loan's proceeds and closes the old loan.
@@ -21,11 +25,15 @@ import { paymentHours } from './officeHours.js';
 // centavo rounding (repayment 'monthly'); they keep their schedules.
 // Requests submitted before migration 011 stored no rate; those keep the
 // historical 8% rate they were quoted.
+const MONTHLY_INTEREST_RATE = '2.5';
+const LOAN_TERM = 6;
+
 export const LOAN_POLICY = Object.freeze({
   maxLoanPerHectare: '50000',
-  interestRate: '2.5',
+  monthlyInterestRate: MONTHLY_INTEREST_RATE,
+  interestRate: String(Number(MONTHLY_INTEREST_RATE) * LOAN_TERM),
   legacyInterestRate: '8',
-  loanTerm: 6,
+  loanTerm: LOAN_TERM,
   repayment: 'single',
   renewalMinPaidPercent: 80,
   interestMethod: 'flat',

@@ -8,7 +8,7 @@ import { addDays, addMonths, officeDayOnOrBefore } from './support.js';
 // theirs in loans.js): loans paid off (on time, early or late), loans not due
 // yet, overdue loans, second loans of members who paid off the first,
 // applications waiting for a decision and declined ones. The loans follow the
-// Loans page's policy (at most farm area x PHP 50,000, 2.5% flat interest, 6
+// Loans page's policy (at most farm area x PHP 50,000, 2.5% a month flat interest, 6
 // months, one payment of the whole amount due 6 months after approval on an
 // office day) and are paid in full at once, as the Payments page requires.
 // Everything is written a statement at a time for all loans together: per

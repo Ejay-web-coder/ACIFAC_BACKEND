@@ -4,7 +4,7 @@ import { centsToString, toCents } from '../../src/utils/money.js';
 import { addDays, addMonths, officeDayOnOrBefore, stampSql } from './support.js';
 
 // Loan applications and loans. Each goes through the application code of the
-// Loans page (eligibility = farm area x PHP 50,000, 2.5% flat interest), is
+// Loans page (eligibility = farm area x PHP 50,000, 2.5% a month flat interest), is
 // approved `approved` months ago, gets its schedule (one payment of the whole
 // amount, due 6 months after approval), and is paid as `paid` says:
 //   'on time' = paid two days before the due date, 'late' = 12 days after,
