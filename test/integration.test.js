@@ -239,6 +239,12 @@ before(async () => {
   pool = getPool();
   await pool.query(`INSERT INTO users (username, email, password_hash, role, account_status, must_change_password)
                     VALUES ('testadmin', 'admin@acifac.local', $1, 'ADMIN', 'ACTIVE', FALSE)`, [await hashPassword('AdminPass1!')]);
+  // A member may hold at most 10% of the cooperative's share capital, so an empty
+  // test cooperative would let nobody pay anything. This inactive member holds
+  // PHP 1,000,000 so the test members can (up to about PHP 111,111 each). Inactive
+  // keeps it out of the active member counts and the active share capital total.
+  await pool.query(`INSERT INTO members (member_number, first_name, last_name, email, membership_date, share_capital, status)
+                    VALUES ('TEST-CAPITAL-POOL', 'Capital', 'Pool', 'capital.pool@example.test', '2020-01-01', 1000000, 'inactive')`);
   startEventListener();
   server = createApp().listen(0);
   baseUrl = `http://127.0.0.1:${server.address().port}`;
@@ -521,8 +527,20 @@ test('savings deposits and share capital are separate ledgers', { skip }, async 
   const share = await admin.post(`/api/members/${state.memberId}/share-contributions`, { amount: '500', contributionDate: '2026-02-03', referenceNumber: 'SC-1' });
   assert.equal(share.status, 201, JSON.stringify(share.data));
   assert.equal(share.data.data.total, 1500);
-  const overCap = await admin.post(`/api/members/${state.memberId}/share-contributions`, { amount: '18600', contributionDate: '2026-02-03' });
+  // No member may hold more than 10% of all members' share capital (them included):
+  // at most a ninth of everyone else's. Here everyone else is mostly the PHP 1,000,000 pool.
+  const { rows: [others] } = await pool.query(`SELECT SUM(share_capital) AS total FROM members WHERE status <> 'archived' AND id <> $1`, [state.memberId]);
+  const capCents = Math.floor(Math.round(Number(others.total) * 100) / 9);
+  const shareView = (await admin.get(`/api/members/${state.memberId}`)).data.data.shareDetails;
+  assert.equal(Math.round(shareView.maximum * 100), capCents, 'the maximum is a ninth of the others');
+  assert.equal(Math.round(shareView.remaining * 100), capCents - 150000);
+  const overCap = await admin.post(`/api/members/${state.memberId}/share-contributions`, { amount: ((capCents - 150000 + 1) / 100).toFixed(2), contributionDate: '2026-02-03' });
   assert.equal(overCap.status, 400);
+  assert.match(overCap.data.message, /10% of the cooperative's total share capital/);
+  // A new member starts with at most a ninth of everyone's share capital.
+  const tooRich = await admin.request('POST', '/api/members', { form: await memberForm({ first_name: 'Rico', last_name: 'Yaman', email: 'rico@example.com', date_of_birth: '1970-07-07', share_capital: '5000000' }) });
+  assert.equal(tooRich.status, 400);
+  assert.match(tooRich.data.message, /A new member can start with at most/);
 
   const mine = await member.get('/api/members/me');
   assert.equal(mine.data.data.savings.total, 32500.5);
@@ -2877,13 +2895,14 @@ test('dashboard and analytics use real data', { skip }, async () => {
   assert.equal(analytics.data.shareCapitalLevels, undefined);
   assert.equal(analytics.data.summary.registeredMembers, undefined);
 
-  // Members (terminated ones left out) by share capital, in bands up to the PHP 20,000 maximum.
+  // Members (terminated ones left out) by share capital, in bands (the top one PHP 20,000 and up).
   const levels = dashboard.data.shareCapitalLevels;
   assert.deepEqual(levels.map((level) => [level.key, level.min, level.max]), [['below1k', 0, 1000], ['from1kTo5k', 1000, 5000], ['from5kTo15k', 5000, 15000], ['from15kTo20k', 15000, 20000], ['maximum', 20000, null]]);
   const memberShares = (await pool.query(`SELECT COALESCE(SUM(sc.amount), 0) AS total FROM members m LEFT JOIN share_contributions sc ON sc.member_id = m.id WHERE m.status <> 'archived' GROUP BY m.id`)).rows.map((row) => Number(row.total));
   const bandOf = (total) => levels.findIndex((level) => total >= level.min && (level.max === null || total < level.max));
   assert.deepEqual(levels.map((level) => level.members), levels.map((_, index) => memberShares.filter((total) => bandOf(total) === index).length));
-  assert.equal(levels.reduce((sum, level) => sum + level.members, 0), dashboard.data.stats.totalMembers);
+  // Every member not terminated, inactive ones too (such as the test's capital pool).
+  assert.equal(levels.reduce((sum, level) => sum + level.members, 0), memberShares.length);
   assert.ok(levels[1].members >= 1, 'Juan is in PHP 1,000 to 4,999');
 
   // Members (terminated ones left out) with and without a login account.

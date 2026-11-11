@@ -143,8 +143,8 @@ export function savingsWithdrawalEmail({ memberName, amount, date, reference, to
 export function shareContributionEmail({ memberName, amount, date, total, maximum }) {
   return message(
     'ACIFAC share capital contribution recorded',
-    `Hello ${memberName},\n\nA share capital contribution of ${formatAmount(amount)} was recorded on ${date}.\nYour total share capital is now ${formatAmount(total)} of the ${formatAmount(maximum)} maximum.`,
-    `<p>Hello ${escapeHtml(memberName)},</p><p>A share capital contribution of <strong>${formatAmount(amount)}</strong> was recorded on ${escapeHtml(date)}.</p><p>Your total share capital is now <strong>${formatAmount(total)}</strong> of the ${formatAmount(maximum)} maximum.</p>`
+    `Hello ${memberName},\n\nA share capital contribution of ${formatAmount(amount)} was recorded on ${date}.\nYour total share capital is now ${formatAmount(total)}. The most you can hold right now is ${formatAmount(maximum)} (10% of the cooperative's total share capital).`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>A share capital contribution of <strong>${formatAmount(amount)}</strong> was recorded on ${escapeHtml(date)}.</p><p>Your total share capital is now <strong>${formatAmount(total)}</strong>. The most you can hold right now is ${formatAmount(maximum)} (10% of the cooperative's total share capital).</p>`
   );
 }
 

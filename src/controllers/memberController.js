@@ -20,7 +20,6 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_PATTERN = /^[+0-9()\s.-]{7,30}$/;
 // Share capital is recorded as share contributions and capped per member.
 // Savings deposits and withdrawals are a separate ledger (savings_transactions).
-export const SHARE_CAPITAL_LIMIT = '20000';
 export const CONTRIBUTION_METHODS = ['Cash', 'Deposit', 'GCash', 'Bank Transfer', 'Check', 'Initial', 'Legacy', 'Other'];
 
 const memberSelect = `
@@ -141,17 +140,40 @@ function mapMember(row) {
   };
 }
 
+// No member may own more than 10% of the cooperative's share capital (RA 9520).
+// It is checked after the payment, the member included: own <= 10% of (others + own),
+// so a member may hold at most one ninth of every other member's share capital.
+// Terminated members are left out. The office chose no exception for a young
+// cooperative: with little capital elsewhere, a member may add little or nothing.
+export const SHARE_CAPITAL_PERCENT_CAP = 10;
+
+/** The most share capital a member may hold, in cents (memberId null: a member not yet registered). */
+export async function shareCapitalMaxCents(db, memberId = null) {
+  const runner = db?.query ? db.query.bind(db) : query;
+  const { rows } = await runner(
+    `SELECT COALESCE(SUM(share_capital), 0) AS total FROM members WHERE status <> 'archived' AND ($1::bigint IS NULL OR id <> $1)`,
+    [memberId]
+  );
+  const othersCents = toCents(rows[0].total);
+  return Math.floor((othersCents * SHARE_CAPITAL_PERCENT_CAP) / (100 - SHARE_CAPITAL_PERCENT_CAP));
+}
+
+// Holds share-capital checks in one line, so two payments at once can't both pass on the same totals.
+const lockShareCapital = (client) => client.query(`SELECT pg_advisory_xact_lock(hashtext('share-capital-cap'))`);
+const pesosFromCents = (cents) => `PHP ${Number(centsToString(Math.max(0, cents))).toLocaleString('en-PH', { minimumFractionDigits: 2 })}`;
+
 async function getShareDetails(db, memberId) {
   const runner = db?.query ? db.query.bind(db) : query;
   const result = await runner(`${shareContributionSelect} WHERE sc.member_id = $1 ORDER BY sc.contribution_date DESC, sc.id DESC`, [memberId]);
   const contributions = result.rows.map((row) => ({ ...row, amount: Number(row.amount) }));
   const totalCents = result.rows.reduce((sum, row) => sum + toCents(row.amount), 0);
-  const limitCents = toCents(SHARE_CAPITAL_LIMIT);
+  const limitCents = await shareCapitalMaxCents(db, memberId);
   return {
     contributions,
     total: Number(centsToString(totalCents)),
-    maximum: Number(SHARE_CAPITAL_LIMIT),
+    maximum: Number(centsToString(limitCents)),
     remaining: Number(centsToString(Math.max(0, limitCents - totalCents))),
+    maximumPercent: SHARE_CAPITAL_PERCENT_CAP,
   };
 }
 
@@ -306,9 +328,11 @@ async function recordContribution(req, memberId, body) {
     }
     const totalResult = await client.query('SELECT COALESCE(SUM(amount), 0) AS total FROM share_contributions WHERE member_id = $1', [memberId]);
     const currentCents = toCents(totalResult.rows[0].total);
-    const remainingCents = toCents(SHARE_CAPITAL_LIMIT) - currentCents;
+    await lockShareCapital(client);
+    const maxCents = await shareCapitalMaxCents(client, memberId);
+    const remainingCents = maxCents - currentCents;
     if (amountCents > remainingCents) {
-      throw badRequest(`Share contribution exceeds the PHP 20,000 maximum. Maximum remaining contribution: PHP ${Number(centsToString(Math.max(0, remainingCents))).toLocaleString('en-PH', { minimumFractionDigits: 2 })}.`);
+      throw badRequest(`A member's share capital can't be more than ${SHARE_CAPITAL_PERCENT_CAP}% of the cooperative's total share capital. This member can hold at most ${pesosFromCents(maxCents)}, so the most that can be added now is ${pesosFromCents(remainingCents)}.`);
     }
     const insert = await client.query(
       `INSERT INTO share_contributions (member_id, amount, contribution_date, payment_method, reference_number, notes, recorded_by)
@@ -655,7 +679,7 @@ async function findDuplicateMember(client, values, dateOfBirth, rsbsaNo, exclude
 export function parseShareCapital(body, errors) {
   const shareCapitalCents = body.share_capital === undefined || body.share_capital === null || body.share_capital === '' ? 0 : parseMoneyInput(body.share_capital, { allowZero: true });
   if (shareCapitalCents === null) errors.push('Share capital must be a non-negative amount with up to two decimals.');
-  else if (shareCapitalCents > toCents(SHARE_CAPITAL_LIMIT)) errors.push('Share capital cannot exceed the PHP 20,000 maximum limit.');
+  // The 10% limit needs the cooperative's totals, so insertMemberRecord checks it.
   return shareCapitalCents;
 }
 
@@ -676,6 +700,14 @@ export async function nextMemberNumber(db) {
 export async function insertMemberRecord(client, req, { body, values, shareCapitalCents, idDocument = null, idDocumentRef = null, photoRef = null, signatureRefs = [], source = 'registration' }) {
   const duplicate = await findDuplicateMember(client, values, cleanString(body.date_of_birth, 10), cleanString(body.rsbsa_no, 100));
   if (duplicate) throw conflict(`This member appears to be already registered (${duplicate.member_number}). Check the email, RSBSA number, or name and birth date.`);
+  // The initial share capital counts toward the 10% limit like any contribution.
+  if (shareCapitalCents > 0) {
+    await lockShareCapital(client);
+    const maxCents = await shareCapitalMaxCents(client, null);
+    if (shareCapitalCents > maxCents) {
+      throw badRequest(`A member's share capital can't be more than ${SHARE_CAPITAL_PERCENT_CAP}% of the cooperative's total share capital. A new member can start with at most ${pesosFromCents(maxCents)}.`);
+    }
+  }
 
   await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['acifac-member-number']);
   const memberNumber = await nextMemberNumber(client);

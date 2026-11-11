@@ -15,19 +15,19 @@ import { machineryAnalytics, machineryRecommendations } from '../services/machin
 import { adviseOnCredit, creditFacts } from '../services/creditAdvice.js';
 import { kadiwaProductAnalytics } from '../services/kadiwaProducts.js';
 
-// A member's share capital is at most PHP 20,000 (SHARE_CAPITAL_LIMIT in
-// memberController.js, not imported: the controllers import each other).
-const SHARE_CAPITAL_LIMIT = 20000;
+// The top share capital band starts at PHP 20,000. (The per-member limit is now
+// 10% of the cooperative's total share capital, see memberController.js.)
+const SHARE_CAPITAL_TOP_BAND = 20000;
 
 // The share capital bands of the admin dashboard, lowest first: min is included, max is
-// not (null for the PHP 20,000 maximum itself). The counts and the member
+// not (null for the top band, PHP 20,000 and up). The counts and the member
 // list of a band both use them.
 const SHARE_CAPITAL_BANDS = [
   { key: 'below1k', min: 0, max: 1000 },
   { key: 'from1kTo5k', min: 1000, max: 5000 },
   { key: 'from5kTo15k', min: 5000, max: 15000 },
-  { key: 'from15kTo20k', min: 15000, max: SHARE_CAPITAL_LIMIT },
-  { key: 'maximum', min: SHARE_CAPITAL_LIMIT, max: null },
+  { key: 'from15kTo20k', min: 15000, max: SHARE_CAPITAL_TOP_BAND },
+  { key: 'maximum', min: SHARE_CAPITAL_TOP_BAND, max: null },
 ];
 const inBand = (band) => `total >= ${band.min}${band.max === null ? '' : ` AND total < ${band.max}`}`;
 // Each member's whole share capital, as on their member record; terminated
@@ -498,7 +498,7 @@ export async function getDashboard(req, res) {
         (SELECT COUNT(*)::int FROM machinery_operations WHERE status = 'scheduled') AS "scheduledOperations",
         (SELECT COUNT(*)::int FROM kadiwa_inventory WHERE stock <= reorder_level AND deleted_at IS NULL) AS "lowStockItems"
     `),
-    // Members by their share capital now, in bands up to the PHP 20,000 maximum.
+    // Members by their share capital now, in bands (the top one PHP 20,000 and up).
     query(`
       WITH totals AS (${MEMBER_SHARE_TOTALS})
       SELECT ${SHARE_CAPITAL_BANDS.map((band) => `COUNT(*) FILTER (WHERE ${inBand(band)})::int AS "${band.key}"`).join(',\n             ')}
