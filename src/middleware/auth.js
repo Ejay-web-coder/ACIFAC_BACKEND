@@ -66,25 +66,35 @@ export async function endIdleSession(session, meta = {}) {
   });
 }
 
+// For GET /api/auth/me, which the page calls on every load to ask whether anyone
+// is signed in: being signed out is a normal answer there (200 with user null and
+// the reason), not a 401 that the browser console shows as an error. Every other
+// route still answers 401, which signs the page out.
+export function allowSignedOut(req, _res, next) {
+  req.allowSignedOut = true;
+  next();
+}
+
+function refuseSession(req, res, code, message) {
+  res.clearCookie('session_token', buildAuthCookieOptions({ includeMaxAge: false }));
+  if (req.allowSignedOut) return res.status(200).json({ success: true, user: null, code, message });
+  return res.status(401).json({ success: false, code, message });
+}
+
 export async function requireAuth(req, res, next) {
   try {
     const session = await loadSession(req.cookies?.session_token);
 
-    if (!session) {
-      res.clearCookie('session_token', buildAuthCookieOptions({ includeMaxAge: false }));
-      return res.status(401).json({ success: false, code: 'SESSION_INVALID', message: SESSION_EXPIRED_MESSAGE });
-    }
+    if (!session) return refuseSession(req, res, 'SESSION_INVALID', SESSION_EXPIRED_MESSAGE);
 
     if (session.idle_expired) {
       await endIdleSession(session, getRequestMeta(req));
-      res.clearCookie('session_token', buildAuthCookieOptions({ includeMaxAge: false }));
-      return res.status(401).json({ success: false, code: 'SESSION_IDLE_TIMEOUT', message: SESSION_IDLE_MESSAGE });
+      return refuseSession(req, res, 'SESSION_IDLE_TIMEOUT', SESSION_IDLE_MESSAGE);
     }
 
     if (session.account_status !== 'ACTIVE') {
       await query('UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL', [session.user_id]);
-      res.clearCookie('session_token', buildAuthCookieOptions({ includeMaxAge: false }));
-      return res.status(401).json({ success: false, code: 'ACCOUNT_INACTIVE', message: 'Your account is inactive or locked. Please contact the ACIFAC office.' });
+      return refuseSession(req, res, 'ACCOUNT_INACTIVE', 'Your account is inactive or locked. Please contact the ACIFAC office.');
     }
 
     const path = req.originalUrl.split('?')[0];

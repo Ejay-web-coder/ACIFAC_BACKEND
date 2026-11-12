@@ -418,7 +418,7 @@ test('accounts: create member login, setup link, forced password change', { skip
   const reset = await new Client().post('/api/auth/reset-password', { token, newPassword: 'MemberPass1!', confirmPassword: 'MemberPass1!' });
   assert.equal(reset.status, 200, JSON.stringify(reset.data));
   const oldSession = await member.get('/api/auth/me');
-  assert.equal(oldSession.status, 401, 'reset revokes existing sessions');
+  assert.equal(oldSession.data.user, null, 'reset revokes existing sessions');
   const reused = await new Client().post('/api/auth/reset-password', { token, newPassword: 'MemberPass2!', confirmPassword: 'MemberPass2!' });
   assert.equal(reused.status, 400, 'token is single-use');
   const relogin = await member.post('/api/auth/login', { usernameOrEmail: 'juan@example.com', password: 'MemberPass1!' });
@@ -3233,7 +3233,7 @@ test('profile pictures: own only, admins see members, members never see admins',
   const adminPicture = Buffer.concat([PNG, Buffer.from('admin')]);
   const memberPicture = Buffer.concat([PNG, Buffer.from('member')]);
 
-  assert.equal((await admin.request('GET', '/api/auth/profile-photo', { raw: true })).status, 404);
+  assert.equal((await admin.request('GET', '/api/auth/profile-photo', { raw: true })).status, 204, 'no picture yet is No Content, not an error');
   const notImage = await admin.request('POST', '/api/auth/profile-photo', { form: (() => { const f = new FormData(); f.append('photo', new Blob([Buffer.from('not an image')], { type: 'image/png' }), 'x.png'); return f; })() });
   assert.equal(notImage.status, 400);
   assert.equal((await admin.request('POST', '/api/auth/profile-photo', { form: photoForm(adminPicture) })).status, 200);
@@ -3256,7 +3256,7 @@ test('profile pictures: own only, admins see members, members never see admins',
   assert.equal((await member.request('DELETE', '/api/auth/profile-photo')).status, 200);
   // A 2x2 registration photo on the member record is not used as the member's picture.
   await pool.query(`UPDATE members SET profile_photo = 'local://member-photos/test/registration.png' WHERE id = $1`, [state.memberId]);
-  assert.equal((await member.request('GET', '/api/auth/profile-photo', { raw: true })).status, 404);
+  assert.equal((await member.request('GET', '/api/auth/profile-photo', { raw: true })).status, 204);
   await pool.query('UPDATE members SET profile_photo = NULL WHERE id = $1', [state.memberId]);
   assert.equal((await admin.request('DELETE', '/api/auth/profile-photo')).status, 200);
 });
@@ -3276,7 +3276,7 @@ test('sessions: forgot password, change password, deactivation, logout', { skip 
 
   const change = await member.post('/api/auth/change-password', { currentPassword: 'ResetPass1!', newPassword: 'ChangedPass1!', confirmPassword: 'ChangedPass1!' });
   assert.equal(change.status, 200);
-  assert.equal((await member.get('/api/auth/me')).status, 401, 'change password ends the session');
+  assert.equal((await member.get('/api/auth/me')).data.user, null, 'change password ends the session');
   await member.post('/api/auth/login', { usernameOrEmail: 'juan@example.com', password: 'ChangedPass1!' });
   assert.equal((await member.get('/api/members/me')).status, 200);
 
@@ -3291,7 +3291,7 @@ test('sessions: forgot password, change password, deactivation, logout', { skip 
   assert.equal(statusAudit.at(-1).new_values.account_status, 'LOCKED');
 
   assert.equal((await member.post('/api/auth/logout')).status, 200);
-  assert.equal((await member.get('/api/auth/me')).status, 401);
+  assert.equal((await member.get('/api/auth/me')).data.user, null);
   const leaked = await pool.query(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE details::text ILIKE '%password_hash%' OR old_values::text ILIKE '%password_hash%' OR new_values::text ILIKE '%$2b$%'`);
   assert.equal(leaked.rows[0].n, 0, 'no password hashes in audit logs');
 });
@@ -3468,7 +3468,7 @@ test('password reset: emailed 6-digit code, limits, single use, sessions ended',
   assert.equal((await replay.json()).code, 'RESET_SESSION_EXPIRED');
 
   // Old sessions are ended; the new password works, the old one does not.
-  assert.equal((await signedIn.get('/api/auth/me')).status, 401);
+  assert.equal((await signedIn.get('/api/auth/me')).data.user, null);
   assert.equal((await new Client('10.0.4.5').post('/api/auth/login', { usernameOrEmail: 'resetme', password: 'OldPass1!' })).status, 401);
   assert.equal((await new Client('10.0.4.6').post('/api/auth/login', { usernameOrEmail: 'resetme', password: 'NewPass1!' })).status, 200);
 
@@ -3540,11 +3540,36 @@ test('sessions: 20 minutes without activity ends the session on the server', { s
 
   // A refresh (or a copy of the old cookie) cannot bring it back.
   const stale = new Client('10.0.6.1');
-  for (const url of ['/api/auth/me', '/api/auth/session', '/api/notifications']) {
+  for (const url of ['/api/auth/session', '/api/notifications']) {
     stale.cookies.set('session_token', token);
     assert.equal((await stale.get(url)).status, 401, url);
   }
+  stale.cookies.set('session_token', token);
+  const staleMe = await stale.get('/api/auth/me');
+  assert.equal(staleMe.status, 200, 'signed out is not an error on /me');
+  assert.equal(staleMe.data.user, null);
+  assert.equal(stale.cookies.has('session_token'), false, 'cookie cleared');
   assert.equal((await pool.query(expiries)).rows[0].n, 1, 'recorded once');
+
+  // The page's sign-in check on load: an idle session gets 200, no user and the
+  // reason (so the login page can say why), and the session still ends.
+  const reopened = new Client('10.0.6.2');
+  assert.equal((await reopened.post('/api/auth/login', { usernameOrEmail: 'idleuser', password: 'IdlePass1!' })).status, 200);
+  const reopenedDigest = createHash('sha256').update(reopened.cookies.get('session_token')).digest('hex');
+  await pool.query(`UPDATE sessions SET last_activity_at = NOW() - INTERVAL '21 minutes' WHERE token_digest = $1`, [reopenedDigest]);
+  const idleMe = await reopened.get('/api/auth/me');
+  assert.equal(idleMe.status, 200);
+  assert.equal(idleMe.data.user, null);
+  assert.equal(idleMe.data.code, 'SESSION_IDLE_TIMEOUT');
+  assert.equal(idleMe.data.message, 'Your session expired because of inactivity. Please log in again.');
+  assert.equal(reopened.cookies.has('session_token'), false, 'cookie cleared');
+  assert.ok((await pool.query('SELECT revoked_at FROM sessions WHERE token_digest = $1', [reopenedDigest])).rows[0].revoked_at);
+
+  // A visit with no session at all is not an error either.
+  const visitor = await new Client('10.0.6.3').get('/api/auth/me');
+  assert.equal(visitor.status, 200);
+  assert.equal(visitor.data.user, null);
+  assert.equal(visitor.data.code, 'SESSION_INVALID');
 });
 
 test('password reset: members without a login email use the email on their member record', { skip }, async () => {
@@ -3641,7 +3666,7 @@ test('change password in settings: a code by text or email instead of the curren
   assert.equal(same.status, 400, 'the new password must differ');
   const changed = await lito.post('/api/auth/change-password', { code, newPassword: 'LitoNew1!', confirmPassword: 'LitoNew1!' });
   assert.equal(changed.status, 200, JSON.stringify(changed.data));
-  assert.equal((await lito.get('/api/auth/me')).status, 401, 'every session ends');
+  assert.equal((await lito.get('/api/auth/me')).data.user, null, 'every session ends');
   assert.equal((await lito.post('/api/auth/login', { usernameOrEmail: 'lito', password: 'LitoNew1!' })).status, 200);
 
   // By email, to the member record's address. A used code does not work twice.

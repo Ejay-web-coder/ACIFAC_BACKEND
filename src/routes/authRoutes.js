@@ -5,7 +5,7 @@ import {
   verifyResetCode,
 } from '../controllers/authController.js';
 import { deleteProfilePhoto, getProfilePhoto, uploadProfilePhoto } from '../controllers/profilePhotoController.js';
-import { requireAuth } from '../middleware/auth.js';
+import { allowSignedOut, requireAuth } from '../middleware/auth.js';
 import { profilePhotoUpload } from '../middleware/upload.js';
 
 const router = express.Router();
@@ -49,7 +49,8 @@ const verifyCodeLimiter = rateLimit({
 
 router.post('/login', loginLimiter, login);
 router.post('/logout', logout);
-router.get('/me', requireAuth, me);
+// Signed out is 200 with user null here (see allowSignedOut).
+router.get('/me', allowSignedOut, requireAuth, me);
 router.get('/session', requireAuth, sessionStatus);
 router.post('/forgot-password', forgotLimiter, forgotPassword);
 router.post('/verify-reset-code', verifyCodeLimiter, verifyResetCode);

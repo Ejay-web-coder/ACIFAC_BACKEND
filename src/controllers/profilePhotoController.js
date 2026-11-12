@@ -1,6 +1,6 @@
 import { query, withTransaction } from '../config/db.js';
 import { createAuditLog } from '../utils/audit.js';
-import { currentUserId, getRequestMeta, notFound } from '../utils/http.js';
+import { currentUserId, getRequestMeta } from '../utils/http.js';
 import { assertValidUpload, BUCKETS, removeFile, sendStoredFile, uploadFile } from '../services/storage.js';
 import { IMAGE_TYPES } from '../middleware/upload.js';
 
@@ -16,12 +16,13 @@ export const photoMimeType = (reference) => MIME_BY_EXTENSION[String(reference |
 // GET /api/auth/profile-photo — own uploaded picture only. A member's 2x2
 // registration photo is not used here (the top bar shows their initial until
 // they upload one); administrators still see it on the member record.
+// No picture is 204 No Content, not 404: the top bar asks on every sign-in, and
+// a 404 shows as an error in the browser console although nothing is wrong.
 export async function getProfilePhoto(req, res) {
   const row = (await query('SELECT profile_photo FROM users WHERE id = $1', [currentUserId(req)])).rows[0];
   const reference = row?.profile_photo;
-  if (!reference) throw notFound('No profile picture.');
-  const sent = await sendStoredFile(res, { reference, mimeType: photoMimeType(reference), fileName: 'profile-picture' });
-  if (!sent) throw notFound('No profile picture.');
+  const sent = reference && (await sendStoredFile(res, { reference, mimeType: photoMimeType(reference), fileName: 'profile-picture' }));
+  if (!sent) res.setHeader('Cache-Control', 'private, no-store').status(204).end();
   return undefined;
 }
 
