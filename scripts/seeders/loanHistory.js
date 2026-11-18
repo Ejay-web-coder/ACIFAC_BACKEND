@@ -1,7 +1,7 @@
 import { SQL_TODAY, TIME_ZONE } from '../../src/config/env.js';
 import { LOAN_POLICY } from '../../src/services/loanService.js';
 import { paymentHours } from '../../src/services/officeHours.js';
-import { centsToString } from '../../src/utils/money.js';
+import { centsToString, toCents } from '../../src/utils/money.js';
 import { addDays, addMonths, officeDayOnOrBefore } from './support.js';
 
 // A year and more of loans for the generated members (the named ones get
@@ -148,12 +148,14 @@ export default async function seedLoanHistory(ctx) {
   );
 
   // Payments: the whole amount at once, on time (two days before the due date),
-  // early (half-way through the term) or late (twelve days after); active and
-  // overdue loans are not paid yet.
+  // early (half-way through the term) or late (twelve days after, with the
+  // late penalty for the days past the grace period); active and overdue loans
+  // are not paid yet.
   const installments = (await client.query(
     `SELECT id, loan_id, installment_number, due_date::text AS due_date, amount_due, principal_due, interest_due
      FROM loan_installments WHERE loan_id = ANY($1::int[]) ORDER BY loan_id, installment_number`, [loanIds]
   )).rows;
+  const daysBetween = (from, to) => Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000);
   const payments = [];
   for (const plan of loans) {
     if (plan.kind !== 'paid') continue;
@@ -162,15 +164,19 @@ export default async function seedLoanHistory(ctx) {
     let paidOn = officeDayOnOrBefore(plan.paying === 'late' ? addDays(due, 12) : plan.paying === 'early' ? addMonths(plan.approvedOn, Math.floor(TERM / 2)) : addDays(due, -2));
     if (paidOn < plan.approvedOn) paidOn = plan.approvedOn;
     if (paidOn > today) continue;
-    payments.push({ loanId: plan.loanId, installmentId: row.id, amount: row.amount_due, principal: row.principal_due, interest: row.interest_due, date: paidOn, remaining: '0.00' });
+    const penaltyCents = Math.max(0, daysBetween(due, paidOn) - LOAN_POLICY.gracePeriodDays) * toCents(LOAN_POLICY.penaltyPerDay);
+    payments.push({
+      loanId: plan.loanId, installmentId: row.id, amount: centsToString(toCents(row.amount_due) + penaltyCents), principal: row.principal_due, interest: row.interest_due,
+      penalty: centsToString(penaltyCents), date: paidOn, remaining: '0.00',
+    });
   }
   if (payments.length) {
     const pc = (pick) => payments.map(pick);
     await client.query(
-      `INSERT INTO loan_payments (loan_id, amount, payment_date, principal_paid, interest_paid, remaining_balance, recorded_by, created_at)
-       SELECT r.loan_id, r.amount, r.day, r.principal, r.interest, r.remaining, $7, ${stamp('r.day', '10:30')}
-       FROM unnest($1::int[], $2::numeric[], $3::date[], $4::numeric[], $5::numeric[], $6::numeric[]) AS r(loan_id, amount, day, principal, interest, remaining)`,
-      [pc((p) => p.loanId), pc((p) => p.amount), pc((p) => p.date), pc((p) => p.principal), pc((p) => p.interest), pc((p) => p.remaining), admin.id]
+      `INSERT INTO loan_payments (loan_id, amount, payment_date, principal_paid, interest_paid, remaining_balance, recorded_by, created_at, penalty_paid)
+       SELECT r.loan_id, r.amount, r.day, r.principal, r.interest, r.remaining, $7, ${stamp('r.day', '10:30')}, r.penalty
+       FROM unnest($1::int[], $2::numeric[], $3::date[], $4::numeric[], $5::numeric[], $6::numeric[], $8::numeric[]) AS r(loan_id, amount, day, principal, interest, remaining, penalty)`,
+      [pc((p) => p.loanId), pc((p) => p.amount), pc((p) => p.date), pc((p) => p.principal), pc((p) => p.interest), pc((p) => p.remaining), admin.id, pc((p) => p.penalty)]
     );
     await client.query(
       `UPDATE loan_installments i SET amount_paid = i.amount_due, interest_paid = i.interest_due, principal_paid = i.principal_due,
@@ -186,7 +192,7 @@ export default async function seedLoanHistory(ctx) {
     `WITH totals AS (
        SELECT l.id,
               COALESCE(l.total_repayment, ROUND(l.amount + ROUND(l.amount * l.interest_rate / 100, 2), 2)) AS total,
-              COALESCE((SELECT SUM(p.amount) FROM loan_payments p WHERE p.loan_id = l.id), 0) AS paid,
+              COALESCE((SELECT SUM(p.amount - p.penalty_paid) FROM loan_payments p WHERE p.loan_id = l.id), 0) AS paid,
               (SELECT MIN(i.due_date) FROM loan_installments i WHERE i.loan_id = l.id AND i.amount_paid < i.amount_due AND i.superseded_by IS NULL) AS next_due,
               EXISTS (SELECT 1 FROM loan_installments i WHERE i.loan_id = l.id AND i.amount_paid < i.amount_due AND i.superseded_by IS NULL AND i.due_date < ${SQL_TODAY}) AS overdue
        FROM loans l WHERE l.id = ANY($1::int[])

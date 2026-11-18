@@ -128,6 +128,7 @@ export async function getAnalytics(req, res) {
         (SELECT COALESCE(SUM(lp.amount), 0) FROM loan_payments lp WHERE lp.payment_date BETWEEN $1::date AND $2::date) AS "loanPayments",
         (SELECT COALESCE(SUM(lp.amount), 0) FROM loan_payments lp) AS "totalLoanPayments",
         (SELECT COALESCE(SUM(lp.interest_paid), 0) FROM loan_payments lp WHERE lp.payment_date BETWEEN $1::date AND $2::date) AS "interestCollected",
+        (SELECT COALESCE(SUM(lp.penalty_paid), 0) FROM loan_payments lp WHERE lp.payment_date BETWEEN $1::date AND $2::date) AS "penaltiesCollected",
         (SELECT COALESCE(SUM(mo.rental_fee), 0) FROM machinery_operations mo WHERE mo.start_date BETWEEN $1::date AND $2::date) AS "machineryRevenue",
         (SELECT COALESCE(SUM(ks.net_sales), 0) FROM kadiwa_sales ks WHERE ks.sale_date BETWEEN $1::date AND $2::date AND ks.status = 'completed') AS "kadiwaNetSales",
         (SELECT COALESCE(SUM(l.balance), 0) FROM loans l WHERE l.status IN ('active', 'overdue')) AS "outstandingBalance",
@@ -172,6 +173,8 @@ export async function getAnalytics(req, res) {
       SELECT category, amount FROM (
         SELECT 'Loan Interest' AS category, COALESCE(SUM(lp.interest_paid), 0) AS amount FROM loan_payments lp WHERE lp.payment_date BETWEEN $1::date AND $2::date
         UNION ALL
+        SELECT 'Loan Penalties', COALESCE(SUM(lp.penalty_paid), 0) FROM loan_payments lp WHERE lp.payment_date BETWEEN $1::date AND $2::date
+        UNION ALL
         SELECT 'Machinery Rental', COALESCE(SUM(mo.rental_fee), 0) FROM machinery_operations mo WHERE mo.start_date BETWEEN $1::date AND $2::date
         UNION ALL
         SELECT 'Kadiwa Net Sales', COALESCE(SUM(ks.net_sales), 0) FROM kadiwa_sales ks WHERE ks.sale_date BETWEEN $1::date AND $2::date AND ks.status = 'completed'
@@ -214,7 +217,7 @@ export async function getAnalytics(req, res) {
                COUNT(*) FILTER (WHERE l.status = 'overdue')::int AS "overdueLoans"
         FROM loans l WHERE l.member_id IS NOT NULL GROUP BY l.member_id
       ), payment_totals AS (
-        SELECT l.member_id, COUNT(p.id)::int AS "paymentCount", COALESCE(SUM(p.amount), 0) AS "totalPaid"
+        SELECT l.member_id, COUNT(p.id)::int AS "paymentCount", COALESCE(SUM(p.amount - p.penalty_paid), 0) AS "totalPaid"
         FROM loan_payments p JOIN loans l ON l.id = p.loan_id WHERE l.member_id IS NOT NULL GROUP BY l.member_id
       ), loan_installment_totals AS (
         -- Per loan. An installment a restructuring replaced counts only if it was
@@ -245,7 +248,7 @@ export async function getAnalytics(req, res) {
                  'onTimePayments', COALESCE(t.on_time, 0), 'latePayments', COALESCE(t.late, 0), 'restructureCount', COALESCE(rc.count, 0)
                ) ORDER BY l.date_approved DESC) AS loans
         FROM loans l
-        LEFT JOIN (SELECT loan_id, COUNT(*) AS count, SUM(amount) AS total FROM loan_payments GROUP BY loan_id) pc ON pc.loan_id = l.id
+        LEFT JOIN (SELECT loan_id, COUNT(*) AS count, SUM(amount - penalty_paid) AS total FROM loan_payments GROUP BY loan_id) pc ON pc.loan_id = l.id
         LEFT JOIN loan_installment_totals t ON t.loan_id = l.id
         LEFT JOIN restructure_counts rc ON rc.loan_id = l.id
         WHERE l.member_id IS NOT NULL GROUP BY l.member_id
@@ -299,7 +302,7 @@ export async function getAnalytics(req, res) {
       ...summaryNumbers,
       netIncome: centsToNumber(income.total),
       machineryNetIncome: centsToNumber(income.parts.machinery),
-      totalOperatingRevenue: toNumber(totals.interestCollected) + toNumber(totals.machineryRevenue) + toNumber(totals.kadiwaNetSales),
+      totalOperatingRevenue: toNumber(totals.interestCollected) + toNumber(totals.penaltiesCollected) + toNumber(totals.machineryRevenue) + toNumber(totals.kadiwaNetSales),
       paymentToOutstandingRate: loanPayments + outstandingBalance > 0 ? Number(((loanPayments / (loanPayments + outstandingBalance)) * 100).toFixed(1)) : 0,
     },
     // changePercent stays null when the month before had no loans (no percentage of zero).
@@ -364,7 +367,8 @@ export async function getRevenueTrend(req, res) {
          FROM machinery_expenses e, bounds b WHERE e.expense_date BETWEEN b.first_day AND b.last_day
        ) parts GROUP BY 1
      ), interest AS (
-       SELECT DATE_TRUNC($1, lp.payment_date)::date AS start, SUM(lp.interest_paid) AS amount
+       -- Loan income: interest and late penalties, as net income counts it.
+       SELECT DATE_TRUNC($1, lp.payment_date)::date AS start, SUM(lp.interest_paid + lp.penalty_paid) AS amount
        FROM loan_payments lp, bounds b WHERE lp.payment_date BETWEEN b.first_day AND b.last_day GROUP BY 1
      )
      SELECT TO_CHAR(bk.start, 'YYYY-MM-DD') AS start, TO_CHAR(bk.start, $4) AS label,

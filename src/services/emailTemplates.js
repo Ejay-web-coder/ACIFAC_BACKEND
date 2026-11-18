@@ -89,10 +89,12 @@ function interestText(interestRate, term) {
   return `${rate}% of principal (flat)`;
 }
 
-export function loanDecisionEmail({ requestId, amount, interestRate, term, status, reason, totalRepayment, monthlyPayment, repayment = 'monthly', dueDate = null }) {
+export function loanDecisionEmail({ requestId, amount, interestRate, term, status, reason, totalRepayment, monthlyPayment, repayment = 'monthly', dueDate = null, penaltyPerDay = 0, graceDays = 0 }) {
   const decision = status === 'approved' ? 'approved' : 'declined';
+  // The late penalty: after a grace period past the due date, so much a day until paid in full.
+  const late = Number(penaltyPerDay) > 0 ? `\nLate payment: after a ${graceDays}-day grace period, a penalty of ${formatAmount(penaltyPerDay)} a day until paid in full` : '';
   const payment = repayment === 'single'
-    ? `Payment: the whole ${formatAmount(totalRepayment)}, due${dueDate ? ` by ${formatDateOnly(dueDate)}` : ''}`
+    ? `Payment: the whole ${formatAmount(totalRepayment)}, due${dueDate ? ` by ${formatDateOnly(dueDate)}` : ''}${late}`
     : `Monthly installment: ${formatAmount(monthlyPayment)}`;
   const details = status === 'approved'
     ? `Amount: ${formatAmount(amount)}\nInterest: ${interestText(interestRate, term)}\nTotal repayment: ${formatAmount(totalRepayment)}\n${payment}\nTerm: ${term ?? 'Not specified'} months`
@@ -104,11 +106,13 @@ export function loanDecisionEmail({ requestId, amount, interestRate, term, statu
   );
 }
 
-export function paymentEmail({ memberName, amount, paymentDate, loanNumber, remainingBalance, status }) {
+// penaltyPaid: the part of the payment that paid the late penalty, if any.
+export function paymentEmail({ memberName, amount, paymentDate, loanNumber, remainingBalance, status, penaltyPaid = 0 }) {
+  const penalty = Number(penaltyPaid) > 0 ? ` (${formatAmount(penaltyPaid)} of it for the late penalty)` : '';
   return message(
     'ACIFAC loan payment recorded',
-    `Hello ${memberName}, your payment of ${formatAmount(amount)} for loan ${loanNumber} was recorded on ${paymentDate}. Remaining balance: ${formatAmount(remainingBalance)}.`,
-    `<p>Hello ${escapeHtml(memberName)},</p><p>Your payment of <strong>${formatAmount(amount)}</strong> for loan ${escapeHtml(loanNumber)} was recorded.</p><p>Remaining balance: ${formatAmount(remainingBalance)} (${escapeHtml(status)}).</p>`
+    `Hello ${memberName}, your payment of ${formatAmount(amount)} for loan ${loanNumber} was recorded on ${paymentDate}${penalty}. Remaining balance: ${formatAmount(remainingBalance)}.`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>Your payment of <strong>${formatAmount(amount)}</strong> for loan ${escapeHtml(loanNumber)} was recorded${penalty}.</p><p>Remaining balance: ${formatAmount(remainingBalance)} (${escapeHtml(status)}).</p>`
   );
 }
 export function rentalDecisionEmail({ machineryName, startDate, endDate, status, rentalFee }) {

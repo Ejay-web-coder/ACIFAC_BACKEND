@@ -74,6 +74,8 @@ const ADDITIONAL_TEXT_FIELDS = [
 export function readAdditionalInfo(raw) {
   let value = raw;
   if (typeof value === 'string') {
+    // A blank form field means no details (JSON.parse would reject it).
+    if (!value.trim()) return {};
     try { value = JSON.parse(value); } catch { throw badRequest('Additional member information is not valid.'); }
   }
   if (value === undefined || value === null || value === '') return {};

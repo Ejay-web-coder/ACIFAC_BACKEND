@@ -1,5 +1,5 @@
 import { insertLoanRequest, memberApplicationSelect, prepareApplication } from '../../src/controllers/loanController.js';
-import { allocatePayment, createInstallments, LOAN_POLICY, recomputeLoanState } from '../../src/services/loanService.js';
+import { allocatePayment, createInstallments, LOAN_POLICY, penaltyDue, recomputeLoanState } from '../../src/services/loanService.js';
 import { centsToString, toCents } from '../../src/utils/money.js';
 import { addDays, addMonths, officeDayOnOrBefore, stampSql } from './support.js';
 
@@ -7,7 +7,8 @@ import { addDays, addMonths, officeDayOnOrBefore, stampSql } from './support.js'
 // Loans page (eligibility = farm area x PHP 50,000, 2.5% a month flat interest), is
 // approved `approved` months ago, gets its schedule (one payment of the whole
 // amount, due 6 months after approval), and is paid as `paid` says:
-//   'on time' = paid two days before the due date, 'late' = 12 days after,
+//   'on time' = paid two days before the due date, 'late' = 12 days after
+//   (with the PHP 100 a day penalty for the days past the 5-day grace period),
 //   and a loan not paid stays unpaid.
 // Loans unpaid past their due date become overdue on their own.
 // Every loan is for 6 months and repaid in one payment of the whole amount by
@@ -69,17 +70,20 @@ async function approve(ctx, { requestId, member, application }, approvedOn) {
   return loanId;
 }
 
-// Records a payment as the Payments page does: applied to the oldest unpaid installment, interest first.
+// Records a payment as the Payments page does: the late penalty due on the
+// payment date first (paid on top of `amount`), then the oldest unpaid
+// installment, interest first.
 async function pay(ctx, loanId, amount, paymentDate) {
   const { client } = ctx;
   const before = await recomputeLoanState(client, loanId);
   const amountCents = Math.min(toCents(amount), toCents(before.balance));
+  const penaltyCents = (await penaltyDue(client, loanId, paymentDate)).cents;
   const allocation = await allocatePayment(client, loanId, amountCents, paymentDate);
   await client.query(
-    `INSERT INTO loan_payments (loan_id, amount, payment_date, principal_paid, interest_paid, remaining_balance, recorded_by, created_at)
-     VALUES ($1, $2::numeric, $3::date, $4::numeric, $5::numeric, $6::numeric, $7, ${stampSql('$3', '10:30')})`,
-    [loanId, centsToString(amountCents), paymentDate, centsToString(allocation.principalCents), centsToString(allocation.interestCents),
-      centsToString(toCents(before.balance) - amountCents), ctx.admin.id]
+    `INSERT INTO loan_payments (loan_id, amount, payment_date, principal_paid, interest_paid, remaining_balance, recorded_by, created_at, penalty_paid)
+     VALUES ($1, $2::numeric, $3::date, $4::numeric, $5::numeric, $6::numeric, $7, ${stampSql('$3', '10:30')}, $8::numeric)`,
+    [loanId, centsToString(amountCents + penaltyCents), paymentDate, centsToString(allocation.principalCents), centsToString(allocation.interestCents),
+      centsToString(toCents(before.balance) - amountCents), ctx.admin.id, centsToString(penaltyCents)]
   );
   await recomputeLoanState(client, loanId);
   ctx.count('loan payments');

@@ -10,7 +10,8 @@ import { centsToString, toCents } from '../utils/money.js';
 //                      recorded as a service counts once, as the service) + service
 //                      fees collected + other income - machinery expenses, as in
 //                      the PhilMech cash flow
-//   Loans & Payments   interest collected (principal repaid is not income)
+//   Loans & Payments   interest and late penalties collected (principal repaid
+//                      is not income)
 const NET_INCOME_SQL = `
   SELECT
     (SELECT COALESCE(SUM(net_sales), 0) FROM kadiwa_sales
@@ -28,14 +29,16 @@ const NET_INCOME_SQL = `
     (SELECT COALESCE(SUM(amount), 0) FROM machinery_expenses
       WHERE ($1::date IS NULL OR expense_date >= $1::date) AND ($2::date IS NULL OR expense_date <= $2::date)) AS expenses,
     (SELECT COALESCE(SUM(interest_paid), 0) FROM loan_payments
-      WHERE ($1::date IS NULL OR payment_date >= $1::date) AND ($2::date IS NULL OR payment_date <= $2::date)) AS "loanInterest"`;
+      WHERE ($1::date IS NULL OR payment_date >= $1::date) AND ($2::date IS NULL OR payment_date <= $2::date)) AS "loanInterest",
+    (SELECT COALESCE(SUM(penalty_paid), 0) FROM loan_payments
+      WHERE ($1::date IS NULL OR payment_date >= $1::date) AND ($2::date IS NULL OR payment_date <= $2::date)) AS "loanPenalties"`;
 
 /** Net income and its parts in centavos. */
 export async function netIncomeCents({ from = null, to = null } = {}, db = { query }) {
   const row = (await db.query(NET_INCOME_SQL, [from, to])).rows[0];
   const kadiwa = toCents(row.kadiwa);
   const machinery = toCents(row.rentalFees) + toCents(row.serviceFees) + toCents(row.otherIncome) - toCents(row.expenses);
-  const loans = toCents(row.loanInterest);
+  const loans = toCents(row.loanInterest) + toCents(row.loanPenalties);
   return { total: kadiwa + machinery + loans, parts: { kadiwa, machinery, loans } };
 }
 

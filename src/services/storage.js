@@ -41,9 +41,12 @@ const SIGNATURES = {
 };
 const EXTENSIONS = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'application/pdf': '.pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx' };
 
+// "an ID document", "an RSBSA enrollment copy", "a signature".
+const withArticle = (label) => `${/^([aeiou]|ID\b|RSBSA\b)/i.test(label) ? 'an' : 'a'} ${label}`;
+
 // Checks the declared type is allowed AND matches the file's real content.
 export function assertValidUpload(file, allowedTypes, label = 'file') {
-  if (!file?.buffer?.length) throw badRequest(`Please upload a ${label}.`);
+  if (!file?.buffer?.length) throw badRequest(`Please upload ${withArticle(label)}.`);
   if (!allowedTypes.includes(file.mimetype) || !SIGNATURES[file.mimetype]?.(file.buffer)) {
     throw badRequest(`The ${label} must be a valid ${allowedTypes.map((type) => EXTENSIONS[type].slice(1).toUpperCase()).join(', ')} file.`);
   }

@@ -12,7 +12,8 @@ import { officeOpenNow, paymentHours } from '../services/officeHours.js';
 import { keepAlive } from '../utils/background.js';
 import { notifyAdmins, notifyMember } from '../services/notificationService.js';
 import {
-  allocatePayment, calculateLoanFinancials, createInstallments, ensureInstallments, LOAN_POLICY, recomputeLoanState, refreshLoanStatusesInBackground,
+  allocatePayment, calculateLoanFinancials, createInstallments, ensureInstallments, LOAN_POLICY, penaltyAccruedSql, penaltyDaysSql, penaltyDue,
+  recomputeLoanState, refreshLoanStatusesInBackground,
 } from '../services/loanService.js';
 
 const MONEY_PATTERN = /^\d+(\.\d{1,2})?$/;
@@ -29,6 +30,11 @@ const LOAN_TYPES = ['agricultural'];
 
 // Every money value the API returns for a loan comes from these columns, so the
 // admin page, member page, receipts and analytics always agree.
+// totalPaid is what was paid of principal and interest (totalAmount =
+// totalPaid + balance); the late penalty is apart: penaltyPaid, and on an open
+// loan penaltyDue (run up to today, less what was paid of it), penaltyDays (days
+// past the grace period, which ends on graceEndsOn) and amountDueNow (balance +
+// penaltyDue).
 const loanSelect = `
   SELECT l.id AS "databaseId", l.loan_number AS id, l.member_id AS "memberDatabaseId",
          COALESCE(m.member_number, l.member_number, l.member_id::text) AS "memberId", l.member_name AS "memberName",
@@ -38,6 +44,10 @@ const loanSelect = `
          l.balance, l.interest_rate AS "interestRate", l.term, l.status, l.date_approved AS "dateApproved", l.due_date AS "dueDate",
          l.next_payment_date AS "nextPaymentDate", l.monthly_payment AS "monthlyPayment", l.repayment,
          COALESCE(pay.total_paid, 0) AS "totalPaid", COALESCE(pay.payment_count, 0)::int AS "paymentCount",
+         l.penalty_per_day AS "penaltyPerDay", l.grace_days AS "graceDays",
+         CASE WHEN l.penalty_per_day > 0 THEN l.due_date + l.grace_days END AS "graceEndsOn",
+         CASE WHEN l.status <> 'paid' THEN ${penaltyDaysSql('l', SQL_TODAY)} ELSE 0 END AS "penaltyDays",
+         COALESCE(pay.penalty_paid, 0.00) AS "penaltyPaid", pen.due AS "penaltyDue", l.balance + pen.due AS "amountDueNow",
          COALESCE(inst.overdue_amount, 0) AS "overdueAmount", COALESCE(inst.overdue_installments, 0)::int AS "overdueInstallments",
          COALESCE(inst.paid_installments, 0)::int AS "paidInstallments", inst.next_amount_due AS "nextAmountDue",
          l.farm_area AS "farmArea", l.maximum_eligible_amount AS "maximumEligibleAmount",
@@ -50,7 +60,12 @@ const loanSelect = `
          ${idDocumentsColumn('l')}, ${signatureColumn('l')}
   FROM loans l
   LEFT JOIN members m ON m.id = l.member_id
-  LEFT JOIN LATERAL (SELECT SUM(p.amount) AS total_paid, COUNT(*) AS payment_count FROM loan_payments p WHERE p.loan_id = l.id) pay ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT SUM(p.amount - p.penalty_paid) AS total_paid, SUM(p.penalty_paid) AS penalty_paid, COUNT(*) AS payment_count FROM loan_payments p WHERE p.loan_id = l.id
+  ) pay ON TRUE
+  CROSS JOIN LATERAL (
+    SELECT CASE WHEN l.status <> 'paid' THEN GREATEST(0.00, ${penaltyAccruedSql('l', SQL_TODAY)} - COALESCE(pay.penalty_paid, 0)) ELSE 0.00 END AS due
+  ) pen
   LEFT JOIN LATERAL (
     SELECT SUM(i.amount_due - i.amount_paid) FILTER (WHERE i.amount_paid < i.amount_due AND i.due_date < ${SQL_TODAY}) AS overdue_amount,
            COUNT(*) FILTER (WHERE i.amount_paid < i.amount_due AND i.due_date < ${SQL_TODAY}) AS overdue_installments,
@@ -60,14 +75,14 @@ const loanSelect = `
   ) inst ON TRUE
   LEFT JOIN LATERAL (SELECT COUNT(*) AS restructure_count, MAX(r.restructured_on) AS last_restructured_on FROM loan_restructurings r WHERE r.loan_id = l.id) rs ON TRUE
   LEFT JOIN LATERAL (
-    -- A loan that restructured an earlier one: that loan, and what of this one paid it off.
-    SELECT o.loan_number, r.balance_carried, r.net_proceeds FROM loan_restructurings r JOIN loans o ON o.id = r.loan_id WHERE r.new_loan_id = l.id LIMIT 1
+    -- A loan that restructured an earlier one: that loan, and what of this one paid it off (its balance and penalty).
+    SELECT o.loan_number, r.balance_carried + r.penalty_carried AS balance_carried, r.net_proceeds FROM loan_restructurings r JOIN loans o ON o.id = r.loan_id WHERE r.new_loan_id = l.id LIMIT 1
   ) rf ON TRUE`;
 
 const paymentSelect = `
   SELECT p.id, p.loan_id AS "loanId", l.loan_number AS "loanNumber", l.member_id AS "memberDatabaseId", l.member_name AS "memberName",
          p.amount, p.payment_date AS "paymentDate", p.principal_paid AS "principalPaid", p.interest_paid AS "interestPaid",
-         p.remaining_balance AS "remainingBalance", p.created_at AS "createdAt", u.username AS "recordedBy"
+         p.penalty_paid AS "penaltyPaid", p.remaining_balance AS "remainingBalance", p.created_at AS "createdAt", u.username AS "recordedBy"
   FROM loan_payments p
   JOIN loans l ON l.id = p.loan_id
   LEFT JOIN users u ON u.id = p.recorded_by`;
@@ -77,7 +92,7 @@ const restructuringSelect = `
          r.principal_carried AS "principalCarried", r.interest_carried AS "interestCarried", r.overdue_amount AS "overdueAmount",
          r.overdue_installments AS "overdueInstallments", r.interest_rate AS "interestRate", r.added_interest AS "addedInterest",
          r.new_term AS "newTerm", r.new_monthly_payment AS "newMonthlyPayment", r.previous_due_date AS "previousDueDate",
-         r.new_due_date AS "newDueDate", r.kind, r.amount_paid_before AS "amountPaidBefore", r.total_before AS "totalBefore",
+         r.new_due_date AS "newDueDate", r.kind, r.amount_paid_before AS "amountPaidBefore", r.total_before AS "totalBefore", r.penalty_carried AS "penaltyCarried",
          r.new_loan_amount AS "newLoanAmount", r.net_proceeds AS "netProceeds", n.loan_number AS "newLoanNumber",
          u.username AS "recordedBy", r.created_at AS "createdAt"
   FROM loan_restructurings r LEFT JOIN users u ON u.id = r.recorded_by LEFT JOIN loans n ON n.id = r.new_loan_id`;
@@ -96,11 +111,13 @@ const requestSelect = `
          r.borrower_address AS "borrowerAddress", r.borrower_age AS "borrowerAge", r.borrower_gender AS "borrowerGender",
          r.borrower_civil_status AS "borrowerCivilStatus", r.borrower_occupation AS "borrowerOccupation", r.years_farming AS "yearsFarming",
          r.farm_location AS "farmLocation", r.barangay, r.municipality, r.province, r.irrigation_other AS "irrigationOther",
-         ol.loan_number AS "openLoanNumber", ol.balance AS "openLoanBalance", ol.total AS "openLoanTotal"
+         ol.loan_number AS "openLoanNumber", ol.balance AS "openLoanBalance", ol.total AS "openLoanTotal", ol.penalty AS "openLoanPenalty"
   FROM loan_requests r LEFT JOIN members m ON m.id = r.member_id
   LEFT JOIN LATERAL (
     -- The member's open loan, which approving this application would restructure (80% paid) or which blocks it.
-    SELECT o.loan_number, o.balance, COALESCE(o.total_repayment, ROUND(o.amount + ROUND(o.amount * o.interest_rate / 100, 2), 2)) AS total
+    -- Its balance and late penalty are what the restructuring deducts.
+    SELECT o.loan_number, o.balance, COALESCE(o.total_repayment, ROUND(o.amount + ROUND(o.amount * o.interest_rate / 100, 2), 2)) AS total,
+           GREATEST(0.00, ${penaltyAccruedSql('o', SQL_TODAY)} - COALESCE((SELECT SUM(op.penalty_paid) FROM loan_payments op WHERE op.loan_id = o.id), 0)) AS penalty
     FROM loans o WHERE o.member_id = r.member_id AND o.status <> 'paid' ORDER BY o.id LIMIT 1
   ) ol ON r.status = 'pending'`;
 
@@ -222,16 +239,17 @@ async function insertLoan(client, loan) {
     `INSERT INTO loans (loan_number, loan_request_id, member_id, member_number, member_name, loan_type, amount, balance, interest_rate, term,
        date_approved, due_date, next_payment_date, monthly_payment, farm_area, maximum_eligible_amount, purpose, loan_mode,
        calculated_interest, total_repayment, in_kind_items, co_maker_name, co_maker_address, co_maker_contact,
-       co_maker_relationship, collateral_type, collateral_details, id_documents, borrower_signature, repayment)
+       co_maker_relationship, collateral_type, collateral_details, id_documents, borrower_signature, repayment, penalty_per_day, grace_days)
      VALUES ('L-TMP-' || left(md5(random()::text), 20), $1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, $9,
        ${SQL_TODAY}, ${SQL_TODAY} + make_interval(months => $9::int), ${SQL_TODAY} + make_interval(months => $9::int), $10::numeric, $11::numeric, $12::numeric,
-       $13, $14, $15::numeric, $7::numeric, $16::jsonb, $17, $18, $19, $20, $21, $22, $23::jsonb, $24::jsonb, '${LOAN_POLICY.repayment}')
+       $13, $14, $15::numeric, $7::numeric, $16::jsonb, $17, $18, $19, $20, $21, $22, $23::jsonb, $24::jsonb, '${LOAN_POLICY.repayment}', $25::numeric, $26::int)
      RETURNING id`,
     [loan.loanRequestId ?? null, loan.memberId, loan.memberNumber, loan.memberName, loan.loanType, loan.amount, loan.totalRepayment,
       loan.interestRate, loan.term, loan.monthlyPayment, loan.farmArea ?? null, loan.maximumEligibleAmount ?? null, loan.purpose ?? null,
       loan.loanMode ?? null, loan.calculatedInterest, JSON.stringify(loan.inKindItems || []), loan.coMaker?.name ?? null,
       loan.coMaker?.address ?? null, loan.coMaker?.contact ?? null, loan.coMaker?.relationship ?? null, loan.collateralType ?? null,
-      loan.collateralDetails ?? null, JSON.stringify(loan.idDocuments || {}), loan.borrowerSignature ? JSON.stringify(loan.borrowerSignature) : null]
+      loan.collateralDetails ?? null, JSON.stringify(loan.idDocuments || {}), loan.borrowerSignature ? JSON.stringify(loan.borrowerSignature) : null,
+      LOAN_POLICY.penaltyPerDay, LOAN_POLICY.gracePeriodDays]
   );
   const loanId = inserted.rows[0].id;
   // Loan numbers follow the loan's own id so they are gap-free per loan: L-YYYY-###.
@@ -305,6 +323,9 @@ export async function listLoans(req, res) {
               COALESCE(SUM(amount), 0) AS "totalPrincipal",
               COALESCE(SUM(balance) FILTER (WHERE status IN ('active', 'overdue')), 0) AS "totalOutstanding",
               (SELECT COALESCE(SUM(amount), 0) FROM loan_payments) AS "totalCollected",
+              (SELECT COALESCE(SUM(penalty_paid), 0) FROM loan_payments) AS "penaltiesCollected",
+              COALESCE(SUM(GREATEST(0, ${penaltyAccruedSql('loans', SQL_TODAY)} - COALESCE((SELECT SUM(lp.penalty_paid) FROM loan_payments lp WHERE lp.loan_id = loans.id), 0)))
+                FILTER (WHERE status IN ('active', 'overdue')), 0) AS "totalPenaltyDue",
               (SELECT COUNT(*)::int FROM loan_requests WHERE status = 'pending') AS "pendingRequests"
        FROM loans`
     ),
@@ -349,11 +370,13 @@ async function memberLoanHistory(memberId) {
   const open = loans.rows.filter((loan) => loan.status !== 'paid');
   return {
     member,
+    // totalPaid: of principal and interest; penaltyPaid and penaltyDue: the late penalty, apart.
     summary: {
       loans: loans.rows.length, openLoans: open.length, paidLoans: loans.rows.length - open.length,
       overdueLoans: loans.rows.filter((loan) => loan.status === 'overdue').length,
       totalBorrowed: sum(loans.rows, 'amount'), totalInterest: sum(loans.rows, 'totalInterest'), totalRepayment: sum(loans.rows, 'totalAmount'),
-      totalPaid: sum(payments.rows, 'amount'), outstandingBalance: sum(open, 'balance'), payments: payments.rows.length,
+      totalPaid: sum(loans.rows, 'totalPaid'), penaltyPaid: sum(loans.rows, 'penaltyPaid'), penaltyDue: sum(open, 'penaltyDue'),
+      outstandingBalance: sum(open, 'balance'), payments: payments.rows.length,
       restructurings: loans.rows.reduce((total, loan) => total + loan.restructureCount, 0),
     },
     loans: loans.rows,
@@ -441,7 +464,7 @@ export async function createLoan(req, res, _next, { takeIds, borrowerSignature =
       entityType: 'loan',
       entityId: String(id),
       description: `Created loan for ${member.full_name}`,
-      newValues: { member_id: member.id, amount: application.requestedAmount, capital_change: capitalChange(-(toCents(application.requestedAmount) - (renewal ? toCents(renewal.balance_carried) : 0))), term: application.term, farm_area: application.farmArea, total_repayment: application.financials.total_repayment, certified: application.certified, signed: Boolean(borrowerSignature), ids: idSummary(idDocuments) },
+      newValues: { member_id: member.id, amount: application.requestedAmount, capital_change: capitalChange(-(renewal ? toCents(renewal.net_proceeds) : toCents(application.requestedAmount))), term: application.term, farm_area: application.farmArea, total_repayment: application.financials.total_repayment, certified: application.certified, signed: Boolean(borrowerSignature), ids: idSummary(idDocuments) },
       ...getRequestMeta(req),
     });
     await notifyMember(client, member.id, { type: 'loan_approved', title: 'Loan approved', message: `A loan of PHP ${Number(application.requestedAmount).toLocaleString('en-PH', { minimumFractionDigits: 2 })} was approved for you.`, severity: 'success', link: '/loan-status', entityType: 'loan', entityId: id, dedupeKey: `loan-created-${id}` });
@@ -449,7 +472,10 @@ export async function createLoan(req, res, _next, { takeIds, borrowerSignature =
   });
   const result = await query(`${loanSelect} WHERE l.id = $1`, [loanId]);
   const loan = result.rows[0];
-  void emailMember(loan.memberDatabaseId, loanDecisionEmail({ requestId: loan.id, amount: loan.amount, interestRate: loan.interestRate, term: loan.term, status: 'approved', totalRepayment: loan.totalAmount, monthlyPayment: loan.monthlyPayment }));
+  void emailMember(loan.memberDatabaseId, loanDecisionEmail({
+    requestId: loan.id, amount: loan.amount, interestRate: loan.interestRate, term: loan.term, status: 'approved', totalRepayment: loan.totalAmount, monthlyPayment: loan.monthlyPayment,
+    repayment: loan.repayment, dueDate: loan.dueDate, penaltyPerDay: loan.penaltyPerDay, graceDays: loan.graceDays,
+  }));
   return res.status(201).json({ success: true, loan });
 }
 
@@ -503,7 +529,7 @@ export async function reviewLoanRequest(req, res) {
       entityId: String(requestRow.id),
       description: `Loan request ${status} for ${requestRow.member_name}`,
       oldValues: { status: requestRow.status },
-      newValues: { status, loan_id: createdLoanId, review_notes: reviewNotes, ...(createdLoanId ? { amount: requestRow.amount, capital_change: capitalChange(-(toCents(requestRow.amount) - (renewal ? toCents(renewal.balance_carried) : 0))) } : {}), ...(renewal ? { restructured_loan: open.row.loan_number, deducted: renewal.balance_carried, net_proceeds: renewal.net_proceeds } : {}) },
+      newValues: { status, loan_id: createdLoanId, review_notes: reviewNotes, ...(createdLoanId ? { amount: requestRow.amount, capital_change: capitalChange(-(renewal ? toCents(renewal.net_proceeds) : toCents(requestRow.amount))) } : {}), ...(renewal ? { restructured_loan: open.row.loan_number, deducted: renewal.balance_carried, ...(open.penaltyCents > 0 ? { penalty_deducted: renewal.penalty_carried } : {}), net_proceeds: renewal.net_proceeds } : {}) },
       ...getRequestMeta(req),
     });
     await notifyMember(client, requestRow.member_id, {
@@ -527,10 +553,11 @@ export async function reviewLoanRequest(req, res) {
   );
   const recipient = recipientResult.rows[0];
   if (recipient?.email) {
-    const loan = loanId ? (await query(`SELECT total_repayment, monthly_payment, interest_rate, term, repayment, TO_CHAR(due_date, 'YYYY-MM-DD') AS due_date FROM loans WHERE id = $1`, [loanId])).rows[0] : null;
+    const loan = loanId ? (await query(`SELECT total_repayment, monthly_payment, interest_rate, term, repayment, TO_CHAR(due_date, 'YYYY-MM-DD') AS due_date, penalty_per_day, grace_days FROM loans WHERE id = $1`, [loanId])).rows[0] : null;
     const email = loanDecisionEmail({
       requestId: request.id, amount: request.amount, interestRate: loan?.interest_rate, term: loan?.term ?? request.term, status, reason: reviewNotes,
       totalRepayment: loan?.total_repayment, monthlyPayment: loan?.monthly_payment, repayment: loan?.repayment, dueDate: loan?.due_date,
+      penaltyPerDay: loan?.penalty_per_day, graceDays: loan?.grace_days,
     });
     void sendEmailSafely({ ...email, to: recipient.email, relatedUserId: recipient.user_id });
   }
@@ -554,15 +581,23 @@ export async function recordPayment(req, res) {
     const state = await recomputeLoanState(client, loanId);
     const balanceCents = toCents(state.balance);
     if (state.status === 'paid' || balanceCents <= 0) throw badRequest('This loan is already fully paid.');
-    if (amountCents > balanceCents) throw badRequest(`Payment cannot exceed the outstanding balance of PHP ${centsToString(balanceCents)}.`);
+    // The late penalty run up by the payment date is paid first, then interest and principal.
+    const penalty = await penaltyDue(client, loanId, paymentDate);
+    if (amountCents > balanceCents + penalty.cents) {
+      throw badRequest(penalty.cents > 0
+        ? `Payment cannot exceed PHP ${centsToString(balanceCents + penalty.cents)}: the balance of PHP ${centsToString(balanceCents)} and the late penalty of PHP ${centsToString(penalty.cents)} (${penalty.days} day${penalty.days === 1 ? '' : 's'}).`
+        : `Payment cannot exceed the outstanding balance of PHP ${centsToString(balanceCents)}.`);
+    }
+    const penaltyCents = Math.min(amountCents, penalty.cents);
+    const loanCents = amountCents - penaltyCents;
 
-    const allocation = await allocatePayment(client, loanId, amountCents, paymentDate);
+    const allocation = await allocatePayment(client, loanId, loanCents, paymentDate);
     if (allocation.unallocatedCents !== 0) throw new Error(`Installment schedule does not match balance for loan ${loanId}.`);
-    const remainingCents = balanceCents - amountCents;
+    const remainingCents = balanceCents - loanCents;
     const inserted = await client.query(
-      `INSERT INTO loan_payments (loan_id, amount, payment_date, principal_paid, interest_paid, remaining_balance, recorded_by)
-       VALUES ($1, $2::numeric, $3::date, $4::numeric, $5::numeric, $6::numeric, $7) RETURNING id`,
-      [loanId, centsToString(amountCents), paymentDate, centsToString(allocation.principalCents), centsToString(allocation.interestCents), centsToString(remainingCents), currentUserId(req)]
+      `INSERT INTO loan_payments (loan_id, amount, payment_date, principal_paid, interest_paid, remaining_balance, recorded_by, penalty_paid)
+       VALUES ($1, $2::numeric, $3::date, $4::numeric, $5::numeric, $6::numeric, $7, $8::numeric) RETURNING id`,
+      [loanId, centsToString(amountCents), paymentDate, centsToString(allocation.principalCents), centsToString(allocation.interestCents), centsToString(remainingCents), currentUserId(req), centsToString(penaltyCents)]
     );
     const newState = await recomputeLoanState(client, loanId);
     await createAuditLog({
@@ -574,13 +609,13 @@ export async function recordPayment(req, res) {
       entityId: String(inserted.rows[0].id),
       description: `Recorded payment for loan ${loan.loan_number}`,
       oldValues: { balance: loan.balance, status: loan.status },
-      newValues: { balance: newState.balance, status: newState.status, amount: centsToString(amountCents), capital_change: capitalChange(amountCents), payment_date: paymentDate, principal_paid: centsToString(allocation.principalCents), interest_paid: centsToString(allocation.interestCents) },
+      newValues: { balance: newState.balance, status: newState.status, amount: centsToString(amountCents), capital_change: capitalChange(amountCents), payment_date: paymentDate, principal_paid: centsToString(allocation.principalCents), interest_paid: centsToString(allocation.interestCents), ...(penaltyCents > 0 ? { penalty_paid: centsToString(penaltyCents) } : {}) },
       ...getRequestMeta(req),
     });
     await notifyMember(client, loan.member_id, {
       type: 'payment_recorded',
       title: newState.status === 'paid' ? 'Loan fully paid' : 'Payment recorded',
-      message: `Your payment of PHP ${Number(centsToString(amountCents)).toLocaleString('en-PH', { minimumFractionDigits: 2 })} for loan ${loan.loan_number} was recorded. Remaining balance: PHP ${Number(newState.balance).toLocaleString('en-PH', { minimumFractionDigits: 2 })}.`,
+      message: `Your payment of ${pesoText(amountCents)} for loan ${loan.loan_number} was recorded${penaltyCents > 0 ? ` (${pesoText(penaltyCents)} of it for the late penalty)` : ''}. Remaining balance: PHP ${Number(newState.balance).toLocaleString('en-PH', { minimumFractionDigits: 2 })}.${penalty.cents > penaltyCents ? ` Late penalty still due: ${pesoText(penalty.cents - penaltyCents)}.` : ''}`,
       severity: 'success',
       link: '/transaction',
       entityType: 'loan_payment',
@@ -595,7 +630,7 @@ export async function recordPayment(req, res) {
     [loanId]
   )).rows[0];
   if (recipient?.email) {
-    const email = paymentEmail({ memberName: payment.memberName, amount: payment.amount, paymentDate: payment.paymentDate, loanNumber: payment.loanNumber, remainingBalance: payment.remainingBalance, status: Number(payment.remainingBalance) === 0 ? 'paid' : 'recorded' });
+    const email = paymentEmail({ memberName: payment.memberName, amount: payment.amount, paymentDate: payment.paymentDate, loanNumber: payment.loanNumber, remainingBalance: payment.remainingBalance, penaltyPaid: payment.penaltyPaid, status: Number(payment.remainingBalance) === 0 ? 'paid' : 'recorded' });
     void sendEmailSafely({ ...email, to: recipient.email, relatedUserId: recipient.user_id });
   }
   return res.status(201).json({ success: true, payment });
@@ -604,15 +639,17 @@ export async function recordPayment(req, res) {
 const pesoText = (cents) => `PHP ${(cents / 100).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
 // An open loan's standing, inside the caller's transaction with the loan row
-// locked: what is still owed and what has been paid of its total. Null when it
-// is already fully paid.
+// locked: what is still owed and what has been paid of its total (principal
+// and interest), and the late penalty due today. owedCents is the balance and
+// the penalty: what closing the loan takes. Null when it is already fully paid.
 async function loanStanding(client, row) {
   await ensureInstallments(client, row.id);
   const state = await recomputeLoanState(client, row.id);
   const balanceCents = toCents(state.balance);
   if (state.status === 'paid' || balanceCents <= 0) return null;
-  const paidCents = toCents((await client.query('SELECT COALESCE(SUM(amount), 0) AS paid FROM loan_payments WHERE loan_id = $1', [row.id])).rows[0].paid);
-  return { row, state, balanceCents, paidCents, totalCents: paidCents + balanceCents };
+  const paidCents = toCents((await client.query('SELECT COALESCE(SUM(amount - penalty_paid), 0) AS paid FROM loan_payments WHERE loan_id = $1', [row.id])).rows[0].paid);
+  const penaltyCents = (await penaltyDue(client, row.id, todayDateOnly())).cents;
+  return { row, state, balanceCents, paidCents, totalCents: paidCents + balanceCents, penaltyCents, owedCents: balanceCents + penaltyCents };
 }
 
 // A member has one loan at a time: the member's open loan (locked), or null.
@@ -629,9 +666,15 @@ async function openLoanOf(client, memberId) {
 
 const paidPercent = (open) => Math.floor((open.paidCents * 1000) / open.totalCents) / 10;
 
+// What is still owed on an open loan, in words: the balance, and the late penalty if any.
+const owedText = (open) => (open.penaltyCents > 0
+  ? `${pesoText(open.owedCents)} (balance ${pesoText(open.balanceCents)} and late penalty ${pesoText(open.penaltyCents)})`
+  : pesoText(open.balanceCents));
+
 // A member with an open loan may borrow again only once at least 80% of it is
-// paid (restructuring): the new loan must cover what is still owed, which is
-// deducted from it. `subject` is "You have" or "This member has".
+// paid (restructuring; the late penalty does not count toward the 80%): the new
+// loan must cover what is still owed, balance and penalty, which is deducted
+// from it. `subject` is "You have" or "This member has".
 function assertMayBorrow(open, amountCents, subject = 'This member has') {
   if (!open) return;
   const minPercent = LOAN_POLICY.renewalMinPaidPercent;
@@ -639,12 +682,13 @@ function assertMayBorrow(open, amountCents, subject = 'This member has') {
     const neededCents = Math.ceil((open.totalCents * minPercent) / 100) - open.paidCents;
     throw conflict(`${subject} an open loan (${open.row.loan_number}): ${pesoText(open.paidCents)} of ${pesoText(open.totalCents)} is paid (${paidPercent(open)}%). A new loan is possible once at least ${minPercent}% is paid, ${pesoText(neededCents)} more; what is still owed is then deducted from the new loan (restructuring).`);
   }
-  if (amountCents <= open.balanceCents) throw badRequest(`The new loan must be more than the ${pesoText(open.balanceCents)} still owed on loan ${open.row.loan_number}, which is deducted from it.`);
+  if (amountCents <= open.owedCents) throw badRequest(`The new loan must be more than the ${owedText(open)} still owed on loan ${open.row.loan_number}, which is deducted from it.`);
 }
 
-// Restructuring: what is still owed on the open loan is deducted from the new
-// loan's proceeds and recorded as the old loan's last payment, which closes it.
-// Returns the restructuring row (balance_carried is the deduction).
+// Restructuring: what is still owed on the open loan, its balance and late
+// penalty, is deducted from the new loan's proceeds and recorded as the old
+// loan's last payment, which closes it. Returns the restructuring row
+// (balance_carried + penalty_carried is the deduction).
 async function closeIntoNewLoan(client, req, open, { newLoanId, amountCents, reason, today }) {
   const loanId = open.row.id;
   // What was past due on the old loan, for the credit history.
@@ -656,26 +700,28 @@ async function closeIntoNewLoan(client, req, open, { newLoanId, amountCents, rea
   const allocation = await allocatePayment(client, loanId, open.balanceCents, today);
   if (allocation.unallocatedCents !== 0) throw new Error(`Installment schedule does not match balance for loan ${loanId}.`);
   const payment = (await client.query(
-    `INSERT INTO loan_payments (loan_id, amount, payment_date, principal_paid, interest_paid, remaining_balance, recorded_by)
-     VALUES ($1, $2::numeric, $3::date, $4::numeric, $5::numeric, 0, $6) RETURNING id`,
-    [loanId, centsToString(open.balanceCents), today, centsToString(allocation.principalCents), centsToString(allocation.interestCents), currentUserId(req)]
+    `INSERT INTO loan_payments (loan_id, amount, payment_date, principal_paid, interest_paid, remaining_balance, recorded_by, penalty_paid)
+     VALUES ($1, $2::numeric, $3::date, $4::numeric, $5::numeric, 0, $6, $7::numeric) RETURNING id`,
+    [loanId, centsToString(open.owedCents), today, centsToString(allocation.principalCents), centsToString(allocation.interestCents), currentUserId(req), centsToString(open.penaltyCents)]
   )).rows[0];
   await recomputeLoanState(client, loanId);
   const newDueDate = (await client.query('SELECT due_date FROM loans WHERE id = $1', [newLoanId])).rows[0].due_date;
   return (await client.query(
     `INSERT INTO loan_restructurings (loan_id, kind, restructured_on, reason, balance_carried, principal_carried, interest_carried, overdue_amount, overdue_installments,
-                                      interest_rate, previous_due_date, new_due_date, amount_paid_before, total_before, new_loan_id, new_loan_amount, net_proceeds, payment_id, recorded_by)
+                                      interest_rate, previous_due_date, new_due_date, amount_paid_before, total_before, new_loan_id, new_loan_amount, net_proceeds, payment_id, recorded_by,
+                                      penalty_carried)
      VALUES ($1, 'renewal', $2::date, $3, $4::numeric, $5::numeric, $6::numeric, $7::numeric, $8::int, $9::numeric, $10::date, $11::date,
-             $12::numeric, $13::numeric, $14, $15::numeric, $15::numeric - $4::numeric, $16, $17)
+             $12::numeric, $13::numeric, $14, $15::numeric, $15::numeric - $4::numeric - $18::numeric, $16, $17, $18::numeric)
      RETURNING *`,
     [loanId, today, reason, centsToString(open.balanceCents), centsToString(allocation.principalCents), centsToString(allocation.interestCents), overdue.amount, overdue.count,
-      LOAN_POLICY.interestRate, open.row.due_date, newDueDate, centsToString(open.paidCents), centsToString(open.totalCents), newLoanId, centsToString(amountCents), payment.id, currentUserId(req)]
+      LOAN_POLICY.interestRate, open.row.due_date, newDueDate, centsToString(open.paidCents), centsToString(open.totalCents), newLoanId, centsToString(amountCents), payment.id, currentUserId(req),
+      centsToString(open.penaltyCents)]
   )).rows[0];
 }
 
 // The words the member is told when a new loan restructured their open one.
 const restructuredMessage = (open, newLoan, restructuring) =>
-  `Your loan ${open.row.loan_number} was restructured into the new loan ${newLoan.loan_number} of ${pesoText(toCents(newLoan.amount))}. The ${pesoText(open.balanceCents)} still owed was deducted, so you receive ${pesoText(toCents(restructuring.net_proceeds))}. The new loan, ${pesoText(toCents(newLoan.total))} with interest, is due by ${formatDateOnly(newLoan.due_date)}.`;
+  `Your loan ${open.row.loan_number} was restructured into the new loan ${newLoan.loan_number} of ${pesoText(toCents(newLoan.amount))}. The ${owedText(open)} still owed was deducted, so you receive ${pesoText(toCents(restructuring.net_proceeds))}. The new loan, ${pesoText(toCents(newLoan.total))} with interest, is due by ${formatDateOnly(newLoan.due_date)}.`;
 const newLoanFigures = async (client, loanId) => (await client.query(
   `SELECT loan_number, amount, due_date, COALESCE(total_repayment, ROUND(amount + ROUND(amount * interest_rate / 100, 2), 2)) AS total FROM loans WHERE id = $1`, [loanId]
 )).rows[0];
@@ -734,9 +780,9 @@ export async function restructureLoanRequest(req, res) {
       entityType: 'loan',
       entityId: String(loanId),
       description: `Restructured loan ${row.loan_number} of ${row.member_name} into loan ${newLoan.loan_number}`,
-      oldValues: { balance: open.state.balance, status: open.state.status, amount_paid: centsToString(open.paidCents), total: centsToString(open.totalCents) },
+      oldValues: { balance: open.state.balance, status: open.state.status, amount_paid: centsToString(open.paidCents), total: centsToString(open.totalCents), ...(open.penaltyCents > 0 ? { penalty_due: centsToString(open.penaltyCents) } : {}) },
       newValues: {
-        status: 'paid', deducted: result.balance_carried, new_loan_id: createdLoanId, new_loan_number: newLoan.loan_number, new_loan_amount: amount,
+        status: 'paid', deducted: result.balance_carried, ...(open.penaltyCents > 0 ? { penalty_deducted: result.penalty_carried } : {}), new_loan_id: createdLoanId, new_loan_number: newLoan.loan_number, new_loan_amount: amount,
         net_proceeds: result.net_proceeds, capital_change: capitalChange(-toCents(result.net_proceeds)), farm_area: farmArea, due_date: newLoan.due_date, reason,
       },
       ...getRequestMeta(req),

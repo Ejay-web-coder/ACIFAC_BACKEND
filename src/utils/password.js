@@ -1,4 +1,7 @@
-import bcrypt from 'bcryptjs';
+// Native bcrypt hashes on libuv's worker threads, so a sign-in (about 0.3 s at
+// cost 12) does not hold up other requests the way pure-JavaScript bcryptjs
+// did on the main thread. The hash format is the same: existing hashes still match.
+import bcrypt from 'bcrypt';
 import { randomInt } from 'node:crypto';
 
 // Letters and digits that can't be mistaken for each other when read off a screen (no O/0, I/l/1).

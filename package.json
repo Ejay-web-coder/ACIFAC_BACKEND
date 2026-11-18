@@ -9,14 +9,15 @@
     "migrate": "node scripts/run-migrations.js",
     "create-admin": "node scripts/create-admin.js",
     "seed": "node scripts/seed.js",
-    "test": "node --test --test-concurrency=1",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\"",
     "remove-sample-data": "node scripts/remove-sample-data.js",
     "remove-all-members": "node scripts/remove-all-members.js",
-    "remove-machinery-kadiwa": "node scripts/remove-machinery-kadiwa.js"
+    "remove-machinery-kadiwa": "node scripts/remove-machinery-kadiwa.js",
+    "test:unit": "node --experimental-vm-modules --no-warnings node_modules/jest/bin/jest.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.0",
-    "bcryptjs": "^3.0.0",
+    "bcrypt": "^6.0.0",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
@@ -28,5 +29,9 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "bcryptjs": "^3.0.3",
+    "jest": "^30.5.2"
   }
 }

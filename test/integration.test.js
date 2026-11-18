@@ -4021,7 +4021,13 @@ test('loans: restructuring after 80% paid deducts the balance from a new loan an
     [state.memberId, plus(today, -200), plus(today, -17)]
   )).rows[0].id;
   await refreshLoanStatuses({ force: true });
+  // Due 3 days ago: overdue, but within its 5-day grace period, so no late penalty yet
+  // (the penalty has its own test below).
+  await pool.query(`UPDATE loan_installments SET due_date = $2 WHERE loan_id = $1`, [singleId, plus(today, -3)]);
+  await pool.query(`UPDATE loans SET due_date = $2 WHERE id = $1`, [singleId, plus(today, -3)]);
+  await refreshLoanStatuses({ force: true });
   assert.equal((await admin.get(`/api/admin/loans/${singleId}`)).data.loan.status, 'overdue');
+  assert.equal((await admin.get(`/api/admin/loans/${singleId}`)).data.loan.penaltyDue, '0.00');
   const half = await admin.post(`/api/admin/loans/${singleId}/payments`, { amount: '5000', paymentDate: today });
   assert.equal(half.status, 201, JSON.stringify(half.data));
   assert.equal(half.data.payment.remainingBalance, '5250.00');
@@ -4253,4 +4259,90 @@ test('About page policies: the printed policies as text; the office adds, change
   assert.equal((await admin.request('DELETE', `/api/policies/${id}`)).status, 404);
   assert.equal((await member.get('/api/policies')).data.data.length, 4);
   assert.equal((await new Client('10.0.12.1').get('/api/policies')).status, 401);
+});
+
+test('loans: a 5-day grace period after the due date, then PHP 100 a day until paid in full', { skip }, async () => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const { refreshLoanStatuses } = await import('../src/services/loanService.js');
+  const office = new Client('10.0.12.8');
+  assert.equal((await office.post('/api/auth/login', { usernameOrEmail: 'testadmin', password: 'AdminPass1!' })).status, 200);
+  const today = todayDateOnly();
+  const plus = (days) => { const d = new Date(`${today}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
+  await settleOpenLoans(state.memberId);
+  // PHP 10,000 at 15%: PHP 11,500 in one payment. Made with a due date ahead, then moved.
+  const loanId = (await pool.query(
+    `INSERT INTO loans (loan_number, member_id, member_name, loan_type, amount, balance, interest_rate, term, status, date_approved, due_date, monthly_payment, calculated_interest, total_repayment, repayment)
+     VALUES ('L-PEN-001', $1, 'Juan Dela Cruz', 'agricultural', 10000, 11500, 15, 6, 'active', $2, $3, 11500, 1500, 11500, 'single') RETURNING id`,
+    [state.memberId, plus(-10), plus(170)]
+  )).rows[0].id;
+  await refreshLoanStatuses({ force: true });
+  await pool.query(`UPDATE loans SET date_approved = $2 WHERE id = $1`, [loanId, plus(-200)]);
+  const dueOn = async (days) => {
+    await pool.query(`UPDATE loan_installments SET due_date = $2 WHERE loan_id = $1`, [loanId, plus(days)]);
+    await pool.query(`UPDATE loans SET due_date = $2 WHERE id = $1`, [loanId, plus(days)]);
+    await refreshLoanStatuses({ force: true });
+    return (await office.get(`/api/admin/loans/${loanId}`)).data.loan;
+  };
+  const notes = async (type) => (await pool.query(`SELECT message FROM notifications WHERE user_id = $1 AND type = $2 AND entity_id = $3 ORDER BY id`, [state.memberUserId, type, String(loanId)])).rows.map((row) => row.message);
+
+  // The last day of the grace period: overdue, no penalty yet; the member is told the day to pay by.
+  const lastGraceDay = await dueOn(-5);
+  assert.deepEqual(
+    [lastGraceDay.status, lastGraceDay.penaltyPerDay, lastGraceDay.graceDays, lastGraceDay.graceEndsOn, lastGraceDay.penaltyDays, lastGraceDay.penaltyDue, lastGraceDay.amountDueNow],
+    ['overdue', '100.00', 5, today, 0, '0.00', '11500.00']
+  );
+  const overdueNote = await notes('payment_overdue');
+  assert.equal(overdueNote.length, 1);
+  assert.match(overdueNote[0], /^Loan L-PEN-001 \(PHP 11,500\.00\) is overdue\. Pay by \w+ \d+, \d{4} to avoid a PHP 100 a day penalty\.$/);
+  assert.ok(`${overdueNote[0]} Please pay at the ACIFAC office.\n- ACIFAC Administrator`.length <= 160, 'one SMS');
+  assert.deepEqual(await notes('loan_penalty'), []);
+
+  // 12 days past the grace period: PHP 1,200, and the member is told once that the penalty runs.
+  const late = await dueOn(-17);
+  assert.deepEqual([late.status, late.penaltyDays, late.penaltyDue, late.amountDueNow, late.balance], ['overdue', 12, '1200.00', '12700.00', '11500.00']);
+  await refreshLoanStatuses({ force: true });
+  assert.deepEqual(await notes('loan_penalty'), ['Loan L-PEN-001 is past its 5-day grace period. PHP 100 is now added each day until it is paid in full.']);
+  assert.ok(Number((await office.get('/api/admin/loans?limit=1')).data.summary.totalPenaltyDue) >= 1200);
+
+  // More than the balance and the penalty is refused.
+  const over = await office.post(`/api/admin/loans/${loanId}/payments`, { amount: '12700.01', paymentDate: today });
+  assert.equal(over.status, 400);
+  assert.match(over.data.message, /PHP 12700\.00: the balance of PHP 11500\.00 and the late penalty of PHP 1200\.00 \(12 days\)/);
+  // A payment dated within the grace period carries no penalty.
+  const inGrace = await office.post(`/api/admin/loans/${loanId}/payments`, { amount: '1000', paymentDate: plus(-15) });
+  assert.equal(inGrace.status, 201, JSON.stringify(inGrace.data));
+  assert.deepEqual([inGrace.data.payment.penaltyPaid, inGrace.data.payment.interestPaid, inGrace.data.payment.remainingBalance], ['0.00', '1000.00', '10500.00']);
+  // Today: the penalty first (PHP 1,200), then the interest left (PHP 500), then principal.
+  const paid = await office.post(`/api/admin/loans/${loanId}/payments`, { amount: '5000', paymentDate: today });
+  assert.equal(paid.status, 201, JSON.stringify(paid.data));
+  assert.deepEqual([paid.data.payment.penaltyPaid, paid.data.payment.interestPaid, paid.data.payment.principalPaid, paid.data.payment.remainingBalance], ['1200.00', '500.00', '3300.00', '6700.00']);
+  const after = (await office.get(`/api/admin/loans/${loanId}`)).data.loan;
+  assert.deepEqual([after.totalPaid, after.penaltyPaid, after.penaltyDue, after.balance, after.amountDueNow], ['4800.00', '1200.00', '0.00', '6700.00', '6700.00']);
+  const told = (await pool.query(`SELECT message FROM notifications WHERE user_id = $1 AND type = 'payment_recorded' ORDER BY id DESC LIMIT 1`, [state.memberUserId])).rows[0].message;
+  assert.match(told, /PHP 5,000\.00 for loan L-PEN-001 was recorded \(PHP 1,200\.00 of it for the late penalty\)/);
+
+  // 80% paid; a day later PHP 100 more is due, and restructuring deducts it with the balance.
+  assert.equal((await office.post(`/api/admin/loans/${loanId}/payments`, { amount: '4400', paymentDate: today })).status, 201);
+  const nextDay = await dueOn(-18);
+  assert.deepEqual([nextDay.penaltyDays, nextDay.penaltyDue, nextDay.balance, nextDay.totalPaid, nextDay.amountDueNow], [13, '100.00', '2300.00', '9200.00', '2400.00']);
+  assert.equal((await office.post(`/api/admin/loans/${loanId}/restructure`, { amount: '2400', farmArea: '1', reason: 'Late harvest' })).status, 400, 'the new loan must cover the balance and the penalty');
+  const renewed = await office.post(`/api/admin/loans/${loanId}/restructure`, { amount: '20000', farmArea: '1', reason: 'Late harvest' });
+  assert.equal(renewed.status, 201, JSON.stringify(renewed.data));
+  assert.deepEqual([renewed.data.restructuring.balance_carried, renewed.data.restructuring.penalty_carried, renewed.data.restructuring.net_proceeds], ['2300.00', '100.00', '17600.00']);
+  assert.deepEqual([renewed.data.loan.renewalDeduction, renewed.data.loan.netProceeds, renewed.data.loan.penaltyPerDay, renewed.data.loan.graceDays], ['2400.00', '17600.00', '100.00', 5]);
+  const closed = renewed.data.previousLoan;
+  assert.deepEqual([closed.status, closed.balance, closed.totalPaid, closed.penaltyPaid, closed.penaltyDue, closed.penaltyDays], ['paid', '0.00', '11500.00', '1300.00', '0.00', 0]);
+  const restructuredNote = (await pool.query(`SELECT message FROM notifications WHERE user_id = $1 AND type = 'loan_restructured' ORDER BY id DESC LIMIT 1`, [state.memberUserId])).rows[0].message;
+  assert.match(restructuredNote, /The PHP 2,400\.00 \(balance PHP 2,300\.00 and late penalty PHP 100\.00\) still owed was deducted, so you receive PHP 17,600\.00/);
+
+  // A paid loan's penalty stops: days later nothing more is due.
+  await pool.query(`UPDATE loans SET due_date = due_date - 30 WHERE id = $1`, [loanId]);
+  assert.equal((await office.get(`/api/admin/loans/${loanId}`)).data.loan.penaltyDue, '0.00');
+  // The member's loan summary and the analytics count the penalty apart from the loan.
+  const history = (await office.get(`/api/admin/members/${state.memberId}/loan-history`)).data;
+  assert.ok(Number(history.summary.penaltyPaid) >= 1300, JSON.stringify(history.summary));
+  const analytics = (await office.get(`/api/admin/analytics?from=${plus(-1)}&to=${today}`)).data;
+  assert.ok((analytics.revenue.find((row) => row.category === 'Loan Penalties')?.amount ?? 0) >= 1300, JSON.stringify(analytics.revenue));
+  assert.ok(analytics.summary.penaltiesCollected >= 1300);
+  await settleOpenLoans(state.memberId);
 });

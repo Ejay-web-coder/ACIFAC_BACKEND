@@ -114,8 +114,9 @@ and the hourly overdue job run.
 | Loan limit | farm area (ha) × ₱50,000 |
 | Interest | 2.5% of principal a month, flat: 15% for the 6-month term (loans before November 2026 keep 2.5% for the term; legacy requests without a rate keep 8%) |
 | Schedule | `term` equal monthly installments, first due one month after approval; last absorbs rounding |
-| Payments | applied to the oldest unpaid installment, interest portion first |
-| Overdue | a loan is overdue when any installment is unpaid after its due date (no grace period) |
+| Payments | the late penalty due on the payment date first, then the oldest unpaid installment, interest portion first; the balance is principal and interest |
+| Overdue | a loan is overdue when any installment is unpaid after its due date |
+| Late penalty | 6-month loans: a 5-day grace period after the due date, then ₱100 for every day until paid in full (`loans.penalty_per_day`, `loans.grace_days`; earlier monthly loans have none). Restructuring deducts it with the balance |
 | Share capital | `share_contributions`, capped at ₱20,000 per member |
 | Savings | separate `savings_transactions` ledger (deposits), not capped, not share capital |
 | Member name | `members.full_name` is generated: first, middle, last name and suffix, single-spaced |

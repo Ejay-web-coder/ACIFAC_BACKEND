@@ -17,9 +17,16 @@ import { paymentHours } from './officeHours.js';
 //     (repayment 'single'); the borrower may pay it in parts before then.
 // Loans made before November 2026 were charged 2.5% once for the whole term;
 // their stored rate (2.5) and totals stay as they were.
+//   * late payment: `gracePeriodDays` (5) days after the due date the grace
+//     period ends; from then on `penaltyPerDay` (PHP 100) is added for every
+//     day until the loan is paid in full. A payment pays the penalty due first,
+//     then interest, then principal; the balance is principal and interest only.
+//     Each loan keeps the penalty terms it was made with (penalty_per_day,
+//     grace_days); the loans repaid monthly (below) have none.
 //   * restructuring: once `renewalMinPaidPercent` (80%) of the total is paid,
-//     the borrower may take a new loan; what is still owed on the old one is
-//     deducted from the new loan's proceeds and closes the old loan.
+//     the borrower may take a new loan; what is still owed on the old one
+//     (balance and penalty) is deducted from the new loan's proceeds and closes
+//     the old loan.
 // Loans made before October 2026 were repaid in `term` equal monthly
 // installments, the first due one month after approval, the last absorbing
 // centavo rounding (repayment 'monthly'); they keep their schedules.
@@ -38,10 +45,34 @@ export const LOAN_POLICY = Object.freeze({
   renewalMinPaidPercent: 80,
   interestMethod: 'flat',
   scheduleFrequency: 'one payment at the end of the term',
+  gracePeriodDays: 5,
+  penaltyPerDay: '100',
 });
 
 function runner(db) {
   return db && typeof db.query === 'function' ? db.query.bind(db) : query;
+}
+
+// SQL: the days loan `alias` is past its grace period on the date `asOf`
+// (a SQL date), the days its penalty counts. 0 for a loan without a penalty.
+export const penaltyDaysSql = (alias, asOf) =>
+  `(CASE WHEN ${alias}.penalty_per_day > 0 THEN GREATEST(0, (${asOf}) - (${alias}.due_date + ${alias}.grace_days)) ELSE 0 END)`;
+
+// SQL: the penalty loan `alias` has run up by the date `asOf`: its penalty a
+// day for each of those days. It runs while the loan is open (the callers
+// take a paid loan's penalty as what was paid of it).
+export const penaltyAccruedSql = (alias, asOf) => `(${penaltyDaysSql(alias, asOf)} * ${alias}.penalty_per_day)`;
+
+// The late penalty still owed on an open loan on `asOf` (YYYY-MM-DD): what
+// has run up by then less what payments have paid of it. { cents, days }.
+export async function penaltyDue(client, loanId, asOf) {
+  const row = (await client.query(
+    `SELECT GREATEST(0, ${penaltyAccruedSql('l', '$2::date')} - COALESCE((SELECT SUM(lp.penalty_paid) FROM loan_payments lp WHERE lp.loan_id = l.id), 0)) AS penalty_due,
+            ${penaltyDaysSql('l', '$2::date')} AS penalty_days
+     FROM loans l WHERE l.id = $1`,
+    [loanId, asOf]
+  )).rows[0];
+  return { cents: toCents(row?.penalty_due), days: Number(row?.penalty_days ?? 0) };
 }
 
 // All money arithmetic happens in PostgreSQL NUMERIC. monthly_payment is the
@@ -144,26 +175,29 @@ export async function allocatePayment(client, loanId, amountCents, paymentDate) 
 }
 
 // Makes sure a loan (e.g. one created before installments existed) has its
-// schedule, and replays already-recorded payments onto it.
+// schedule, and replays already-recorded payments onto it (less what of them
+// paid the late penalty).
 export async function ensureInstallments(client, loanId) {
   const existing = await client.query('SELECT COUNT(*)::int AS count FROM loan_installments WHERE loan_id = $1', [loanId]);
   if (existing.rows[0].count > 0) return false;
   await createInstallments(client, loanId);
-  const payments = await client.query('SELECT amount, payment_date FROM loan_payments WHERE loan_id = $1 ORDER BY payment_date, id', [loanId]);
+  const payments = await client.query('SELECT amount, payment_date, penalty_paid FROM loan_payments WHERE loan_id = $1 ORDER BY payment_date, id', [loanId]);
   for (const payment of payments.rows) {
-    await allocatePayment(client, loanId, toCents(payment.amount), payment.payment_date);
+    await allocatePayment(client, loanId, toCents(payment.amount) - toCents(payment.penalty_paid), payment.payment_date);
   }
   return true;
 }
 
 // Recomputes balance, next payment date and status from the schedule and the
-// recorded payments (the database is the source of truth).
+// recorded payments (the database is the source of truth). The balance is
+// principal and interest: what payments paid of the late penalty does not
+// count toward it.
 export async function recomputeLoanState(client, loanId) {
   const result = await client.query(
     `WITH totals AS (
        SELECT l.id,
               COALESCE(l.total_repayment, ROUND(l.amount + ROUND(l.amount * l.interest_rate / 100, 2), 2)) AS total,
-              COALESCE((SELECT SUM(p.amount) FROM loan_payments p WHERE p.loan_id = l.id), 0) AS paid,
+              COALESCE((SELECT SUM(p.amount - p.penalty_paid) FROM loan_payments p WHERE p.loan_id = l.id), 0) AS paid,
               (SELECT MIN(i.due_date) FROM loan_installments i WHERE i.loan_id = l.id AND i.amount_paid < i.amount_due AND i.superseded_by IS NULL) AS next_due,
               EXISTS (SELECT 1 FROM loan_installments i WHERE i.loan_id = l.id AND i.amount_paid < i.amount_due AND i.superseded_by IS NULL AND i.due_date < ${SQL_TODAY}) AS overdue
        FROM loans l WHERE l.id = $1
@@ -224,13 +258,18 @@ export async function refreshLoanStatuses({ force = false } = {}) {
     );
 
     const money = `'PHP ' || to_char(i.amount_due - i.amount_paid, 'FM999,999,990.00')`;
+    const perDay = `'PHP ' || trim_scale(l.penalty_per_day)::text`;
+    // These texts are also emailed and texted: each fits one SMS (160
+    // characters with the closing line and signature, see smsService).
     // Member: a 6-month loan due within 2 days, reminded once by notification,
-    // email and SMS (respects the loan reminder preference). Loans repaid
-    // monthly (from before) get no reminder each month, only when overdue.
+    // email and SMS (respects the loan reminder preference), with the grace
+    // period and penalty after it. Loans repaid monthly (from before) get no
+    // reminder each month, only when overdue.
     const dueSoon = await query(
       `INSERT INTO notifications (user_id, type, title, message, severity, link, entity_type, entity_id, dedupe_key)
        SELECT u.id, 'payment_due', 'Loan payment due soon',
-              format('Your loan %s (%s) is due on %s.', l.loan_number, ${money}, to_char(i.due_date, 'FMMonth DD, YYYY')),
+              format('Your loan %s (%s) is due on %s.', l.loan_number, ${money}, to_char(i.due_date, 'FMMonth DD, YYYY'))
+                || CASE WHEN l.penalty_per_day > 0 THEN format(' %s-day grace, then %s a day.', l.grace_days, ${perDay}) ELSE '' END,
               'warning', '/loan-status', 'loan', l.id::text, 'installment-due-' || i.id
        FROM loan_installments i
        JOIN loans l ON l.id = i.loan_id AND l.status <> 'paid'
@@ -241,11 +280,14 @@ export async function refreshLoanStatuses({ force = false } = {}) {
        ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
        RETURNING user_id, title, message`
     );
-    // Member: installment overdue.
+    // Member: installment overdue. Within a loan's grace period, the member is
+    // told the last day to pay before the penalty starts.
     const overdue = await query(
       `INSERT INTO notifications (user_id, type, title, message, severity, link, entity_type, entity_id, dedupe_key)
        SELECT u.id, 'payment_overdue', 'Loan payment overdue',
-              format('Installment %s of loan %s (%s) was due on %s and is now overdue.', i.installment_number, l.loan_number, ${money}, to_char(i.due_date, 'FMMonth DD, YYYY')),
+              CASE WHEN l.penalty_per_day > 0 AND ${SQL_TODAY} <= i.due_date + l.grace_days
+                THEN format('Loan %s (%s) is overdue. Pay by %s to avoid a %s a day penalty.', l.loan_number, ${money}, to_char(i.due_date + l.grace_days, 'FMMonth DD, YYYY'), ${perDay})
+                ELSE format('Installment %s of loan %s (%s) was due on %s and is now overdue.', i.installment_number, l.loan_number, ${money}, to_char(i.due_date, 'FMMonth DD, YYYY')) END,
               'error', '/loan-status', 'loan', l.id::text, 'installment-overdue-' || i.id
        FROM loan_installments i
        JOIN loans l ON l.id = i.loan_id AND l.status <> 'paid'
@@ -254,11 +296,24 @@ export async function refreshLoanStatuses({ force = false } = {}) {
        ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
        RETURNING user_id, title, message`
     );
+    // Member: the grace period is over and the penalty runs, told once per loan.
+    const penalty = await query(
+      `INSERT INTO notifications (user_id, type, title, message, severity, link, entity_type, entity_id, dedupe_key)
+       SELECT u.id, 'loan_penalty', 'Loan penalty started',
+              format('Loan %s is past its %s-day grace period. %s is now added each day until it is paid in full.', l.loan_number, l.grace_days, ${perDay}),
+              'error', '/loan-status', 'loan', l.id::text, 'loan-penalty-' || l.id
+       FROM loans l
+       JOIN users u ON u.member_id = l.member_id AND u.account_status = 'ACTIVE'
+       WHERE l.status <> 'paid' AND l.balance > 0 AND l.penalty_per_day > 0 AND l.due_date + l.grace_days < ${SQL_TODAY}
+       ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+       RETURNING user_id, title, message`
+    );
     // Each reminder is created once per installment (dedupe key), so only the
     // new ones returned here are emailed and texted. Texts are queued; the
     // flush sends them now if it is daytime, else on a later refresh.
-    await emailNotifiedUsers([...dueSoon.rows, ...overdue.rows], loanReminderEmail);
-    await queueSmsForUsers([...dueSoon.rows, ...overdue.rows], loanReminderSms);
+    const reminders = [...dueSoon.rows, ...overdue.rows, ...penalty.rows];
+    await emailNotifiedUsers(reminders, loanReminderEmail);
+    await queueSmsForUsers(reminders, loanReminderSms);
     void flushSmsOutbox();
     // Admins: one notification per overdue installment.
     await query(
