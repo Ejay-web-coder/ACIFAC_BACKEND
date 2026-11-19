@@ -42,7 +42,7 @@ const { removeFile } = await import('../src/services/storage.js');
 class Rehearsal extends Error {}
 const STORED = /^(supabase|local):\/\/[^/]+\/.+$/;
 const ENTITY_TYPES = [
-  'machinery', 'machinery_operation', 'machinery_service', 'machinery_service_payment', 'machinery_service_rate', 'machinery_expense',
+  'machinery', 'machinery_operation', 'machinery_service', 'machinery_service_payment', 'machinery_service_rate', 'machinery_expense', 'machinery_bag_sale',
   'machinery_report_form', 'machinery_period_balance', 'rental_request',
   'kadiwa_sale', 'kadiwa_inventory', 'kadiwa_branch',
 ];
@@ -63,6 +63,7 @@ async function removeMachineryAndKadiwa(client) {
   await run('machinery services (with their payments)', 'DELETE FROM machinery_services');
   await run('rental requests', 'DELETE FROM rental_requests');
   await run('machinery expenses', 'DELETE FROM machinery_expenses');
+  await run('bag sales', 'DELETE FROM machinery_bag_sales');
   await run('machinery period balances', 'DELETE FROM machinery_period_balances');
   await run('PhilMech report forms', 'DELETE FROM machinery_report_forms');
   await run('machinery service rates', 'DELETE FROM machinery_service_rates');

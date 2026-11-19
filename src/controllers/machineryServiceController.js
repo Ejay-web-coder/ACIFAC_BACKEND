@@ -9,7 +9,7 @@ import { formatDateOnly, isValidDateOnly, todayDateOnly } from '../utils/dates.j
 import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import {
-  CLIENT_CATEGORIES, CROPPING_PERIODS, SERVICE_UNITS, FeeInputError, computeServiceFee, findRateForDate, rateForClient, toScaled,
+  CLIENT_CATEGORIES, CROPPING_PERIODS, SERVICE_UNITS, FeeInputError, computeServiceFee, findRateForDate, fromScaled, rateForClient, toScaled,
 } from '../services/machineryFees.js';
 import { EXPENSE_CATEGORIES, buildPhilmechReport } from '../services/philmechReport.js';
 
@@ -430,9 +430,156 @@ export async function deleteExpense(req, res) {
   return res.json({ success: true, message: 'Expense deleted.' });
 }
 
+// ----- Bags of palay from harvesting, and their sales -------------------------------------
+// Harvesting is charged in bags (unit per_100_bags). What a farmer has paid of
+// a harvest fee, divided by the value of one bag, is the bags handed to the
+// cooperative; the balance is the bags still to collect. The cooperative sells
+// the bags later at the price of the day, so every sale keeps its own price.
+
+const BAG_STOCK_LOCK = 'acifac-machinery-bag-stock';
+const MAX_BAGS = 100000;
+const MAX_PRICE_PER_BAG = 100000;
+
+const bagSaleSelect = `
+  SELECT b.id, b.sale_date AS "saleDate", b.bags, b.price_per_bag AS "pricePerBag", b.amount, b.buyer, b.notes,
+         u.username AS "recordedBy", b.created_at AS "createdAt", b.updated_at AS "updatedAt"
+  FROM machinery_bag_sales b LEFT JOIN users u ON u.id = b.recorded_by`;
+
+// All time, in bags with 2 decimals (BigInt hundredths). excludeSaleId leaves
+// out the sale being edited.
+async function bagStock(db, excludeSaleId = null) {
+  const row = (await db.query(
+    `SELECT
+       (SELECT COALESCE(SUM(ROUND(s.amount_paid / s.bag_value, 2)), 0) FROM machinery_services s
+         WHERE s.unit = 'per_100_bags' AND s.bag_value > 0) AS received,
+       (SELECT COALESCE(SUM(ROUND(s.balance / s.bag_value, 2)), 0) FROM machinery_services s
+         WHERE s.unit = 'per_100_bags' AND s.bag_value > 0) AS "toCollect",
+       (SELECT COALESCE(SUM(b.bags), 0) FROM machinery_bag_sales b WHERE $1::int IS NULL OR b.id <> $1) AS sold`,
+    [excludeSaleId]
+  )).rows[0];
+  const received = toScaled(row.received, 2, 'Bags received');
+  const sold = toScaled(row.sold, 2, 'Bags sold');
+  return { received, toCollect: toScaled(row.toCollect, 2, 'Bags to collect'), sold, onHand: received - sold };
+}
+
+const bagStockText = (stock) => Object.fromEntries(Object.entries(stock).map(([key, value]) => [key, fromScaled(value, 2)]));
+const bagsText = (scaled) => `${Number(fromScaled(scaled, 2)).toLocaleString('en-PH', { maximumFractionDigits: 2 })} bag${scaled === 100n ? '' : 's'}`;
+
+function readBagSaleInput(body) {
+  const bagsInput = typeof body.bags === 'number' ? String(body.bags) : String(body.bags ?? '').trim();
+  if (!bagsInput) throw badRequest('Enter the number of bags sold.');
+  let bags;
+  try {
+    bags = toScaled(bagsInput, 2, 'Bags sold');
+  } catch (error) {
+    throw badRequest(error.message);
+  }
+  if (bags === 0n) throw badRequest('Bags sold must be more than zero.');
+  if (bags > BigInt(MAX_BAGS) * 100n) throw badRequest(`Bags sold cannot be more than ${MAX_BAGS.toLocaleString('en-PH')}.`);
+  const priceCents = parseMoneyInput(body.pricePerBag, { max: MAX_PRICE_PER_BAG });
+  if (priceCents === null) throw badRequest(`Price per bag must be an amount above zero, up to ₱${MAX_PRICE_PER_BAG.toLocaleString('en-PH')}, with at most 2 decimals.`);
+  return {
+    saleDate: readDate(body.saleDate, 'sale date'),
+    bags,
+    pricePerBag: centsToString(priceCents),
+    buyer: cleanString(body.buyer, 200),
+    notes: cleanString(body.notes, 1000),
+  };
+}
+
+// A sale may not sell more bags than the cooperative holds. The lock keeps two
+// sales recorded at the same moment from both taking the last bags.
+async function assertBagsOnHand(db, bags, excludeSaleId = null) {
+  await db.query('SELECT pg_advisory_xact_lock(hashtext($1))', [BAG_STOCK_LOCK]);
+  const stock = await bagStock(db, excludeSaleId);
+  if (bags > stock.onHand) {
+    throw conflict(stock.onHand > 0n
+      ? `The cooperative has only ${bagsText(stock.onHand)} on hand, so ${bagsText(bags)} cannot be sold.`
+      : 'The cooperative has no bags on hand. Bags come from harvest fees paid under Services.');
+  }
+}
+
+const auditBagSale = (row) => ({ sale_date: row.saleDate, bags: row.bags, price_per_bag: row.pricePerBag, amount: row.amount, buyer: row.buyer, notes: row.notes });
+
+export async function listBagSales(req, res) {
+  const where = [];
+  const params = [];
+  if (req.query.year) {
+    params.push(readYear(req.query.year));
+    where.push(`b.sale_date BETWEEN make_date($${params.length}::int, 1, 1) AND make_date($${params.length}::int, 12, 31)`);
+  }
+  if (req.query.search) {
+    params.push(cleanString(req.query.search, 100));
+    where.push(`b.buyer ILIKE '%' || $${params.length} || '%'`);
+  }
+  const filter = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const [rows, totals, stock, last] = await Promise.all([
+    query(`${bagSaleSelect} ${filter} ORDER BY b.sale_date DESC, b.id DESC LIMIT 1000`, params),
+    query(`SELECT COUNT(*)::int AS count, COALESCE(SUM(b.bags), 0) AS bags, COALESCE(SUM(b.amount), 0) AS amount FROM machinery_bag_sales b ${filter}`, params),
+    bagStock({ query }),
+    query('SELECT price_per_bag AS "pricePerBag", sale_date AS "saleDate" FROM machinery_bag_sales ORDER BY sale_date DESC, id DESC LIMIT 1'),
+  ]);
+  const { count, bags, amount } = totals.rows[0];
+  const bagsScaled = toScaled(bags, 2, 'Bags');
+  // The average price of one bag over the sales listed (amount / bags, to centavos).
+  const averagePrice = bagsScaled > 0n ? centsToString(Number((BigInt(toCents(amount)) * 100n + bagsScaled / 2n) / bagsScaled)) : null;
+  return res.json({
+    success: true,
+    sales: rows.rows,
+    totals: { count, bags: fromScaled(bagsScaled, 2), amount: centsToString(toCents(amount)), averagePrice },
+    stock: bagStockText(stock),
+    lastSale: last.rows[0] ?? null,
+  });
+}
+
+export async function createBagSale(req, res) {
+  const input = readBagSaleInput(req.body || {});
+  const sale = await withTransaction(async (client) => {
+    await assertBagsOnHand(client, input.bags);
+    const id = (await client.query(
+      `INSERT INTO machinery_bag_sales (sale_date, bags, price_per_bag, buyer, notes, recorded_by)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [input.saleDate, fromScaled(input.bags, 2), input.pricePerBag, input.buyer, input.notes, currentUserId(req)]
+    )).rows[0].id;
+    const row = (await client.query(`${bagSaleSelect} WHERE b.id = $1`, [id])).rows[0];
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_BAG_SALE_RECORDED', module: 'Machinery', entityType: 'machinery_bag_sale', entityId: String(id), description: `Sold ${bagsText(input.bags)} of palay${input.buyer ? ` to ${input.buyer}` : ''} at ₱${Number(row.pricePerBag).toLocaleString('en-PH', { minimumFractionDigits: 2 })} a bag`, newValues: auditBagSale(row), ...getRequestMeta(req) });
+    return row;
+  });
+  return res.status(201).json({ success: true, sale });
+}
+
+export async function updateBagSale(req, res) {
+  const id = parseId(req.params.id, 'sale ID');
+  const input = readBagSaleInput(req.body || {});
+  const sale = await withTransaction(async (client) => {
+    const before = (await client.query(`${bagSaleSelect} WHERE b.id = $1 FOR UPDATE OF b`, [id])).rows[0];
+    if (!before) throw notFound('Bag sale not found.');
+    await assertBagsOnHand(client, input.bags, id);
+    await client.query(
+      'UPDATE machinery_bag_sales SET sale_date = $2, bags = $3, price_per_bag = $4, buyer = $5, notes = $6, updated_at = NOW() WHERE id = $1',
+      [id, input.saleDate, fromScaled(input.bags, 2), input.pricePerBag, input.buyer, input.notes]
+    );
+    const row = (await client.query(`${bagSaleSelect} WHERE b.id = $1`, [id])).rows[0];
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_BAG_SALE_UPDATED', module: 'Machinery', entityType: 'machinery_bag_sale', entityId: String(id), description: `Updated the sale of ${bagsText(input.bags)} of palay${input.buyer ? ` to ${input.buyer}` : ''}`, oldValues: auditBagSale(before), newValues: auditBagSale(row), ...getRequestMeta(req) });
+    return row;
+  });
+  return res.json({ success: true, sale });
+}
+
+export async function deleteBagSale(req, res) {
+  const id = parseId(req.params.id, 'sale ID');
+  await withTransaction(async (client) => {
+    const before = (await client.query(`${bagSaleSelect} WHERE b.id = $1 FOR UPDATE OF b`, [id])).rows[0];
+    if (!before) throw notFound('Bag sale not found.');
+    await client.query('DELETE FROM machinery_bag_sales WHERE id = $1', [id]);
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_BAG_SALE_DELETED', module: 'Machinery', entityType: 'machinery_bag_sale', entityId: String(id), description: `Deleted the sale of ${bagsText(toScaled(before.bags, 2, 'Bags'))} of palay of ${formatDateOnly(before.saleDate)}`, oldValues: auditBagSale(before), ...getRequestMeta(req) });
+  });
+  return res.json({ success: true, message: 'Bag sale deleted.' });
+}
+
 // ----- Rates ---------------------------------------------------------------------------------
 
-const auditRate = (row) => ({ machinery_id: row.machineryId, service_type: row.serviceType, unit: row.unit, member_rate: row.memberRate, non_member_rate: row.nonMemberRate, effective_from: row.effectiveFrom, effective_to: row.effectiveTo });
+const auditRate =(row) => ({ machinery_id: row.machineryId, service_type: row.serviceType, unit: row.unit, member_rate: row.memberRate, non_member_rate: row.nonMemberRate, effective_from: row.effectiveFrom, effective_to: row.effectiveTo });
 
 function readRateAmounts(body, partial = false) {
   const values = {};

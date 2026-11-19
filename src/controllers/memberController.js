@@ -224,6 +224,39 @@ export async function getMemberStatistics(req, res) {
   return res.status(200).json({ success: true, data: { ...row, totalShareCapital: Number(row.totalShareCapital) } });
 }
 
+// Loyalty awards: every active member with the full years of membership
+// completed on the award date (?asOf=YYYY-MM-DD, today if not given), longest
+// membership first. Members who joined after that day are left out. The award
+// date may be ahead, to prepare the awards for a coming general assembly.
+export async function getLoyaltyReport(req, res) {
+  const asOf = cleanString(req.query.asOf, 10) || todayDateOnly();
+  if (!isValidDateOnly(asOf)) throw badRequest('The award date must be a valid date (YYYY-MM-DD).');
+  const result = await query(
+    `SELECT m.id, m.member_number, TRIM(CONCAT_WS(' ', m.first_name, m.middle_name, m.last_name, m.suffix)) AS full_name,
+            m.membership_date, m.barangay, m.municipality,
+            EXTRACT(YEAR FROM age($1::date::timestamp, m.membership_date::timestamp))::int AS years
+     FROM members m
+     WHERE m.status = 'active' AND m.membership_date <= $1::date
+     ORDER BY m.membership_date ASC, m.id ASC`,
+    [asOf]
+  );
+  return res.status(200).json({
+    success: true,
+    data: {
+      asOf,
+      members: result.rows.map((row) => ({
+        id: Number(row.id),
+        memberNumber: row.member_number || '',
+        name: row.full_name || '',
+        membershipDate: row.membership_date,
+        years: Number(row.years),
+        barangay: row.barangay || '',
+        municipality: row.municipality || '',
+      })),
+    },
+  });
+}
+
 export async function getMember(req, res) {
   const id = parseId(req.params.id, 'member ID');
   const result = await query(`${memberSelect} WHERE m.id = $1`, [id]);

@@ -9,6 +9,7 @@ import {
   downloadMemberDocument,
   getMember,
   getMemberSavings,
+  getLoyaltyReport,
   getMemberStatistics,
   getMyMemberData,
   listArchivedMembers,
@@ -47,6 +48,8 @@ router.use(requireAdmin);
 router.get('/', listMembers);
 router.get('/statistics', getMemberStatistics);
 router.get('/archived', listArchivedMembers);
+// Loyalty awards: active members by full years of membership on the award date.
+router.get('/loyalty', getLoyaltyReport);
 router.get('/savings', listSavingsRecords);
 router.post('/savings', createSavingsRecord);
 router.post('/savings/withdrawals', createSavingsWithdrawal);

@@ -36,7 +36,18 @@ const forgotLimiter = rateLimit({
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { success: false, code: 'RESET_RATE_LIMITED', message: 'Too many verification code requests. Please try again later.' },
+  // Says when this device may ask again, like the database limits do.
+  message: (req) => {
+    const retryAfterSeconds = Math.max(1, Math.ceil(((req.rateLimit?.resetTime?.getTime() ?? Date.now() + 60 * 60 * 1000) - Date.now()) / 1000));
+    const minutes = Math.ceil(retryAfterSeconds / 60);
+    return {
+      success: false,
+      code: 'RESET_RATE_LIMITED',
+      retryAfterSeconds,
+      retryAt: new Date(Date.now() + retryAfterSeconds * 1000).toISOString(),
+      message: `Too many verification code requests. Please try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+    };
+  },
 });
 
 const verifyCodeLimiter = rateLimit({

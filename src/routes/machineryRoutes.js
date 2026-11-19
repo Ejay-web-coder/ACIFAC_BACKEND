@@ -4,8 +4,9 @@ import {
   createMachinery, createRentalRequest, getMachineryAvailability, listMachineryCatalog, listMachineryData, reviewRentalRequest, updateMachinery, updateOperationStatus,
 } from '../controllers/machineryController.js';
 import {
-  createExpense, createRate, createService, deleteExpense, deleteRate, deleteService, getReportForm, getService, listExpenses, listPeriodBalances, listRates,
-  listServices, philmechReport, quoteService, receivePayment, savePeriodBalance, saveReportForm, updateExpense, updateRate, updateService, voidPayment,
+  createBagSale, createExpense, createRate, createService, deleteBagSale, deleteExpense, deleteRate, deleteService, getReportForm, getService, listBagSales,
+  listExpenses, listPeriodBalances, listRates, listServices, philmechReport, quoteService, receivePayment, savePeriodBalance, saveReportForm, updateBagSale,
+  updateExpense, updateRate, updateService, voidPayment,
 } from '../controllers/machineryServiceController.js';
 
 const router = express.Router();
@@ -33,6 +34,11 @@ router.get('/expenses', requireAdmin, listExpenses);
 router.post('/expenses', requireAdmin, createExpense);
 router.patch('/expenses/:id', requireAdmin, updateExpense);
 router.delete('/expenses/:id', requireAdmin, deleteExpense);
+// Bags of palay from harvest fees: what the cooperative holds and its sales.
+router.get('/bag-sales', requireAdmin, listBagSales);
+router.post('/bag-sales', requireAdmin, createBagSale);
+router.patch('/bag-sales/:id', requireAdmin, updateBagSale);
+router.delete('/bag-sales/:id', requireAdmin, deleteBagSale);
 router.get('/period-balances', requireAdmin, listPeriodBalances);
 router.put('/period-balances', requireAdmin, savePeriodBalance);
 router.get('/reports/philmech', requireAdmin, philmechReport);

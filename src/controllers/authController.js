@@ -356,8 +356,28 @@ async function storeResetCode({ digest, userId, code, ip }) {
     if (usage.cooldown_seconds > 0) {
       return { limited: { code: 'RESET_CODE_COOLDOWN', retryAfterSeconds: usage.cooldown_seconds, message: `Please wait ${usage.cooldown_seconds} seconds before requesting another code.` } };
     }
-    if (usage.email_requests >= RESET_CODES_PER_EMAIL_PER_HOUR || usage.ip_requests >= RESET_CODES_PER_IP_PER_HOUR) {
-      return { limited: { code: 'RESET_RATE_LIMITED', message: 'Too many verification code requests. Please try again later.' } };
+    const emailLimited = usage.email_requests >= RESET_CODES_PER_EMAIL_PER_HOUR;
+    const ipLimited = usage.ip_requests >= RESET_CODES_PER_IP_PER_HOUR;
+    if (emailLimited || ipLimited) {
+      // The hour is rolling: a request is allowed again once the request that
+      // filled the limit is an hour old. When both limits are full, the later one.
+      const { rows: [free] } = await client.query(
+        `SELECT GREATEST(1, CEIL(EXTRACT(EPOCH FROM (GREATEST(
+           CASE WHEN $3 THEN (SELECT created_at FROM password_reset_codes WHERE email_digest = $1 AND created_at > NOW() - INTERVAL '1 hour' ORDER BY created_at DESC OFFSET $4 LIMIT 1) END,
+           CASE WHEN $5 THEN (SELECT created_at FROM password_reset_codes WHERE ip_address = $2 AND created_at > NOW() - INTERVAL '1 hour' ORDER BY created_at DESC OFFSET $6 LIMIT 1) END
+         ) + INTERVAL '1 hour' - NOW()))))::int AS retry_after_seconds`,
+        [digest, ip, emailLimited, RESET_CODES_PER_EMAIL_PER_HOUR - 1, ipLimited, RESET_CODES_PER_IP_PER_HOUR - 1]
+      );
+      const retryAfterSeconds = free?.retry_after_seconds || 60 * 60;
+      const minutes = Math.ceil(retryAfterSeconds / 60);
+      return {
+        limited: {
+          code: 'RESET_RATE_LIMITED',
+          retryAfterSeconds,
+          retryAt: new Date(Date.now() + retryAfterSeconds * 1000).toISOString(),
+          message: `Too many verification code requests. Please try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+        },
+      };
     }
     // Only the newest code for an address can be used.
     await client.query(

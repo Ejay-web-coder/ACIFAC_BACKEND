@@ -1042,6 +1042,70 @@ test('machinery services: dated rates, fees, payments, expenses and the PhilMech
   }
 });
 
+test('machinery bag sales: bags from paid harvest fees, sold at the price of the day', { skip }, async () => {
+  assert.equal((await member.get('/api/machinery/bag-sales')).status, 403);
+  const start = (await admin.get('/api/machinery/bag-sales')).data.stock;
+  const bags = (value) => Number(value);
+
+  // 200 bags harvested at the member rate of 10 per 100 bags: the fee is 20 bags
+  // of PHP 900. Half of it is paid, so the cooperative has received 10 bags.
+  const harvest = await admin.post('/api/machinery/services', {
+    machineryId: 'HK-02', serviceType: 'Harvesting', serviceDate: '2026-05-20', croppingPeriod: '1st', year: 2026,
+    clientCategory: 'member', memberDatabaseId: state.memberId, totalBags: '200', bagValue: '900', areaHa: '2', amountPaid: '9000',
+  });
+  assert.equal(harvest.status, 201, JSON.stringify(harvest.data));
+  assert.deepEqual([harvest.data.service.feeBags, harvest.data.service.feeAmount], ['20.00', '18000.00']);
+  let stock = (await admin.get('/api/machinery/bag-sales')).data.stock;
+  assert.equal(bags(stock.received), bags(start.received) + 10, 'paid harvest fees are bags received');
+  assert.equal(bags(stock.toCollect), bags(start.toCollect) + 10, 'the unpaid part is bags still to collect');
+  assert.equal(bags(stock.onHand), bags(start.onHand) + 10);
+
+  // Every sale has its own price per bag; amount = bags x price.
+  const tooMany = await admin.post('/api/machinery/bag-sales', { saleDate: '2026-06-01', bags: (bags(stock.onHand) + 1).toFixed(2), pricePerBag: '950' });
+  assert.equal(tooMany.status, 409, 'no more bags can be sold than the cooperative holds');
+  assert.match(tooMany.data.message, /on hand/);
+  const first = await admin.post('/api/machinery/bag-sales', { saleDate: '2026-06-01', bags: '4', pricePerBag: '950', buyer: 'Mindoro Rice Mill' });
+  assert.equal(first.status, 201, JSON.stringify(first.data));
+  assert.deepEqual([first.data.sale.bags, first.data.sale.pricePerBag, first.data.sale.amount, first.data.sale.buyer], ['4.00', '950.00', '3800.00', 'Mindoro Rice Mill']);
+  const second = await admin.post('/api/machinery/bag-sales', { saleDate: '2026-06-15', bags: '2.5', pricePerBag: '1020.50' });
+  assert.equal(second.status, 201, JSON.stringify(second.data));
+  assert.equal(second.data.sale.amount, '2551.25', 'the price changed for this sale');
+
+  for (const wrong of [{ bags: '0', pricePerBag: '900' }, { bags: '', pricePerBag: '900' }, { bags: '1', pricePerBag: '' }, { bags: '1', pricePerBag: '0' }, { bags: '1.234', pricePerBag: '900' }]) {
+    assert.equal((await admin.post('/api/machinery/bag-sales', { saleDate: '2026-06-01', ...wrong })).status, 400, JSON.stringify(wrong));
+  }
+  assert.equal((await admin.post('/api/machinery/bag-sales', { saleDate: '2099-01-01', bags: '1', pricePerBag: '900' })).status, 400, 'a sale cannot be dated in the future');
+
+  let list = (await admin.get('/api/machinery/bag-sales?year=2026')).data;
+  assert.deepEqual(list.sales.slice(0, 2).map((sale) => sale.id), [second.data.sale.id, first.data.sale.id], 'newest sale first');
+  assert.deepEqual(list.lastSale, { pricePerBag: '1020.50', saleDate: '2026-06-15' }, 'the last price is offered for the next sale');
+  stock = list.stock;
+  assert.equal(bags(stock.sold), bags(start.sold) + 6.5);
+  assert.equal(bags(stock.onHand), bags(start.onHand) + 3.5, 'received - sold');
+  assert.equal((await admin.get('/api/machinery/bag-sales?year=2025')).data.sales.length, 0);
+  const totals = (await admin.get('/api/machinery/bag-sales?year=2026&search=rice mill')).data.totals;
+  assert.deepEqual(totals, { count: 1, bags: '4.00', amount: '3800.00', averagePrice: '950.00' });
+
+  // An edit is checked against the bags on hand without the sale being edited.
+  const tooBig = await admin.patch(`/api/machinery/bag-sales/${first.data.sale.id}`, { saleDate: '2026-06-01', bags: (bags(stock.onHand) + 4.01).toFixed(2), pricePerBag: '950' });
+  assert.equal(tooBig.status, 409);
+  const edited = await admin.patch(`/api/machinery/bag-sales/${first.data.sale.id}`, { saleDate: '2026-06-01', bags: (bags(stock.onHand) + 4).toFixed(2), pricePerBag: '1000', buyer: 'Mindoro Rice Mill' });
+  assert.equal(edited.status, 200, JSON.stringify(edited.data));
+  assert.equal(bags((await admin.get('/api/machinery/bag-sales')).data.stock.onHand), 0, 'every bag on hand sold');
+
+  // Paying the rest of the harvest fee brings in the other 10 bags.
+  assert.equal((await admin.post(`/api/machinery/services/${harvest.data.service.id}/payments`, { amount: '9000', paymentDate: '2026-06-20' })).status, 201);
+  stock = (await admin.get('/api/machinery/bag-sales')).data.stock;
+  assert.equal(bags(stock.onHand), 10);
+  assert.equal(bags(stock.toCollect), bags(start.toCollect));
+
+  assert.equal((await admin.request('DELETE', `/api/machinery/bag-sales/${second.data.sale.id}`)).status, 200);
+  assert.equal((await admin.request('DELETE', `/api/machinery/bag-sales/${second.data.sale.id}`)).status, 404);
+  assert.equal(bags((await admin.get('/api/machinery/bag-sales')).data.stock.onHand), 12.5);
+  const audited = (await pool.query(`SELECT action FROM audit_logs WHERE entity_type = 'machinery_bag_sale' ORDER BY id`)).rows.map((row) => row.action);
+  assert.deepEqual([...new Set(audited)], ['MACHINERY_BAG_SALE_RECORDED', 'MACHINERY_BAG_SALE_UPDATED', 'MACHINERY_BAG_SALE_DELETED']);
+});
+
 test('machinery: the PhilMech report form is saved per cropping', { skip }, async () => {
   const url = '/api/machinery/reports/philmech/form';
   assert.equal((await member.get(`${url}?croppingPeriod=1st&year=2026`)).status, 403);
@@ -3483,18 +3547,37 @@ test('password reset: hourly limits per address and per device', { skip }, async
   await createLoginUser('flood', 'flood@acifac.local', 'FloodPass1!');
   const client = new Client('10.0.5.1');
   const statuses = [];
+  let last;
   for (let attempt = 0; attempt < 6; attempt += 1) {
     await pool.query(`UPDATE password_reset_codes SET created_at = created_at - INTERVAL '61 seconds' WHERE ip_address = '10.0.5.1'`);
-    statuses.push((await client.post('/api/auth/forgot-password', { email: 'flood@acifac.local' })).status);
+    last = await client.post('/api/auth/forgot-password', { email: 'flood@acifac.local' });
+    statuses.push(last.status);
   }
   assert.deepEqual(statuses, [200, 200, 200, 200, 200, 429]);
+  // The refusal says when a code can be asked for again: when the oldest of
+  // the 5 (now 5 x 61 s old) is an hour old.
+  assert.equal(last.data.code, 'RESET_RATE_LIMITED');
+  assert.ok(last.data.retryAfterSeconds > 3285 && last.data.retryAfterSeconds <= 3295, String(last.data.retryAfterSeconds));
+  assert.equal(last.headers.get('retry-after'), String(last.data.retryAfterSeconds));
+  assert.match(last.data.message, /Please try again in 55 minutes\.$/);
+  assert.ok(Math.abs(Date.parse(last.data.retryAt) - (Date.now() + last.data.retryAfterSeconds * 1000)) < 5000);
+  // Asking while refused does not use up anything: the wait stays the same.
+  const again = await client.post('/api/auth/forgot-password', { email: 'flood@acifac.local' });
+  assert.equal(again.status, 429);
+  assert.ok(Math.abs(again.data.retryAfterSeconds - last.data.retryAfterSeconds) <= 2);
 
   // Refused addresses use up the device's allowance too (15 an hour), so the
   // form cannot be used to find out which addresses have accounts in bulk.
   const prober = new Client('10.0.5.2');
   const probes = [];
-  for (let attempt = 0; attempt < 16; attempt += 1) probes.push((await prober.post('/api/auth/forgot-password', { email: `probe${attempt}@acifac.local` })).status);
+  let lastProbe;
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    lastProbe = await prober.post('/api/auth/forgot-password', { email: `probe${attempt}@acifac.local` });
+    probes.push(lastProbe.status);
+  }
   assert.deepEqual(probes, [...Array(15).fill(404), 429]);
+  // The device limit frees up when its oldest request is an hour old.
+  assert.ok(lastProbe.data.retryAfterSeconds > 3500 && lastProbe.data.retryAfterSeconds <= 3600, String(lastProbe.data.retryAfterSeconds));
 });
 
 test('sessions: 20 minutes without activity ends the session on the server', { skip }, async () => {
