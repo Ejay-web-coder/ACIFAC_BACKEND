@@ -15,6 +15,7 @@ import { maskPhilippineMobile, normalizePhilippineMobile } from '../utils/phone.
 import { forgetTemporaryPassword, notifyUser } from '../services/notificationService.js';
 import { clearFailures, findActiveLock, registerFailure, throttleKeys } from '../services/loginThrottle.js';
 import { findAccountsByEmail, findAccountsByPhone } from '../services/accountLookup.js';
+import { ACCOUNT_INACTIVE_MESSAGE, IDLE_TIMEOUT_SECONDS, loadSession, SESSION_EXPIRED_MESSAGE } from '../middleware/auth.js';
 import { emailConflict, phoneConflict } from './adminAccountController.js';
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -632,6 +633,64 @@ export async function resetPassword(req, res) {
 export async function sessionStatus(req, res) {
   const { idleTimeoutSeconds, idleExpiresInSeconds, sessionExpiresInSeconds } = req.authSession;
   return res.status(200).json({ success: true, idleTimeoutSeconds, idleExpiresInSeconds, sessionExpiresInSeconds });
+}
+
+// POST /api/auth/unlock {password}: "Stay logged in" on a session locked after
+// 20 minutes without activity. The password is checked as at sign-in, with the
+// same lockout (the 3rd wrong password in a row locks the account for 20
+// minutes), and the session goes on as it was: same cookie, same 8-hour expiry.
+// Not behind requireAuth, which refuses locked sessions.
+export async function unlockSession(req, res) {
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (!password) throw badRequest('Enter your password.');
+
+  const session = await loadSession(req.cookies?.session_token);
+  if (!session) {
+    res.clearCookie('session_token', buildAuthCookieOptions({ includeMaxAge: false }));
+    return res.status(401).json({ success: false, code: 'SESSION_INVALID', message: SESSION_EXPIRED_MESSAGE });
+  }
+  if (session.account_status !== 'ACTIVE') {
+    await query('UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL', [session.user_id]);
+    res.clearCookie('session_token', buildAuthCookieOptions({ includeMaxAge: false }));
+    return res.status(401).json({ success: false, code: 'ACCOUNT_INACTIVE', message: ACCOUNT_INACTIVE_MESSAGE });
+  }
+
+  const auditUser = { id: session.user_id, username: session.username, role: session.role };
+  const audit = (entry) => createAuditLog({ user: auditUser, module: 'Authentication', entityType: 'user', entityId: String(session.user_id), ...getRequestMeta(req), ...entry });
+  const accountKey = throttleKeys.user(session.user_id);
+
+  // A locked account stays locked here too, so this is no way around the lockout.
+  const activeLock = await findActiveLock([accountKey]);
+  if (activeLock) {
+    await audit({ action: 'LOGIN_BLOCKED', description: 'Unlock attempt while sign-in is locked', status: 'FAILED', details: { reason: 'account_locked', during: 'unlock', retry_after_seconds: activeLock.retryAfterSeconds } });
+    return sendLoginLocked(res, activeLock);
+  }
+
+  const stored = (await query('SELECT password_hash FROM users WHERE id = $1', [session.user_id])).rows[0];
+  if (!(await verifyPassword(password, stored?.password_hash || await getDummyHash()))) {
+    const account = await registerFailure(accountKey, { ...ACCOUNT_LIMITS, userId: session.user_id });
+    await audit({ action: 'LOGIN_FAILURE', description: 'Wrong password while unlocking the session', status: 'FAILED', details: { reason: 'invalid_password', during: 'unlock', attempts_remaining: account.attemptsRemaining } });
+    if (account.locked) {
+      await audit({ action: 'LOGIN_LOCKED', description: `Sign-in locked for ${LOGIN_LOCK_MINUTES} minutes after ${LOGIN_MAX_FAILED_ATTEMPTS} failed attempts`, status: 'FAILED', details: { during: 'unlock', locked_until: account.lockedUntil } });
+      return sendLoginLocked(res, account);
+    }
+    return res.status(400).json({ success: false, code: 'INVALID_PASSWORD', message: 'Incorrect password.', attemptsRemaining: account.attemptsRemaining });
+  }
+
+  await withTransaction(async (client) => {
+    await client.query('UPDATE sessions SET locked_at = NULL, last_activity_at = NOW() WHERE id = $1', [session.session_id]);
+    // A correct password resets the failed-attempt count, as at sign-in.
+    await clearFailures(accountKey, client);
+  });
+  if (session.locked) await audit({ action: 'SESSION_UNLOCKED', description: 'Entered the password again after inactivity and continued the session' });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Welcome back.',
+    idleTimeoutSeconds: IDLE_TIMEOUT_SECONDS,
+    idleExpiresInSeconds: IDLE_TIMEOUT_SECONDS,
+    sessionExpiresInSeconds: session.session_expires_in_seconds,
+  });
 }
 
 // POST /change-password/code {channel: 'email' | 'sms'}: a code a signed-in

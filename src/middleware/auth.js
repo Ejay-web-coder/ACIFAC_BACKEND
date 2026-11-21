@@ -14,19 +14,22 @@ const PASSWORD_CHANGE_ALLOWED_GET = new Set(['/api/notifications']);
 const PASSIVE_PATHS = new Set(['/api/events', '/api/events/changes']);
 // last_activity_at is written at most this often per session.
 const ACTIVITY_WRITE_INTERVAL_SECONDS = 30;
-const IDLE_TIMEOUT_SECONDS = SESSION_IDLE_TIMEOUT_MINUTES * 60;
+export const IDLE_TIMEOUT_SECONDS = SESSION_IDLE_TIMEOUT_MINUTES * 60;
 
 export const SESSION_EXPIRED_MESSAGE = 'Your session has expired. Please log in again.';
-export const SESSION_IDLE_MESSAGE = 'Your session expired because of inactivity. Please log in again.';
+export const SESSION_LOCKED_MESSAGE = `Your session was locked after ${SESSION_IDLE_TIMEOUT_MINUTES} minutes without activity. Enter your password to continue.`;
+export const ACCOUNT_INACTIVE_MESSAGE = 'Your account is inactive or locked. Please contact the ACIFAC office.';
 
-// The session for a cookie token with its user, including idle sessions
-// (idle_expired = true); null when there is no live session.
+// The session for a cookie token with its user, including locked sessions
+// (locked = true: idle past the timeout, or already recorded as locked); null
+// when there is no live session.
 export async function loadSession(sessionToken) {
   if (!sessionToken || typeof sessionToken !== 'string' || sessionToken.length > 200) return null;
   const result = await query(
     `SELECT s.id AS session_id, s.expires_at,
-            -- Kadiwa vendors are never signed out for inactivity (see VENDOR_SESSION_TTL_MS).
-            (u.role <> 'VENDOR' AND s.last_activity_at <= NOW() - make_interval(mins => $2)) AS idle_expired,
+            -- Kadiwa vendors are never locked for inactivity (see VENDOR_SESSION_TTL_MS).
+            (u.role <> 'VENDOR' AND (s.locked_at IS NOT NULL OR s.last_activity_at <= NOW() - make_interval(mins => $2))) AS locked,
+            s.locked_at IS NOT NULL AS lock_recorded,
             s.last_activity_at < NOW() - make_interval(secs => $3) AS activity_stale,
             GREATEST(0, CEIL(EXTRACT(EPOCH FROM (s.last_activity_at + make_interval(mins => $2) - NOW()))))::int AS idle_expires_in_seconds,
             GREATEST(0, CEIL(EXTRACT(EPOCH FROM (s.expires_at - NOW()))))::int AS session_expires_in_seconds,
@@ -43,27 +46,39 @@ export async function loadSession(sessionToken) {
   return result.rows[0] || null;
 }
 
-// The signed-in user for a session cookie, or null when the session has
-// ended, expired or been idle for too long.
-export async function loadSessionUser(sessionToken) {
-  const session = await loadSession(sessionToken);
-  return session && !session.idle_expired ? session : null;
-}
-
-// Revokes a session that went idle past the timeout and records it (once).
-export async function endIdleSession(session, meta = {}) {
-  const revoked = await query('UPDATE sessions SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL', [session.session_id]);
-  if (!revoked.rowCount) return;
+// Records that a session idle past the timeout is locked, and audits it, once.
+// The idle condition is checked again, so a request that just counted as
+// activity is never overtaken.
+export async function lockIdleSession(session, meta = {}) {
+  if (session.lock_recorded) return;
+  const locked = await query(
+    `UPDATE sessions SET locked_at = last_activity_at + make_interval(mins => $2)
+     WHERE id = $1 AND locked_at IS NULL AND revoked_at IS NULL AND last_activity_at <= NOW() - make_interval(mins => $2)`,
+    [session.session_id, SESSION_IDLE_TIMEOUT_MINUTES]
+  );
+  if (!locked.rowCount) return;
   await createAuditLog({
     user: { id: session.user_id, username: session.username, role: session.role },
-    action: 'SESSION_EXPIRED',
+    action: 'SESSION_LOCKED',
     module: 'Authentication',
     entityType: 'user',
     entityId: String(session.user_id),
-    description: `Signed out after ${SESSION_IDLE_TIMEOUT_MINUTES} minutes of inactivity`,
+    description: `Session locked after ${SESSION_IDLE_TIMEOUT_MINUTES} minutes of inactivity`,
     details: { reason: 'inactivity' },
     ...meta,
   });
+}
+
+// Whose locked session it is, for the lock screen after a page reload.
+async function lockedAccount(userId) {
+  const row = (await query(
+    `SELECT u.username,
+            COALESCE(NULLIF(TRIM(u.full_name), ''), NULLIF(TRIM(CONCAT_WS(' ', m.first_name, m.middle_name, m.last_name, m.suffix)), ''), u.username) AS display_name
+     FROM users u LEFT JOIN members m ON m.id = u.member_id
+     WHERE u.id = $1`,
+    [userId]
+  )).rows[0];
+  return { username: row?.username ?? null, display_name: row?.display_name ?? null, idleTimeoutSeconds: IDLE_TIMEOUT_SECONDS };
 }
 
 // For GET /api/auth/me, which the page calls on every load to ask whether anyone
@@ -81,24 +96,31 @@ function refuseSession(req, res, code, message) {
   return res.status(401).json({ success: false, code, message });
 }
 
+// A locked session keeps its cookie: it goes on once the password is entered again.
+async function refuseLocked(req, res, session) {
+  if (!req.allowSignedOut) return res.status(401).json({ success: false, code: 'SESSION_LOCKED', message: SESSION_LOCKED_MESSAGE });
+  return res.status(200).json({ success: true, user: null, code: 'SESSION_LOCKED', message: SESSION_LOCKED_MESSAGE, locked: await lockedAccount(session.user_id) });
+}
+
 export async function requireAuth(req, res, next) {
   try {
     const session = await loadSession(req.cookies?.session_token);
 
     if (!session) return refuseSession(req, res, 'SESSION_INVALID', SESSION_EXPIRED_MESSAGE);
 
-    if (session.idle_expired) {
-      await endIdleSession(session, getRequestMeta(req));
-      return refuseSession(req, res, 'SESSION_IDLE_TIMEOUT', SESSION_IDLE_MESSAGE);
-    }
-
+    // A deactivated account ends the session, locked or not.
     if (session.account_status !== 'ACTIVE') {
       await query('UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL', [session.user_id]);
-      return refuseSession(req, res, 'ACCOUNT_INACTIVE', 'Your account is inactive or locked. Please contact the ACIFAC office.');
+      return refuseSession(req, res, 'ACCOUNT_INACTIVE', ACCOUNT_INACTIVE_MESSAGE);
+    }
+
+    if (session.locked) {
+      await lockIdleSession(session, getRequestMeta(req));
+      return await refuseLocked(req, res, session);
     }
 
     const path = req.originalUrl.split('?')[0];
-    const { idle_expired: _idle, activity_stale: activityStale, idle_expires_in_seconds: idleExpiresInSeconds, session_expires_in_seconds: sessionExpiresInSeconds, ...user } = session;
+    const { locked: _locked, lock_recorded: _lockRecorded, activity_stale: activityStale, idle_expires_in_seconds: idleExpiresInSeconds, session_expires_in_seconds: sessionExpiresInSeconds, ...user } = session;
     const passive = PASSIVE_PATHS.has(path) || req.get('x-session-activity') === 'passive';
     const touch = !passive && activityStale;
     if (touch) await query('UPDATE sessions SET last_activity_at = NOW() WHERE id = $1', [session.session_id]);

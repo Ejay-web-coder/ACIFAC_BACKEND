@@ -13,14 +13,17 @@ React (Vercel)  →  Express API (this repo)  →  Supabase PostgreSQL (+ privat
   * the 3rd wrong password in a row locks that account for 20 minutes, whichever sign-in name is used;
     names with no account lock the same way, and each client address is locked after
     `LOGIN_IP_MAX_FAILURES` (default 20) failures (`login_throttles`);
-  * a session ends after 20 minutes without activity (`sessions.last_activity_at`). Requests sent with
+  * a session is locked after 20 minutes without activity (`sessions.last_activity_at`, `locked_at`):
+    every request answers 401 `SESSION_LOCKED` and the cookie is kept until the person enters their password
+    (`POST /api/auth/unlock`; wrong passwords count toward the lockout above). A locked session still ends at
+    its 8-hour expiry or at logout; Kadiwa vendor sessions are never locked. Requests sent with
     `X-Session-Activity: passive` (the browser's background refreshes) and the live-update stream don't count;
   * forgot password emails a 6-digit code (bcrypt-hashed in `password_reset_codes`, 10 minutes, 5 attempts,
     60-second resend cooldown, 5 codes per address and `RESET_CODES_PER_IP_PER_HOUR` (default 15) per client
     address per hour). Every address gets the same reply. A verified code sets a short-lived httpOnly
     `password_reset_grant` cookie that allows one password change. The change ends all sessions and lifts a
     lockout. Emailed links (account setup, office resets) still use `password_reset_tokens`.
-  * Endpoints: `POST /api/auth/login`, `/logout`, `/forgot-password`, `/verify-reset-code`,
+  * Endpoints: `POST /api/auth/login`, `/logout`, `/unlock`, `/forgot-password`, `/verify-reset-code`,
     `/reset-password`; `GET /api/auth/me`, `/session`.
 * Money is calculated in PostgreSQL `NUMERIC` or integer centavos, never floating point.
 * Live updates: database triggers → `pg_notify` → one `LISTEN` connection → Server-Sent Events

@@ -1,7 +1,7 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import {
-  changePassword, forgotPassword, login, logout, me, resetPassword, sendPasswordChangeCode, sessionStatus, updateNotificationPreferences, updateProfile,
+  changePassword, forgotPassword, login, logout, me, resetPassword, sendPasswordChangeCode, sessionStatus, unlockSession, updateNotificationPreferences, updateProfile,
   verifyResetCode,
 } from '../controllers/authController.js';
 import { deleteProfilePhoto, getProfilePhoto, uploadProfilePhoto } from '../controllers/profilePhotoController.js';
@@ -63,6 +63,9 @@ router.post('/logout', logout);
 // Signed out is 200 with user null here (see allowSignedOut).
 router.get('/me', allowSignedOut, requireAuth, me);
 router.get('/session', requireAuth, sessionStatus);
+// "Stay logged in" after 20 minutes without activity: the password unlocks the
+// session. It counts toward the same per-address flood guard as sign-in.
+router.post('/unlock', loginLimiter, unlockSession);
 router.post('/forgot-password', forgotLimiter, forgotPassword);
 router.post('/verify-reset-code', verifyCodeLimiter, verifyResetCode);
 router.post('/reset-password', resetLimiter, resetPassword);

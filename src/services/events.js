@@ -1,5 +1,5 @@
 import { createDedicatedClient, query } from '../config/db.js';
-import { endIdleSession, loadSession } from '../middleware/auth.js';
+import { loadSession, lockIdleSession } from '../middleware/auth.js';
 import { getRequestMeta } from '../utils/http.js';
 
 // Live updates: PostgreSQL triggers call pg_notify('acifac_events', {table, op,
@@ -151,14 +151,19 @@ export function eventStream(req, res) {
   connections.add(connection);
 
   // The heartbeat also re-checks the session so a revoked, deactivated or
-  // idle (timed-out) session stops receiving updates within one interval.
-  // It never counts as activity itself.
+  // locked (idle for 20 minutes) session stops receiving updates within one
+  // interval. It never counts as activity itself.
   const heartbeat = setInterval(async () => {
     try {
       const session = await loadSession(req.cookies?.session_token);
-      if (!session || session.idle_expired || session.account_status !== 'ACTIVE') {
-        if (session?.idle_expired) await endIdleSession(session, getRequestMeta(req));
-        res.write(`event: session-ended\ndata: ${JSON.stringify({ reason: session?.idle_expired ? 'inactivity' : 'ended' })}\n\n`);
+      if (!session || session.account_status !== 'ACTIVE') {
+        res.write(`event: session-ended\ndata: ${JSON.stringify({ reason: 'ended' })}\n\n`);
+        res.end();
+        return;
+      }
+      if (session.locked) {
+        await lockIdleSession(session, getRequestMeta(req));
+        res.write('event: session-locked\ndata: {}\n\n');
         res.end();
         return;
       }

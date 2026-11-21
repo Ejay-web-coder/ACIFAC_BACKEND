@@ -6,7 +6,7 @@ jest.unstable_mockModule('../../src/config/db.js', () => db.module);
 const { requireAuth, requireAdmin, requireMember, requireVendor } = await import('../../src/middleware/auth.js');
 const { csrfProtection } = await import('../../src/middleware/security.js');
 
-const liveSession = { session_id: 11, user_id: 7, username: 'juan.delacruz', role: 'MEMBER', member_id: 3, account_status: 'ACTIVE', must_change_password: false, idle_expired: false, activity_stale: false, idle_expires_in_seconds: 900, session_expires_in_seconds: 20000 };
+const liveSession = { session_id: 11, user_id: 7, username: 'juan.delacruz', role: 'MEMBER', member_id: 3, account_status: 'ACTIVE', must_change_password: false, locked: false, lock_recorded: false, activity_stale: false, idle_expires_in_seconds: 900, session_expires_in_seconds: 20000 };
 function sessionIs(row) {
   db.module.query.mockImplementation(async (sql) => (sql.includes('FROM sessions s') ? { rows: row ? [row] : [] } : { rows: [], rowCount: 1 }));
 }
@@ -33,12 +33,33 @@ describe('Access control (requireAuth, role guards, CSRF)', () => {
     expect(ended.body.code).toBe('SESSION_INVALID');
   });
 
-  test('a session idle for 20 minutes is ended', async () => {
-    sessionIs({ ...liveSession, idle_expired: true });
+  test('a session idle for 20 minutes is locked until the password is entered again', async () => {
+    sessionIs({ ...liveSession, locked: true });
     const res = mockResponse();
-    await requireAuth(page('/api/members/me'), res, jest.fn());
+    const next = jest.fn();
+    await requireAuth(page('/api/members/me'), res, next);
+    expect(next).not.toHaveBeenCalled();
     expect(res.statusCode).toBe(401);
-    expect(res.body).toMatchObject({ code: 'SESSION_IDLE_TIMEOUT', message: 'Your session expired because of inactivity. Please log in again.' });
+    expect(res.body).toEqual({ success: false, code: 'SESSION_LOCKED', message: 'Your session was locked after 20 minutes without activity. Enter your password to continue.' });
+    // The cookie stays, so the same session can go on after the password.
+    expect(res.cleared).toEqual([]);
+    expect(db.module.query).toHaveBeenCalledWith(expect.stringContaining('SET locked_at'), [11, 20]);
+    expect(db.module.query).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO audit_logs'), expect.arrayContaining(['SESSION_LOCKED']));
+  });
+
+  test('edge case: the lock is recorded once, and the page reload gets whose session it is', async () => {
+    db.module.query.mockImplementation(async (sql) => {
+      if (sql.includes('FROM sessions s')) return { rows: [{ ...liveSession, locked: true, lock_recorded: true }] };
+      if (sql.includes('LEFT JOIN members m')) return { rows: [{ username: 'juan.delacruz', display_name: 'Juan Dela Cruz' }] };
+      return { rows: [], rowCount: 1 };
+    });
+    const req = page('/api/auth/me');
+    req.allowSignedOut = true;
+    const res = mockResponse();
+    await requireAuth(req, res, jest.fn());
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ user: null, code: 'SESSION_LOCKED', locked: { username: 'juan.delacruz', display_name: 'Juan Dela Cruz', idleTimeoutSeconds: 1200 } });
+    expect(db.module.query).not.toHaveBeenCalledWith(expect.stringContaining('SET locked_at'), expect.anything());
   });
 
   test('a deactivated account is signed out', async () => {

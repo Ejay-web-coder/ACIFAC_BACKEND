@@ -3580,8 +3580,8 @@ test('password reset: hourly limits per address and per device', { skip }, async
   assert.ok(lastProbe.data.retryAfterSeconds > 3500 && lastProbe.data.retryAfterSeconds <= 3600, String(lastProbe.data.retryAfterSeconds));
 });
 
-test('sessions: 20 minutes without activity ends the session on the server', { skip }, async () => {
-  await createLoginUser('idleuser', 'idle@acifac.local', 'IdlePass1!');
+test('sessions: 20 minutes without activity locks the session until the password is entered again', { skip }, async () => {
+  const userId = await createLoginUser('idleuser', 'idle@acifac.local', 'IdlePass1!');
   const browser = new Client('10.0.6.1');
   assert.equal((await browser.post('/api/auth/login', { usernameOrEmail: 'idleuser', password: 'IdlePass1!' })).status, 200);
   const token = browser.cookies.get('session_token');
@@ -3589,6 +3589,8 @@ test('sessions: 20 minutes without activity ends the session on the server', { s
   const digest = createHash('sha256').update(token).digest('hex');
   const setIdle = (minutes) => pool.query(`UPDATE sessions SET last_activity_at = NOW() - make_interval(mins => $2) WHERE token_digest = $1`, [digest, minutes]);
   const idleSeconds = async () => (await pool.query(`SELECT EXTRACT(EPOCH FROM NOW() - last_activity_at)::int AS s FROM sessions WHERE token_digest = $1`, [digest])).rows[0].s;
+  const sessionRow = async () => (await pool.query('SELECT revoked_at, locked_at FROM sessions WHERE token_digest = $1', [digest])).rows[0];
+  const audits = async (action) => (await pool.query(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE action = $1 AND user_name_snapshot = 'idleuser'`, [action])).rows[0].n;
 
   const status = await browser.get('/api/auth/session');
   assert.equal(status.status, 200);
@@ -3610,43 +3612,74 @@ test('sessions: 20 minutes without activity ends the session on the server', { s
   assert.equal((await browser.get('/api/auth/me')).status, 200);
   assert.ok(await idleSeconds() < 5, 'activity recorded');
 
-  // 20 minutes idle: refused, cookie cleared, session revoked and recorded.
+  // 20 minutes idle: every request is refused as locked, but the session and
+  // its cookie stay, so the person can go on after entering the password.
   await setIdle(21);
-  const expired = await browser.get('/api/notifications');
-  assert.equal(expired.status, 401);
-  assert.equal(expired.data.code, 'SESSION_IDLE_TIMEOUT');
-  assert.equal(expired.data.message, 'Your session expired because of inactivity. Please log in again.');
+  const locked = await browser.get('/api/notifications');
+  assert.equal(locked.status, 401);
+  assert.equal(locked.data.code, 'SESSION_LOCKED');
+  assert.equal(locked.data.message, 'Your session was locked after 20 minutes without activity. Enter your password to continue.');
+  assert.equal(browser.cookies.get('session_token'), token, 'cookie kept');
+  assert.equal((await sessionRow()).revoked_at, null, 'not ended');
+  assert.ok((await sessionRow()).locked_at, 'lock recorded');
+  assert.equal(await audits('SESSION_LOCKED'), 1);
+
+  // Nothing gets through while locked (the status check and changes included), and it is recorded once.
+  for (const url of ['/api/auth/session', '/api/notifications', '/api/members']) assert.equal((await browser.get(url)).data.code, 'SESSION_LOCKED', url);
+  assert.equal((await browser.patch('/api/auth/notification-preferences', { emailNotifications: false })).status, 401);
+  assert.equal(await audits('SESSION_LOCKED'), 1, 'recorded once');
+
+  // The page's sign-in check after a reload: 200, no user, and whose session it is (for the lock screen).
+  const lockedMe = await browser.get('/api/auth/me');
+  assert.equal(lockedMe.status, 200, 'locked is not an error on /me');
+  assert.equal(lockedMe.data.user, null);
+  assert.equal(lockedMe.data.code, 'SESSION_LOCKED');
+  assert.deepEqual(lockedMe.data.locked, { username: 'idleuser', display_name: 'idleuser', idleTimeoutSeconds: 1200 });
+  assert.equal(browser.cookies.get('session_token'), token, 'cookie kept on /me');
+
+  // A wrong password keeps it locked and counts as a failed attempt, as at sign-in.
+  const wrong = await browser.post('/api/auth/unlock', { password: 'WrongPass1!' });
+  assert.equal(wrong.status, 400);
+  assert.equal(wrong.data.code, 'INVALID_PASSWORD');
+  assert.equal(wrong.data.attemptsRemaining, 2);
+  assert.equal((await browser.get('/api/notifications')).status, 401, 'still locked');
+
+  // "Stay logged in" with the right password: the same session goes on, with a fresh 20 minutes.
+  const unlocked = await browser.post('/api/auth/unlock', { password: 'IdlePass1!' });
+  assert.equal(unlocked.status, 200);
+  assert.equal(unlocked.data.idleExpiresInSeconds, 1200);
+  assert.equal(browser.cookies.get('session_token'), token, 'same session');
+  assert.equal((await sessionRow()).locked_at, null);
+  assert.ok(await idleSeconds() < 5, 'activity recorded');
+  assert.equal((await browser.get('/api/notifications')).status, 200);
+  assert.equal((await browser.get('/api/auth/me')).data.user.username, 'idleuser');
+  assert.equal(await audits('SESSION_UNLOCKED'), 1);
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM login_throttles WHERE throttle_key = $1', [`user:${userId}`])).rows[0].n, 0, 'failed attempts cleared');
+
+  // Three wrong passwords in a row lock sign-in for 20 minutes: here, and on the login page.
+  await setIdle(21);
+  assert.equal((await browser.get('/api/notifications')).data.code, 'SESSION_LOCKED');
+  assert.equal((await browser.post('/api/auth/unlock', { password: 'WrongPass1!' })).data.attemptsRemaining, 2);
+  assert.equal((await browser.post('/api/auth/unlock', { password: 'WrongPass1!' })).data.attemptsRemaining, 1);
+  const third = await browser.post('/api/auth/unlock', { password: 'WrongPass1!' });
+  assert.equal(third.status, 429);
+  assert.equal(third.data.code, 'LOGIN_LOCKED');
+  assert.ok(third.data.retryAfterSeconds > 1190, String(third.data.retryAfterSeconds));
+  assert.equal((await browser.post('/api/auth/unlock', { password: 'IdlePass1!' })).status, 429, 'the right password waits for the lock too');
+  assert.equal((await new Client('10.0.6.4').post('/api/auth/login', { usernameOrEmail: 'idleuser', password: 'IdlePass1!' })).status, 429, 'login page locked as well');
+  assert.equal((await sessionRow()).revoked_at, null, 'still only locked');
+
+  // Log out works on a locked session, and an ended session cannot be unlocked.
+  assert.equal((await browser.post('/api/auth/logout')).status, 200);
+  assert.ok((await sessionRow()).revoked_at, 'ended');
   assert.equal(browser.cookies.has('session_token'), false, 'cookie cleared');
-  assert.ok((await pool.query('SELECT revoked_at FROM sessions WHERE token_digest = $1', [digest])).rows[0].revoked_at);
-  const expiries = `SELECT COUNT(*)::int AS n FROM audit_logs WHERE action = 'SESSION_EXPIRED' AND user_name_snapshot = 'idleuser'`;
-  assert.equal((await pool.query(expiries)).rows[0].n, 1);
-
-  // A refresh (or a copy of the old cookie) cannot bring it back.
+  await pool.query('DELETE FROM login_throttles WHERE throttle_key = $1', [`user:${userId}`]);
   const stale = new Client('10.0.6.1');
-  for (const url of ['/api/auth/session', '/api/notifications']) {
-    stale.cookies.set('session_token', token);
-    assert.equal((await stale.get(url)).status, 401, url);
-  }
   stale.cookies.set('session_token', token);
-  const staleMe = await stale.get('/api/auth/me');
-  assert.equal(staleMe.status, 200, 'signed out is not an error on /me');
-  assert.equal(staleMe.data.user, null);
-  assert.equal(stale.cookies.has('session_token'), false, 'cookie cleared');
-  assert.equal((await pool.query(expiries)).rows[0].n, 1, 'recorded once');
-
-  // The page's sign-in check on load: an idle session gets 200, no user and the
-  // reason (so the login page can say why), and the session still ends.
-  const reopened = new Client('10.0.6.2');
-  assert.equal((await reopened.post('/api/auth/login', { usernameOrEmail: 'idleuser', password: 'IdlePass1!' })).status, 200);
-  const reopenedDigest = createHash('sha256').update(reopened.cookies.get('session_token')).digest('hex');
-  await pool.query(`UPDATE sessions SET last_activity_at = NOW() - INTERVAL '21 minutes' WHERE token_digest = $1`, [reopenedDigest]);
-  const idleMe = await reopened.get('/api/auth/me');
-  assert.equal(idleMe.status, 200);
-  assert.equal(idleMe.data.user, null);
-  assert.equal(idleMe.data.code, 'SESSION_IDLE_TIMEOUT');
-  assert.equal(idleMe.data.message, 'Your session expired because of inactivity. Please log in again.');
-  assert.equal(reopened.cookies.has('session_token'), false, 'cookie cleared');
-  assert.ok((await pool.query('SELECT revoked_at FROM sessions WHERE token_digest = $1', [reopenedDigest])).rows[0].revoked_at);
+  const afterLogout = await stale.post('/api/auth/unlock', { password: 'IdlePass1!' });
+  assert.equal(afterLogout.status, 401);
+  assert.equal(afterLogout.data.code, 'SESSION_INVALID');
+  assert.equal((await stale.get('/api/auth/me')).data.user, null);
 
   // A visit with no session at all is not an error either.
   const visitor = await new Client('10.0.6.3').get('/api/auth/me');
