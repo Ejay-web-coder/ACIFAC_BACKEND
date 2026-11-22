@@ -48,7 +48,7 @@ describe('Late payment penalty (5-day grace period, then PHP 100 a day)', () => 
     await recordPayment(pay('5000'), res);
     expect(res.statusCode).toBe(201);
     // PHP 5,000: PHP 1,200 penalty, PHP 3,800 interest, nothing to principal; PHP 30,700 still owed.
-    expect(insertedPayment()).toEqual([5, '5000.00', '2026-05-21', '0.00', '3800.00', '30700.00', 1, '1200.00']);
+    expect(insertedPayment()).toEqual([5, '5000.00', '2026-05-21', '0.00', '3800.00', '30700.00', 1, '1200.00', null, null]);
     expect(memberNotice()).toBe('Your payment of PHP 5,000.00 for loan L-2026-005 was recorded (PHP 1,200.00 of it for the late penalty). Remaining balance: PHP 30,700.00.');
   });
 
@@ -58,20 +58,20 @@ describe('Late payment penalty (5-day grace period, then PHP 100 a day)', () => 
     });
     databaseHas({ after: { balance: '0.00', status: 'paid' } });
     await recordPayment(pay('35700'), mockResponse());
-    expect(insertedPayment()).toEqual([5, '35700.00', '2026-05-21', '30000.00', '4500.00', '0.00', 1, '1200.00']);
+    expect(insertedPayment()).toEqual([5, '35700.00', '2026-05-21', '30000.00', '4500.00', '0.00', 1, '1200.00', null, null]);
   });
 
   test('a payment smaller than the penalty pays only penalty, and the rest is still due', async () => {
     databaseHas({ after: { balance: '34500.00', status: 'overdue' } });
     await recordPayment(pay('500'), mockResponse());
-    expect(insertedPayment()).toEqual([5, '500.00', '2026-05-21', '0.00', '0.00', '34500.00', 1, '500.00']);
+    expect(insertedPayment()).toEqual([5, '500.00', '2026-05-21', '0.00', '0.00', '34500.00', 1, '500.00', null, null]);
     expect(memberNotice()).toMatch(/Late penalty still due: PHP 700\.00\.$/);
   });
 
   test('within the grace period nothing is charged', async () => {
     databaseHas({ penalty: { penalty_due: '0.00', penalty_days: 0 }, after: { balance: '29500.00', status: 'overdue' } });
     await recordPayment(pay('5000', '2026-05-08'), mockResponse());
-    expect(insertedPayment()).toEqual([5, '5000.00', '2026-05-08', '500.00', '4500.00', '29500.00', 1, '0.00']);
+    expect(insertedPayment()).toEqual([5, '5000.00', '2026-05-08', '500.00', '4500.00', '29500.00', 1, '0.00', null, null]);
     databaseHas({ penalty: { penalty_due: '0.00', penalty_days: 0 } });
     await expect(recordPayment(pay('34500.01', '2026-05-08'), mockResponse())).rejects.toMatchObject({ message: 'Payment cannot exceed the outstanding balance of PHP 34500.00.' });
   });

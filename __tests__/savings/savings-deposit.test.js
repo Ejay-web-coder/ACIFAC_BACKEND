@@ -51,7 +51,7 @@ describe('Savings deposit (memberController.createSavingsRecord)', () => {
 
   test('rejects a payment method that is not on the list', async () => {
     await expect(createSavingsRecord(deposit({ paymentMethod: 'Crypto' }), mockResponse()))
-      .rejects.toMatchObject({ status: 400, message: 'Payment method must be one of: Cash, Deposit, GCash, Bank Transfer, Check, Other.' });
+      .rejects.toMatchObject({ status: 400, message: 'Payment method must be one of: Cash, Deposit, GCash, Maya, Bank Transfer, Check, Other.' });
   });
 
   test('a receipt number cannot be recorded twice for the same member', async () => {

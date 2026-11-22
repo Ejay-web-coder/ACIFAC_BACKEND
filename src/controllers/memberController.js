@@ -472,7 +472,7 @@ export async function addShareContribution(req, res) {
   return res.status(201).json({ success: true, data: result.shareDetails, contribution: result.contribution, message: 'Share contribution recorded.' });
 }
 
-export const SAVINGS_METHODS = ['Cash', 'Deposit', 'GCash', 'Bank Transfer', 'Check', 'Other'];
+export const SAVINGS_METHODS = ['Cash', 'Deposit', 'GCash', 'Maya', 'Bank Transfer', 'Check', 'Other'];
 
 const savingsMemberName = `TRIM(CONCAT_WS(' ', m.first_name, m.middle_name, m.last_name, m.suffix))`;
 const savingsBalanceOf = (db, memberId) => db.query(`SELECT COALESCE(SUM(${signedSavings('st')}), 0) AS total FROM savings_transactions st WHERE st.member_id = $1`, [memberId]);

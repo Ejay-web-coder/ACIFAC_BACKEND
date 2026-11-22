@@ -499,6 +499,7 @@ export async function getDashboard(req, res) {
         (SELECT COUNT(*)::int FROM loans WHERE status = 'overdue') AS "overdueLoans",
         (SELECT COUNT(*)::int FROM loan_requests WHERE status = 'pending') AS "pendingLoanRequests",
         (SELECT COUNT(*)::int FROM rental_requests WHERE status = 'pending') AS "pendingRentalRequests",
+        (SELECT COUNT(*)::int FROM payment_submissions WHERE status = 'pending') AS "pendingOnlinePayments",
         (SELECT COUNT(*)::int FROM machinery_operations WHERE status = 'scheduled') AS "scheduledOperations",
         (SELECT COUNT(*)::int FROM kadiwa_inventory WHERE stock <= reorder_level AND deleted_at IS NULL) AS "lowStockItems"
     `),

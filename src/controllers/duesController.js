@@ -129,52 +129,69 @@ export async function recordDuesPayment(req, res) {
   if (dueIds.length > 200 || dueIds.some((id) => !Number.isInteger(id) || id <= 0)) throw badRequest('Some of the dues chosen are not valid.');
   const paymentDate = readDate(req.body?.paymentDate, 'payment date');
   const paymentMethod = cleanString(req.body?.paymentMethod, 50) || DUES_PAYMENT_METHOD;
+  // At the office, cash only; GCash and Maya come in through an approved online payment (payment submissions).
   if (paymentMethod !== DUES_PAYMENT_METHOD) throw badRequest('Dues are paid in cash only.');
   const reference = optionalString(req.body?.reference, 100);
   const notes = cleanString(req.body?.notes, 1000);
 
-  const result = await withTransaction(async (client) => {
-    const member = (await client.query('SELECT id, member_number, status FROM members WHERE id = $1 FOR UPDATE', [memberId])).rows[0];
-    if (!member) throw notFound('Member not found.');
-    const dues = (await client.query('SELECT * FROM member_dues WHERE id = ANY($1::int[]) AND member_id = $2 ORDER BY due_date, id FOR UPDATE', [dueIds, memberId])).rows;
-    if (dues.length !== dueIds.length) throw badRequest('Some of the dues chosen were not found for this member.');
-    if (dues.some((due) => due.payment_id || due.waived_at)) throw conflict('Some of the dues chosen are already paid or waived. Refresh the list and try again.');
-    const latest = dues.reduce((max, due) => (due.due_date > max ? due.due_date : max), dues[0].due_date);
-    if (paymentDate < latest) throw badRequest(`The payment date cannot be before ${formatDateOnly(latest)}, the date of the latest due being paid.`);
-
-    const sum = (kind) => dues.filter((due) => !kind || due.kind === kind).reduce((total, due) => total + toCents(due.amount), 0);
-    const totalCents = sum();
-    const note = notes || `Dues paid at the office (${dues.length} ${dues.length === 1 ? 'due' : 'dues'}).`;
-    let shareContributionId = null;
-    let savingsTransactionId = null;
-    if (sum('share_capital')) {
-      const share = await insertShareContribution(client, req, memberId, { amountCents: sum('share_capital'), contributionDate: paymentDate, paymentMethod, referenceNumber: reference, notes: `Meeting dues: ${note}` });
-      shareContributionId = share.contribution.id;
-    }
-    if (sum('savings')) {
-      const savings = await insertSavingsDeposit(client, req, { memberId, amountCents: sum('savings'), date: paymentDate, paymentMethod, reference, notes: `Meeting dues: ${note}` });
-      savingsTransactionId = savings.record.id;
-    }
-    const payment = (await client.query(
-      `INSERT INTO member_dues_payments (member_id, amount, payment_date, payment_method, reference_number, notes, share_contribution_id, savings_transaction_id, recorded_by)
-       VALUES ($1, $2::numeric, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-      [memberId, centsToString(totalCents), paymentDate, paymentMethod, reference, notes, shareContributionId, savingsTransactionId, currentUserId(req)]
-    )).rows[0];
-    await client.query('UPDATE member_dues SET payment_id = $1, updated_at = NOW() WHERE id = ANY($2::int[])', [payment.id, dueIds]);
-    await createAuditLog({
-      client, user: req.user, action: 'DUES_PAYMENT_RECORDED', module: MODULE, entityType: 'member_dues_payment', entityId: String(payment.id),
-      description: `Recorded a dues payment of ${pesos(totalCents)} for member ${member.member_number || memberId} (${dues.length} ${dues.length === 1 ? 'due' : 'dues'})`,
-      newValues: { member_id: memberId, amount: centsToString(totalCents), payment_date: paymentDate, payment_method: paymentMethod, reference_number: reference, due_ids: dueIds, share_contribution_id: shareContributionId, savings_transaction_id: savingsTransactionId },
-      ...getRequestMeta(req),
-    });
-    await notifyMember(client, memberId, {
-      type: 'dues_paid', title: 'Dues payment recorded', severity: 'success', link: '/member/dues',
-      message: `A payment of ${pesos(totalCents)} for ${dues.length} ${dues.length === 1 ? 'due' : 'dues'} was recorded on ${formatDateOnly(paymentDate)}.`,
-      entityType: 'member_dues_payment', entityId: payment.id, dedupeKey: `dues-payment-${payment.id}`,
-    });
-    return { id: payment.id, amount: Number(centsToString(totalCents)) };
-  });
+  const result = await withTransaction((client) => insertDuesPayment(client, req, { memberId, dueIds, paymentDate, paymentMethod, reference, notes }));
   return res.status(201).json({ success: true, message: `Payment of ${pesos(Math.round(result.amount * 100))} recorded.`, payment: result, ...(await memberDues(memberId)) });
+}
+
+// The payment methods dues can be paid with: cash at the office, or GCash or
+// Maya through an online payment the office approved (never typed in Dues).
+const DUES_METHODS = [DUES_PAYMENT_METHOD, 'GCash', 'Maya'];
+
+/**
+ * Pays the chosen dues of the member in full, in the caller's transaction:
+ * share capital dues become one share capital contribution (the 10% limit
+ * applies) and savings dues one savings deposit; fines and fees are income of
+ * the cooperative. The audit log and the member's notification go with it.
+ * Used by the office's Dues page (cash) and by an approved online payment.
+ * Returns { id, amount } of the dues payment.
+ */
+export async function insertDuesPayment(client, req, { memberId, dueIds, paymentDate, paymentMethod = DUES_PAYMENT_METHOD, reference = null, notes = '' }) {
+  if (!DUES_METHODS.includes(paymentMethod)) throw badRequest('Dues are paid in cash only.');
+  const member = (await client.query('SELECT id, member_number, status FROM members WHERE id = $1 FOR UPDATE', [memberId])).rows[0];
+  if (!member) throw notFound('Member not found.');
+  const dues = (await client.query('SELECT * FROM member_dues WHERE id = ANY($1::int[]) AND member_id = $2 ORDER BY due_date, id FOR UPDATE', [dueIds, memberId])).rows;
+  if (dues.length !== dueIds.length) throw badRequest('Some of the dues chosen were not found for this member.');
+  if (dues.some((due) => due.payment_id || due.waived_at)) throw conflict('Some of the dues chosen are already paid or waived. Refresh the list and try again.');
+  const latest = dues.reduce((max, due) => (due.due_date > max ? due.due_date : max), dues[0].due_date);
+  if (paymentDate < latest) throw badRequest(`The payment date cannot be before ${formatDateOnly(latest)}, the date of the latest due being paid.`);
+
+  const sum = (kind) => dues.filter((due) => !kind || due.kind === kind).reduce((total, due) => total + toCents(due.amount), 0);
+  const totalCents = sum();
+  const count = `${dues.length} ${dues.length === 1 ? 'due' : 'dues'}`;
+  const note = notes || (paymentMethod === DUES_PAYMENT_METHOD ? `Dues paid at the office (${count}).` : `Dues paid online by ${paymentMethod} (${count}).`);
+  let shareContributionId = null;
+  let savingsTransactionId = null;
+  if (sum('share_capital')) {
+    const share = await insertShareContribution(client, req, memberId, { amountCents: sum('share_capital'), contributionDate: paymentDate, paymentMethod, referenceNumber: reference, notes: `Meeting dues: ${note}` });
+    shareContributionId = share.contribution.id;
+  }
+  if (sum('savings')) {
+    const savings = await insertSavingsDeposit(client, req, { memberId, amountCents: sum('savings'), date: paymentDate, paymentMethod, reference, notes: `Meeting dues: ${note}` });
+    savingsTransactionId = savings.record.id;
+  }
+  const payment = (await client.query(
+    `INSERT INTO member_dues_payments (member_id, amount, payment_date, payment_method, reference_number, notes, share_contribution_id, savings_transaction_id, recorded_by)
+     VALUES ($1, $2::numeric, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+    [memberId, centsToString(totalCents), paymentDate, paymentMethod, reference, notes, shareContributionId, savingsTransactionId, currentUserId(req)]
+  )).rows[0];
+  await client.query('UPDATE member_dues SET payment_id = $1, updated_at = NOW() WHERE id = ANY($2::int[])', [payment.id, dueIds]);
+  await createAuditLog({
+    client, user: req.user, action: 'DUES_PAYMENT_RECORDED', module: MODULE, entityType: 'member_dues_payment', entityId: String(payment.id),
+    description: `Recorded a dues payment of ${pesos(totalCents)} for member ${member.member_number || memberId} (${count})`,
+    newValues: { member_id: memberId, amount: centsToString(totalCents), payment_date: paymentDate, payment_method: paymentMethod, reference_number: reference, due_ids: dueIds, share_contribution_id: shareContributionId, savings_transaction_id: savingsTransactionId },
+    ...getRequestMeta(req),
+  });
+  await notifyMember(client, memberId, {
+    type: 'dues_paid', title: 'Dues payment recorded', severity: 'success', link: '/member/dues',
+    message: `A ${paymentMethod === DUES_PAYMENT_METHOD ? '' : `${paymentMethod} `}payment of ${pesos(totalCents)} for ${count} was recorded on ${formatDateOnly(paymentDate)}.`,
+    entityType: 'member_dues_payment', entityId: payment.id, dedupeKey: `dues-payment-${payment.id}`,
+  });
+  return { id: payment.id, amount: Number(centsToString(totalCents)) };
 }
 
 // POST /api/dues/transfer-fee { memberId, transferTo, date?, notes? }

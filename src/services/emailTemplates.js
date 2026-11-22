@@ -162,6 +162,15 @@ export function savingsDepositEmail({ memberName, amount, date, reference, total
   );
 }
 
+// An online payment (GCash or Maya) the office could not accept, with the reason.
+export function onlinePaymentRejectedEmail({ memberName, channel, amount, reference, paidOn, purpose, reason }) {
+  return message(
+    `ACIFAC ${channel} payment not accepted`,
+    `Hello ${memberName},\n\nYour ${channel} payment of ${formatAmount(amount)} for ${purpose} (reference ${reference}, paid ${formatDateOnly(paidOn)}) was not accepted.\nReason: ${reason}\n\nIf you did send the money, please contact the ACIFAC office or report the payment again under Pay online with a clear screenshot.`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>Your ${escapeHtml(channel)} payment of <strong>${formatAmount(amount)}</strong> for ${escapeHtml(purpose)} (reference ${escapeHtml(reference)}, paid ${escapeHtml(formatDateOnly(paidOn))}) was not accepted.</p><p><strong>Reason:</strong> ${escapeHtml(reason)}</p><p>If you did send the money, please contact the ACIFAC office or report the payment again under Pay online with a clear screenshot.</p>`
+  );
+}
+
 export function savingsWithdrawalEmail({ memberName, amount, date, reference, total }) {
   return message(
     'ACIFAC savings withdrawal recorded',

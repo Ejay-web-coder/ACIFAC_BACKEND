@@ -32,3 +32,6 @@ export const ocrDocumentUpload = memoryUpload(10 * 1024 * 1024, DOCUMENT_TYPES);
 export const legalDocumentUpload = memoryUpload(10 * 1024 * 1024, DOCUMENT_TYPES);
 // Pictures are resized in the browser to about 100 KB; 5 MB leaves room for originals.
 export const profilePhotoUpload = memoryUpload(5 * 1024 * 1024, IMAGE_TYPES);
+// Pay online: the screenshot of a GCash or Maya payment, and the cooperative's QR code (Settings).
+export const paymentProofUpload = memoryUpload(5 * 1024 * 1024, IMAGE_TYPES, 1);
+export const paymentChannelUpload = memoryUpload(5 * 1024 * 1024, IMAGE_TYPES, 1);

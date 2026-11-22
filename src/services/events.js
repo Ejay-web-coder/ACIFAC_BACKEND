@@ -16,7 +16,8 @@ const ADMIN_ONLY_TABLES = new Set([
 ]);
 // Activities (meetings, trainings...) are shown to every member as upcoming
 // activities; attendance rows reach only the member they belong to.
-const PUBLIC_TABLES = new Set(['machinery', 'announcements', 'activities']);
+// The cooperative's GCash and Maya accounts (Pay online) too.
+const PUBLIC_TABLES = new Set(['machinery', 'announcements', 'activities', 'payment_channels']);
 const HEARTBEAT_MS = 25000;
 
 const connections = new Set();

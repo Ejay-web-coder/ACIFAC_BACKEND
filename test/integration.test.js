@@ -21,6 +21,8 @@ let stubAnalysis = DEFAULT_STUB_ANALYSIS;
 // What the stub AI answers when it is asked to read an applicant's ID or check their 2x2 picture.
 let stubIdReading = {};
 let stubPhotoReading = {};
+// What the stub AI reads on the screenshot of a GCash or Maya payment (Pay online).
+let stubProofReading = {};
 // The second, cross-check reading of a form: null = the same answer as the first; secondMode 'fail' = AI busy for it.
 let stubSecondReading = null;
 let secondMode = 'ok';
@@ -216,6 +218,7 @@ before(async () => {
       if (secondReading && secondMode === 'fail') { res.writeHead(503); res.end('{}'); return; }
       const answer = secondReading && stubSecondReading ? stubSecondReading
         : prompt.startsWith('You check the valid ID that') ? stubIdReading : prompt.includes('2x2 ID picture that an applicant submits') ? stubPhotoReading
+        : prompt.startsWith('You read the screenshot of a GCash or Maya payment') ? stubProofReading
         : prompt.startsWith('You advise the officers of ACIFAC') ? stubRecommendations : stubAnalysis;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(answer) } }] }));
@@ -3030,7 +3033,7 @@ test('dashboard and analytics use real data', { skip }, async () => {
   assert.equal((await member.get('/api/admin/analytics/revenue')).status, 403);
 
   // What needs the admin's attention: counts the dashboard turns into links.
-  for (const key of ['overdueLoans', 'loansDueThisWeek', 'pendingLoanRequests', 'pendingRentalRequests', 'scheduledOperations', 'lowStockItems']) {
+  for (const key of ['overdueLoans', 'loansDueThisWeek', 'pendingLoanRequests', 'pendingRentalRequests', 'pendingOnlinePayments', 'scheduledOperations', 'lowStockItems']) {
     assert.ok(Number.isInteger(dashboard.data.stats[key]), key);
   }
   assert.equal(dashboard.data.alerts, undefined, 'the dashboard shows the counts, not alert sentences');
@@ -5101,4 +5104,207 @@ test('loans: the loan policy at release: 2 hectares in the first year of loans; 
   );
   q = await quote('150000');
   assert.deepEqual([q.maximumEligibleAmount, q.eligibleFarmArea, q.withinLimit, q.firstLoanYear.inFirstYear, q.firstLoanYear.limited], ['150000.00', '3', true, false, false]);
+});
+
+test('pay online: GCash or Maya with a screenshot; AI reads it, the office checks its own app and approves or rejects', { skip }, async () => {
+  const { hashPassword } = await import('../src/utils/password.js');
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const today = todayDateOnly();
+  const shift = (days) => new Date(Date.parse(`${today}T00:00:00Z`) + days * 86400000).toISOString().slice(0, 10);
+  const office = new Client('10.0.70.1');
+  assert.equal((await office.post('/api/auth/login', { usernameOrEmail: 'testadmin', password: 'AdminPass1!' })).status, 200);
+  const adminId = (await pool.query(`SELECT id FROM users WHERE username = 'testadmin'`)).rows[0].id;
+  const addMember = async (number, first) => (await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status)
+     VALUES ($1, $2, 'Online', $3, '09170007777', 'Purok 7', '2022-01-01', 0, 'active') RETURNING id`,
+    [number, first, `${first.toLowerCase()}.online@acifac.ph`]
+  )).rows[0].id;
+  const [olive, paolo] = [await addMember('PAY-ONLINE-1', 'Olive'), await addMember('PAY-ONLINE-2', 'Paolo')];
+  const login = async (memberId, username, ip) => {
+    const userId = (await pool.query(`INSERT INTO users (member_id, username, email, password_hash, role, account_status) VALUES ($1, $2, NULL, $3, 'MEMBER', 'ACTIVE') RETURNING id`, [memberId, username, await hashPassword('OnlinePass1!')])).rows[0].id;
+    const client = new Client(ip);
+    assert.equal((await client.post('/api/auth/login', { usernameOrEmail: username, password: 'OnlinePass1!' })).status, 200);
+    return { userId, client };
+  };
+  const { userId: oliveUser, client: member } = await login(olive, 'olive.online', '10.0.70.2');
+  const { client: other } = await login(paolo, 'paolo.online', '10.0.70.3');
+  const notes = async (userId, type) => (await pool.query('SELECT title, message, severity, link FROM notifications WHERE user_id = $1 AND type = $2 ORDER BY id', [userId, type])).rows;
+  let shots = 0;
+  const screenshot = () => { shots += 1; return Buffer.concat([PNG, Buffer.from([0xa0, shots])]); };
+  const pay = (client, fields, file = screenshot()) => {
+    const form = new FormData();
+    for (const [key, value] of Object.entries(fields)) for (const item of [value].flat()) form.append(key, String(item));
+    form.append('proof', new Blob([file], { type: 'image/png' }), 'gcash.png');
+    return client.request('POST', '/api/payment-submissions', { form });
+  };
+  const channelForm = (fields, qr = null) => {
+    const form = new FormData();
+    for (const [key, value] of Object.entries(fields)) form.append(key, value);
+    if (qr) form.append('qr', new Blob([qr], { type: 'image/png' }), 'qr.png');
+    return form;
+  };
+  const receipt = (changes = {}) => ({
+    isPaymentReceipt: true, app: 'GCash', status: 'successful', amount: '5000.00', referenceNumber: '1009000011111', date: today,
+    recipientName: 'AC****C', recipientNumber: '+63 917 *** 4567', confidence: 95, ...changes,
+  });
+  const codes = (row) => row.flags.map((flag) => flag.code);
+
+  // 1. The office sets up the cooperative's GCash account in Settings; members see only the accounts that take payments.
+  assert.deepEqual((await member.get('/api/payment-channels')).data.data, []);
+  assert.equal((await member.request('PUT', '/api/payment-channels/GCash', { form: channelForm({ accountName: 'X', accountNumber: '09171234567', enabled: 'true' }) })).status, 403);
+  const noQr = await office.request('PUT', '/api/payment-channels/GCash', { form: channelForm({ accountName: 'ACIFAC Cooperative', accountNumber: '0917 123 4567', enabled: 'true' }) });
+  assert.equal(noQr.status, 400);
+  assert.match(noQr.data.message, /Upload the GCash QR code/);
+  assert.equal((await office.request('PUT', '/api/payment-channels/GCash', { form: channelForm({ accountName: 'ACIFAC Cooperative', accountNumber: '02 8123 4567', enabled: 'true' }, PNG) })).status, 400, 'a mobile number');
+  const saved = await office.request('PUT', '/api/payment-channels/GCash', { form: channelForm({ accountName: 'ACIFAC Cooperative', accountNumber: '+63 917 123 4567', enabled: 'true' }, PNG) });
+  assert.equal(saved.status, 200, JSON.stringify(saved.data));
+  assert.deepEqual([saved.data.data.accountNumber, saved.data.data.enabled, saved.data.data.hasQr], ['09171234567', true, true]);
+  assert.deepEqual((await member.get('/api/payment-channels')).data.data, [{ channel: 'GCash', accountName: 'ACIFAC Cooperative', accountNumber: '09171234567', enabled: true, hasQr: true }]);
+  const qr = await member.request('GET', '/api/payment-channels/GCash/qr', { raw: true });
+  assert.equal(qr.status, 200);
+  assert.deepEqual(Buffer.from(await qr.arrayBuffer()), PNG);
+  assert.equal((await member.request('GET', '/api/payment-channels/Maya/qr', { raw: true })).status, 404, 'Maya is not set up');
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE action = 'PAYMENT_CHANNEL_UPDATED'`)).rows[0].n, 1);
+
+  // 2. Olive has a PHP 20,000 loan (PHP 23,000 with interest) and a PHP 500 transfer fee to pay.
+  const requestId = (await pool.query(
+    `INSERT INTO loan_requests (member_id, member_number, member_name, loan_type, amount, term, purpose, borrower_phone, borrower_address, farm_area, loan_mode,
+       maximum_eligible_amount, interest_rate, calculated_interest, total_repayment, in_kind_items, status)
+     VALUES ($1, 'PAY-ONLINE-1', 'Olive Online', 'agricultural', 20000, 6, 'Palay', '09170007777', 'Purok 7', 1, 'cash', 50000, 15, 3000, 23000, '[]'::jsonb, 'pending') RETURNING id`,
+    [olive]
+  )).rows[0].id;
+  const approvedLoan = await office.patch(`/api/admin/loan-requests/${requestId}`, { status: 'approved' });
+  assert.equal(approvedLoan.status, 200, JSON.stringify(approvedLoan.data));
+  const loanId = approvedLoan.data.loanId;
+  assert.equal((await office.post('/api/dues/transfer-fee', { memberId: olive, transferTo: 'Omar Online (son)' })).status, 201);
+  let mine = (await member.get('/api/payment-submissions/me')).data;
+  assert.deepEqual(mine.payable.loans.map((loan) => [loan.id, loan.amountDueNow, loan.payableNow]), [[loanId, 23000, 23000]]);
+  assert.deepEqual(mine.payable.dues.map((due) => [due.kind, due.amount]), [['transfer_fee', 500]]);
+  assert.deepEqual(mine.channels.map((channel) => channel.channel), ['GCash']);
+  const feeId = mine.payable.dues[0].id;
+
+  // 3. Olive pays PHP 5,000 of the loan by GCash and reports it. AI reads the screenshot: it agrees with everything.
+  stubProofReading = receipt();
+  const base = { purpose: 'loan', loanId, amount: '5000', channel: 'GCash', referenceNumber: '1009 0000 11111', paidOn: today };
+  assert.equal((await pay(member, { ...base, channel: 'Maya' })).status, 400, 'Maya is not set up');
+  assert.equal((await pay(member, base, Buffer.from('not a picture'))).status, 400);
+  assert.equal((await pay(member, { ...base, amount: '23000.01' })).status, 400, 'more than is owed');
+  assert.equal((await pay(member, { ...base, paidOn: shift(1) })).status, 400, 'not in the future');
+  assert.equal((await pay(member, { ...base, referenceNumber: '12-3' })).status, 400, 'a reference number');
+  assert.equal((await pay(other, base)).status, 400, 'only her own loan');
+  assert.equal((await office.request('POST', '/api/payment-submissions', { form: new FormData() })).status, 403, 'members report payments');
+  const loanPay = await pay(member, base);
+  assert.equal(loanPay.status, 201, JSON.stringify(loanPay.data));
+  assert.deepEqual([loanPay.data.data.reference, loanPay.data.data.status, loanPay.data.data.reading, loanPay.data.data.flags], ['1009000011111', 'pending', undefined, undefined], 'what AI found is for the office');
+  assert.equal((await pay(member, { ...base, amount: '100' })).status, 409, 'a reference number is reported once');
+  const officeNote = (await notes(adminId, 'online_payment_submitted')).at(-1);
+  assert.deepEqual([officeNote.title, officeNote.link, officeNote.severity], ['GCash payment to check', '/admin/online-payments', 'info']);
+  assert.match(officeNote.message, /^Olive Online reported a GCash payment of PHP 5,000\.00 for loan \S+ \(reference 1009000011111\)\. Check the cooperative's GCash app before approving\.$/);
+  mine = (await member.get('/api/payment-submissions/me')).data;
+  assert.equal(mine.payable.loans[0].payableNow, 18000, 'what the office is checking is not owed twice');
+  assert.equal((await pay(member, { ...base, referenceNumber: '1009000022222', amount: '18000.01' })).status, 400);
+
+  // 4. The transfer fee: the screenshot shows another amount, sent to another number.
+  stubProofReading = receipt({ amount: '450.00', referenceNumber: '1009000033333', recipientNumber: '0999 *** 0000' });
+  const duesPay = await pay(member, { purpose: 'dues', dueIds: [feeId], channel: 'GCash', referenceNumber: '1009000033333', paidOn: today });
+  assert.equal(duesPay.status, 201, JSON.stringify(duesPay.data));
+  assert.equal(duesPay.data.data.amount, 500, 'dues are paid in full');
+  assert.deepEqual((await member.get('/api/payment-submissions/me')).data.payable.dues, [], 'dues in a payment being checked cannot be chosen again');
+  assert.equal((await pay(member, { purpose: 'dues', dueIds: [feeId], channel: 'GCash', referenceNumber: '1009000044444', paidOn: today })).status, 400);
+  assert.equal((await notes(adminId, 'online_payment_submitted')).at(-1).severity, 'warning', 'the office is told problems were found');
+
+  // 5. A savings deposit while AI is busy is still sent. Its reference number is on a deposit the office recorded.
+  assert.equal((await office.post('/api/members/savings', { memberId: paolo, amount: '200', date: today, paymentMethod: 'Cash', reference: 'OR-5555-123' })).status, 201);
+  stubMode = 'fail';
+  const savingsPay = await pay(member, { purpose: 'savings', amount: '1000', channel: 'GCash', referenceNumber: 'or5555123', paidOn: shift(-10) });
+  stubMode = 'ok';
+  assert.equal(savingsPay.status, 201, JSON.stringify(savingsPay.data));
+
+  // 6. The office's queue: oldest first, with what AI read and the problems found.
+  assert.equal((await member.get('/api/payment-submissions')).status, 403);
+  const queue = (await office.get('/api/payment-submissions')).data;
+  const ours = queue.data.filter((row) => row.memberId === olive);
+  assert.deepEqual(ours.map((row) => [row.purpose, row.amount, row.status]), [['loan', 5000, 'pending'], ['dues', 500, 'pending'], ['savings', 1000, 'pending']]);
+  const [loanRow, duesRow, savingsRow] = ours;
+  assert.deepEqual(codes(loanRow), []);
+  assert.equal(loanRow.reading.amount, '5000.00');
+  assert.deepEqual(codes(duesRow), ['amount_mismatch', 'wrong_recipient']);
+  assert.deepEqual(duesRow.dues.map((due) => [due.kind, due.amount]), [['transfer_fee', 500]]);
+  assert.deepEqual(codes(savingsRow), ['reference_recorded', 'not_read', 'old_payment']);
+  assert.equal(savingsRow.flags[0].message, 'Reference number OR5555123 is already on a savings record.');
+  assert.equal(queue.counts.pending, 3);
+  assert.equal((await office.get('/api/admin/dashboard')).data.stats.pendingOnlinePayments, 3);
+  // The screenshot: the office and the member who sent it, nobody else.
+  const proof = await office.request('GET', `/api/payment-submissions/${loanRow.id}/proof`, { raw: true });
+  assert.equal(proof.status, 200);
+  assert.equal(proof.headers.get('content-type'), 'image/png');
+  assert.equal((await member.request('GET', `/api/payment-submissions/${loanRow.id}/proof`, { raw: true })).status, 200);
+  assert.equal((await other.request('GET', `/api/payment-submissions/${loanRow.id}/proof`, { raw: true })).status, 404);
+  // AI reads the savings screenshot again, now that it is available.
+  stubProofReading = receipt({ amount: '1000.00', referenceNumber: 'OR5555123', date: shift(-10) });
+  const reread = await office.post(`/api/payment-submissions/${savingsRow.id}/read-again`);
+  assert.equal(reread.status, 200, JSON.stringify(reread.data));
+  assert.deepEqual(codes(reread.data.data), ['reference_recorded', 'old_payment']);
+
+  // 7. Approving: only once the treasurer saw the money in the cooperative's GCash app. It is recorded as the office records a payment.
+  const noCheck = await office.post(`/api/payment-submissions/${loanRow.id}/approve`, {});
+  assert.equal(noCheck.status, 400);
+  assert.match(noCheck.data.message, /Check the cooperative's GCash or Maya app first/);
+  const approved = await office.post(`/api/payment-submissions/${loanRow.id}/approve`, { confirmed: true });
+  assert.equal(approved.status, 200, JSON.stringify(approved.data));
+  assert.equal(approved.data.data.status, 'approved');
+  const loanPayment = (await pool.query('SELECT amount::text, payment_method, reference_number, payment_date::text, recorded_by FROM loan_payments WHERE id = $1', [approved.data.data.loanPaymentId])).rows[0];
+  assert.deepEqual(loanPayment, { amount: '5000.00', payment_method: 'GCash', reference_number: '1009000011111', payment_date: today, recorded_by: adminId });
+  assert.equal(Number((await office.get(`/api/admin/loans/${loanId}`)).data.loan.balance), 18000);
+  assert.match((await notes(oliveUser, 'payment_recorded')).at(-1).message, /^Your GCash payment of PHP 5,000\.00 for loan \S+ was recorded\. Remaining balance: PHP 18,000\.00\.$/);
+  await waitForMail((mail) => mail.to === 'olive.online@acifac.ph' && mail.subject === 'ACIFAC loan payment recorded');
+  assert.equal((await office.post(`/api/payment-submissions/${loanRow.id}/approve`, { confirmed: true })).status, 409);
+  assert.equal((await office.post(`/api/payment-submissions/${loanRow.id}/reject`, { reason: 'Too late' })).status, 409);
+
+  // 8. Rejecting needs the reason; the member is told it, and the dues can be chosen again.
+  assert.equal((await office.post(`/api/payment-submissions/${duesRow.id}/reject`, { reason: ' ' })).status, 400);
+  const reason = 'Only PHP 450 arrived in our GCash, from another number.';
+  const rejected = await office.post(`/api/payment-submissions/${duesRow.id}/reject`, { reason });
+  assert.equal(rejected.status, 200, JSON.stringify(rejected.data));
+  const told = (await notes(oliveUser, 'online_payment_rejected')).at(-1);
+  assert.deepEqual([told.title, told.severity, told.link], ['GCash payment not accepted', 'error', '/member/pay-online']);
+  assert.equal(told.message, `Your GCash payment of PHP 500.00 for 1 due (reference 1009000033333) was not accepted: ${reason}`);
+  const rejectionMail = await waitForMail((mail) => mail.to === 'olive.online@acifac.ph' && mail.subject === 'ACIFAC GCash payment not accepted');
+  assert.match(rejectionMail.text, /Reason: Only PHP 450 arrived/);
+  mine = (await member.get('/api/payment-submissions/me')).data;
+  assert.equal(mine.submissions.find((row) => row.id === duesRow.id).reviewNotes, reason);
+  assert.deepEqual(mine.payable.dues.map((due) => due.id), [feeId]);
+  // She sends the rest and reports it again with the same reference number: allowed, since the first was rejected.
+  stubProofReading = receipt({ amount: '500.00', referenceNumber: '1009000033333' });
+  const resent = await pay(member, { purpose: 'dues', dueIds: [feeId], channel: 'GCash', referenceNumber: '1009000033333', paidOn: today });
+  assert.equal(resent.status, 201, JSON.stringify(resent.data));
+  assert.deepEqual(codes((await office.get('/api/payment-submissions')).data.data.find((row) => row.id === resent.data.data.id)), ['rejected_before']);
+  // The office's Dues page still takes cash only: GCash comes in only through an approved online payment.
+  const gcashAtOffice = await office.post('/api/dues/payments', { memberId: olive, dueIds: [feeId], paymentMethod: 'GCash', reference: 'X' });
+  assert.deepEqual([gcashAtOffice.status, gcashAtOffice.data.message], [400, 'Dues are paid in cash only.']);
+  const duesApproved = await office.post(`/api/payment-submissions/${resent.data.data.id}/approve`, { confirmed: true, notes: 'Seen in GCash at 2:10 PM' });
+  assert.equal(duesApproved.status, 200, JSON.stringify(duesApproved.data));
+  const duesPayment = (await pool.query('SELECT amount::text, payment_method, reference_number FROM member_dues_payments WHERE id = $1', [duesApproved.data.data.duesPaymentId])).rows[0];
+  assert.deepEqual(duesPayment, { amount: '500.00', payment_method: 'GCash', reference_number: '1009000033333' });
+  assert.equal((await pool.query('SELECT payment_id FROM member_dues WHERE id = $1', [feeId])).rows[0].payment_id, duesApproved.data.data.duesPaymentId);
+  assert.match((await notes(oliveUser, 'dues_paid')).at(-1).message, /^A GCash payment of PHP 500\.00 for 1 due was recorded on /);
+
+  // 9. The savings deposit, dated the day she paid.
+  const savingsApproved = await office.post(`/api/payment-submissions/${savingsRow.id}/approve`, { confirmed: true });
+  assert.equal(savingsApproved.status, 200, JSON.stringify(savingsApproved.data));
+  const deposit = (await pool.query('SELECT transaction_type, amount::text, payment_method, reference_number, transaction_date::text FROM savings_transactions WHERE id = $1', [savingsApproved.data.data.savingsTransactionId])).rows[0];
+  assert.deepEqual(deposit, { transaction_type: 'deposit', amount: '1000.00', payment_method: 'GCash', reference_number: 'OR5555123', transaction_date: shift(-10) });
+  assert.deepEqual((await office.get('/api/payment-submissions?status=all')).data.counts, { pending: 0, approved: 3, rejected: 1 });
+  assert.equal((await office.get('/api/payment-submissions?status=bogus')).status, 400);
+  assert.deepEqual((await pool.query(`SELECT action, COUNT(*)::int AS n FROM audit_logs WHERE module = 'Online Payments' GROUP BY action ORDER BY action`)).rows,
+    [{ action: 'ONLINE_PAYMENT_APPROVED', n: 3 }, { action: 'ONLINE_PAYMENT_REJECTED', n: 1 }, { action: 'ONLINE_PAYMENT_SUBMITTED', n: 4 }, { action: 'PAYMENT_CHANNEL_UPDATED', n: 1 }]);
+  // The member's list: every payment she reported, newest first, with the office's decision and nothing AI found.
+  mine = (await member.get('/api/payment-submissions/me')).data;
+  assert.deepEqual(mine.submissions.map((row) => [row.purpose, row.status]), [['dues', 'approved'], ['savings', 'approved'], ['dues', 'rejected'], ['loan', 'approved']]);
+  assert.ok(mine.submissions.every((row) => row.reading === undefined && row.flags === undefined));
+
+  // 10. With GCash turned off, members can no longer pay by it.
+  assert.equal((await office.request('PUT', '/api/payment-channels/GCash', { form: channelForm({ accountName: 'ACIFAC Cooperative', accountNumber: '09171234567', enabled: 'false' }) })).status, 200);
+  assert.deepEqual((await member.get('/api/payment-channels')).data.data, []);
+  assert.equal((await pay(member, { purpose: 'savings', amount: '100', channel: 'GCash', referenceNumber: '1009000055555', paidOn: today })).status, 400);
 });

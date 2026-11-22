@@ -101,6 +101,7 @@ const paymentSelect = `
          COALESCE(pm.member_number, l.member_number) AS "memberNumber",
          p.amount, p.payment_date AS "paymentDate", p.principal_paid AS "principalPaid", p.interest_paid AS "interestPaid",
          p.penalty_paid AS "penaltyPaid", p.remaining_balance AS "remainingBalance", p.created_at AS "createdAt",
+         p.payment_method AS "paymentMethod", p.reference_number AS reference,
          ${displayName('u')} AS "recordedBy", u.position AS "recordedByPosition"
   FROM loan_payments p
   JOIN loans l ON l.id = p.loan_id
@@ -649,58 +650,86 @@ export async function recordPayment(req, res) {
   if (paymentDate > todayDateOnly()) throw badRequest('Payment date cannot be in the future.');
   // A payment is recorded whenever it is entered, any day and time.
 
-  const payment = await withTransaction(async (client) => {
-    const loan = (await client.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId])).rows[0];
-    if (!loan) throw notFound('Loan not found.');
-    if (paymentDate < loan.date_approved) throw badRequest('Payment date cannot be before the loan approval date.');
-    await ensureInstallments(client, loanId);
-    const state = await recomputeLoanState(client, loanId);
-    const balanceCents = toCents(state.balance);
-    if (state.status === 'paid' || balanceCents <= 0) throw badRequest('This loan is already fully paid.');
-    // The late penalty run up by the payment date is paid first, then interest and principal.
-    const penalty = await penaltyDue(client, loanId, paymentDate);
-    if (amountCents > balanceCents + penalty.cents) {
-      throw badRequest(penalty.cents > 0
-        ? `Payment cannot exceed PHP ${centsToString(balanceCents + penalty.cents)}: the balance of PHP ${centsToString(balanceCents)} and the late penalty of PHP ${centsToString(penalty.cents)} (${penalty.days} day${penalty.days === 1 ? '' : 's'}).`
-        : `Payment cannot exceed the outstanding balance of PHP ${centsToString(balanceCents)}.`);
-    }
-    const penaltyCents = Math.min(amountCents, penalty.cents);
-    const loanCents = amountCents - penaltyCents;
+  const payment = await withTransaction((client) => insertLoanPayment(client, req, { loanId, amountCents, paymentDate }));
+  await emailLoanPayment(loanId, payment);
+  return res.status(201).json({ success: true, payment });
+}
 
-    const allocation = await allocatePayment(client, loanId, loanCents, paymentDate);
-    if (allocation.unallocatedCents !== 0) throw new Error(`Installment schedule does not match balance for loan ${loanId}.`);
-    const remainingCents = balanceCents - loanCents;
-    const inserted = await client.query(
-      `INSERT INTO loan_payments (loan_id, amount, payment_date, principal_paid, interest_paid, remaining_balance, recorded_by, penalty_paid)
-       VALUES ($1, $2::numeric, $3::date, $4::numeric, $5::numeric, $6::numeric, $7, $8::numeric) RETURNING id`,
-      [loanId, centsToString(amountCents), paymentDate, centsToString(allocation.principalCents), centsToString(allocation.interestCents), centsToString(remainingCents), currentUserId(req), centsToString(penaltyCents)]
-    );
-    const newState = await recomputeLoanState(client, loanId);
-    await createAuditLog({
-      client,
-      user: req.user,
-      action: 'PAYMENT_CREATED',
-      module: 'Payments',
-      entityType: 'loan_payment',
-      entityId: String(inserted.rows[0].id),
-      description: `Recorded payment for loan ${loan.loan_number}`,
-      oldValues: { balance: loan.balance, status: loan.status },
-      newValues: { balance: newState.balance, status: newState.status, amount: centsToString(amountCents), capital_change: capitalChange(amountCents), payment_date: paymentDate, principal_paid: centsToString(allocation.principalCents), interest_paid: centsToString(allocation.interestCents), ...(penaltyCents > 0 ? { penalty_paid: centsToString(penaltyCents) } : {}) },
-      ...getRequestMeta(req),
-    });
-    await notifyMember(client, loan.member_id, {
-      type: 'payment_recorded',
-      title: newState.status === 'paid' ? 'Loan fully paid' : 'Payment recorded',
-      message: `Your payment of ${pesoText(amountCents)} for loan ${loan.loan_number} was recorded${penaltyCents > 0 ? ` (${pesoText(penaltyCents)} of it for the late penalty)` : ''}. Remaining balance: PHP ${Number(newState.balance).toLocaleString('en-PH', { minimumFractionDigits: 2 })}.${penalty.cents > penaltyCents ? ` Late penalty still due: ${pesoText(penalty.cents - penaltyCents)}.` : ''}`,
-      severity: 'success',
-      link: '/transaction',
-      entityType: 'loan_payment',
-      entityId: inserted.rows[0].id,
-      dedupeKey: `payment-${inserted.rows[0].id}`,
-    });
-    return (await client.query(`${paymentSelect} WHERE p.id = $1`, [inserted.rows[0].id])).rows[0];
+/**
+ * Records a payment of `amountCents` on the loan in the caller's transaction:
+ * the late penalty run up by `paymentDate` first, then interest and principal;
+ * the audit log and the member's notification go with it. Used by the office's
+ * payment form and by an approved online payment (paymentMethod GCash or Maya
+ * and its reference number; null for a payment at the office). Returns the
+ * payment as the payment lists show it.
+ */
+export async function insertLoanPayment(client, req, { loanId, amountCents, paymentDate, paymentMethod = null, reference = null }) {
+  const loan = (await client.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId])).rows[0];
+  if (!loan) throw notFound('Loan not found.');
+  if (paymentDate < loan.date_approved) throw badRequest('Payment date cannot be before the loan approval date.');
+  await ensureInstallments(client, loanId);
+  const state = await recomputeLoanState(client, loanId);
+  const balanceCents = toCents(state.balance);
+  if (state.status === 'paid' || balanceCents <= 0) throw badRequest('This loan is already fully paid.');
+  // The late penalty run up by the payment date is paid first, then interest and principal.
+  const penalty = await penaltyDue(client, loanId, paymentDate);
+  if (amountCents > balanceCents + penalty.cents) {
+    throw badRequest(penalty.cents > 0
+      ? `Payment cannot exceed PHP ${centsToString(balanceCents + penalty.cents)}: the balance of PHP ${centsToString(balanceCents)} and the late penalty of PHP ${centsToString(penalty.cents)} (${penalty.days} day${penalty.days === 1 ? '' : 's'}).`
+      : `Payment cannot exceed the outstanding balance of PHP ${centsToString(balanceCents)}.`);
+  }
+  const penaltyCents = Math.min(amountCents, penalty.cents);
+  const loanCents = amountCents - penaltyCents;
+
+  const allocation = await allocatePayment(client, loanId, loanCents, paymentDate);
+  if (allocation.unallocatedCents !== 0) throw new Error(`Installment schedule does not match balance for loan ${loanId}.`);
+  const remainingCents = balanceCents - loanCents;
+  const inserted = await client.query(
+    `INSERT INTO loan_payments (loan_id, amount, payment_date, principal_paid, interest_paid, remaining_balance, recorded_by, penalty_paid, payment_method, reference_number)
+     VALUES ($1, $2::numeric, $3::date, $4::numeric, $5::numeric, $6::numeric, $7, $8::numeric, $9, $10) RETURNING id`,
+    [loanId, centsToString(amountCents), paymentDate, centsToString(allocation.principalCents), centsToString(allocation.interestCents), centsToString(remainingCents), currentUserId(req), centsToString(penaltyCents),
+      paymentMethod, reference]
+  );
+  const newState = await recomputeLoanState(client, loanId);
+  await createAuditLog({
+    client,
+    user: req.user,
+    action: 'PAYMENT_CREATED',
+    module: 'Payments',
+    entityType: 'loan_payment',
+    entityId: String(inserted.rows[0].id),
+    description: `Recorded payment for loan ${loan.loan_number}${paymentMethod ? ` (${paymentMethod} ${reference})` : ''}`,
+    oldValues: { balance: loan.balance, status: loan.status },
+    newValues: {
+      balance: newState.balance, status: newState.status, amount: centsToString(amountCents), capital_change: capitalChange(amountCents), payment_date: paymentDate, principal_paid: centsToString(allocation.principalCents), interest_paid: centsToString(allocation.interestCents),
+      ...(penaltyCents > 0 ? { penalty_paid: centsToString(penaltyCents) } : {}), ...(paymentMethod ? { payment_method: paymentMethod, reference_number: reference } : {}),
+    },
+    ...getRequestMeta(req),
   });
+  await notifyMember(client, loan.member_id, {
+    type: 'payment_recorded',
+    title: newState.status === 'paid' ? 'Loan fully paid' : 'Payment recorded',
+    message: `Your ${paymentMethod ? `${paymentMethod} ` : ''}payment of ${pesoText(amountCents)} for loan ${loan.loan_number} was recorded${penaltyCents > 0 ? ` (${pesoText(penaltyCents)} of it for the late penalty)` : ''}. Remaining balance: PHP ${Number(newState.balance).toLocaleString('en-PH', { minimumFractionDigits: 2 })}.${penalty.cents > penaltyCents ? ` Late penalty still due: ${pesoText(penalty.cents - penaltyCents)}.` : ''}`,
+    severity: 'success',
+    link: '/transaction',
+    entityType: 'loan_payment',
+    entityId: inserted.rows[0].id,
+    dedupeKey: `payment-${inserted.rows[0].id}`,
+  });
+  return (await client.query(`${paymentSelect} WHERE p.id = $1`, [inserted.rows[0].id])).rows[0];
+}
 
+/** The member's loans not fully paid, with what is owed today (balance and late penalty), for Pay online. */
+export async function unpaidLoansOf(memberId) {
+  const rows = (await query(`${loanSelect} WHERE l.member_id = $1 AND l.status <> 'paid' ORDER BY l.id`, [memberId])).rows;
+  return rows.filter((row) => toCents(row.amountDueNow) > 0).map((row) => ({
+    id: Number(row.databaseId), loanNumber: row.id, balance: Number(row.balance), penaltyDue: Number(row.penaltyDue), amountDueNow: Number(row.amountDueNow),
+    dueDate: row.dueDate, dateApproved: row.dateApproved, status: row.status,
+  }));
+}
+
+/** Emails the member the receipt of a loan payment just recorded (after the transaction). */
+export async function emailLoanPayment(loanId, payment) {
   const recipient = (await query(
     `SELECT u.id AS user_id, COALESCE(u.email, m.email) AS email FROM loans l LEFT JOIN members m ON m.id = l.member_id LEFT JOIN users u ON u.member_id = m.id WHERE l.id = $1`,
     [loanId]
@@ -709,7 +738,6 @@ export async function recordPayment(req, res) {
     const email = paymentEmail({ memberName: payment.memberName, amount: payment.amount, paymentDate: payment.paymentDate, loanNumber: payment.loanNumber, remainingBalance: payment.remainingBalance, penaltyPaid: payment.penaltyPaid, status: Number(payment.remainingBalance) === 0 ? 'paid' : 'recorded' });
     void sendEmailSafely({ ...email, to: recipient.email, relatedUserId: recipient.user_id });
   }
-  return res.status(201).json({ success: true, payment });
 }
 
 const pesoText = (cents) => `PHP ${(cents / 100).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;

@@ -35,7 +35,7 @@ describe('Record loan payment (loanController.recordPayment)', () => {
     expect(res.statusCode).toBe(201);
     expect(res.body).toMatchObject({ success: true, payment: { id: 90, remainingBalance: '29500.00' } });
     const [, params] = db.client.query.mock.calls.find(([sql]) => sql.includes('INSERT INTO loan_payments'));
-    expect(params).toEqual([5, '5000.00', '2026-11-02', '500.00', '4500.00', '29500.00', 1, '0.00']);
+    expect(params).toEqual([5, '5000.00', '2026-11-02', '500.00', '4500.00', '29500.00', 1, '0.00', null, null]);
     expect(notificationTitle()).toBe('Payment recorded');
   });
 
