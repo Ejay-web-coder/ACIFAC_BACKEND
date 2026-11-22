@@ -89,7 +89,22 @@ function interestText(interestRate, term) {
   return `${rate}% of principal (flat)`;
 }
 
-export function loanDecisionEmail({ requestId, amount, interestRate, term, status, reason, totalRepayment, monthlyPayment, repayment = 'monthly', dueDate = null, penaltyPerDay = 0, graceDays = 0 }) {
+// The deductions taken from the proceeds at release (loan policy), for an approved loan.
+function deductionLines(deductions) {
+  if (!deductions) return '';
+  const overLimit = Number(deductions.capitalBuildUpToSavings) > 0 ? ` (${formatAmount(deductions.capitalBuildUpToSavings)} of it to savings, over the 10% share capital limit)` : '';
+  const lines = [
+    '\n\nTaken from the loan proceeds:',
+    `Savings: ${formatAmount(deductions.savings)}`,
+    `Capital Build-Up (2%): ${formatAmount(deductions.capitalBuildUp)}${overLimit}`,
+    `PCIC life insurance: ${formatAmount(deductions.pcicInsurance)}`,
+    `Cash you receive: ${formatAmount(deductions.cashReleased)}`,
+  ];
+  if (Number(deductions.paidAtRelease) > 0) lines.push(`To pay at the office when the loan is released: ${formatAmount(deductions.paidAtRelease)}`);
+  return lines.join('\n');
+}
+
+export function loanDecisionEmail({ requestId, amount, interestRate, term, status, reason, totalRepayment, monthlyPayment, repayment = 'monthly', dueDate = null, penaltyPerDay = 0, graceDays = 0, deductions = null }) {
   const decision = status === 'approved' ? 'approved' : 'declined';
   // The late penalty: after a grace period past the due date, so much a day until paid in full.
   const late = Number(penaltyPerDay) > 0 ? `\nLate payment: after a ${graceDays}-day grace period, a penalty of ${formatAmount(penaltyPerDay)} a day until paid in full` : '';
@@ -97,7 +112,7 @@ export function loanDecisionEmail({ requestId, amount, interestRate, term, statu
     ? `Payment: the whole ${formatAmount(totalRepayment)}, due${dueDate ? ` by ${formatDateOnly(dueDate)}` : ''}${late}`
     : `Monthly installment: ${formatAmount(monthlyPayment)}`;
   const details = status === 'approved'
-    ? `Amount: ${formatAmount(amount)}\nInterest: ${interestText(interestRate, term)}\nTotal repayment: ${formatAmount(totalRepayment)}\n${payment}\nTerm: ${term ?? 'Not specified'} months`
+    ? `Amount: ${formatAmount(amount)}\nInterest: ${interestText(interestRate, term)}\nTotal repayment: ${formatAmount(totalRepayment)}\n${payment}\nTerm: ${term ?? 'Not specified'} months${deductionLines(deductions)}`
     : `Reason: ${reason || 'Please contact ACIFAC for more information.'}`;
   return message(
     `ACIFAC loan application ${decision}`,

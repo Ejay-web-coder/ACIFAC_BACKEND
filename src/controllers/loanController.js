@@ -8,6 +8,9 @@ import { sendEmailSafely } from '../services/emailService.js';
 import { loanApplicationReceivedEmail, loanDecisionEmail, loanSubmittedEmail, paymentEmail } from '../services/emailTemplates.js';
 import { emailMember } from '../services/memberEmails.js';
 import { loanApprovedSms, loanDeclinedSms, textMember } from '../services/smsService.js';
+import {
+  deductionValues, deductionsText, eligibleFarmArea, FIRST_LOAN_YEAR, firstLoanYear, firstYearLimitText, inKindCentsOf, LOAN_DEDUCTIONS, loanRelease, recordLoanDeductions,
+} from '../services/loanDeductions.js';
 import { sendStoredFile } from '../services/storage.js';
 import { officeOpenNow, paymentHours } from '../services/officeHours.js';
 import { keepAlive } from '../utils/background.js';
@@ -59,6 +62,11 @@ const loanSelect = `
          l.collateral_details AS "collateralDetails", l.in_kind_items AS "inKindItems", l.loan_request_id AS "loanRequestId",
          COALESCE(rs.restructure_count, 0)::int AS "restructureCount", rs.last_restructured_on AS "lastRestructuredOn",
          rf.loan_number AS "renewedFromLoan", rf.balance_carried AS "renewalDeduction", rf.net_proceeds AS "netProceeds",
+         -- Taken from the proceeds at release (loan policy; NULL for loans released before November 2026).
+         l.savings_deducted AS "savingsDeducted", l.capital_build_up AS "capitalBuildUp", l.capital_build_up_to_savings AS "capitalBuildUpToSavings",
+         l.pcic_insurance AS "pcicInsurance", l.cash_released AS "cashReleased", l.paid_at_release AS "paidAtRelease",
+         -- When the member's first year of loans (at most 2 hectares a loan) ends: 12 months after their first loan.
+         (SELECT TO_CHAR((MIN(fl.date_approved) + make_interval(months => ${FIRST_LOAN_YEAR.months}))::date, 'YYYY-MM-DD') FROM loans fl WHERE fl.member_id = l.member_id) AS "firstLoanYearEnds",
          -- Who approved the loan: the reviewer of its application, else whoever recorded the restructuring that made it.
          COALESCE(${displayName('approver')}, ${displayName('restructurer')}) AS "approvedBy",
          COALESCE(approver.position, restructurer.position) AS "approvedByPosition",
@@ -123,7 +131,9 @@ const requestSelect = `
          r.borrower_address AS "borrowerAddress", r.borrower_age AS "borrowerAge", r.borrower_gender AS "borrowerGender",
          r.borrower_civil_status AS "borrowerCivilStatus", r.borrower_occupation AS "borrowerOccupation", r.years_farming AS "yearsFarming",
          r.farm_location AS "farmLocation", r.barangay, r.municipality, r.province, r.irrigation_other AS "irrigationOther",
-         ol.loan_number AS "openLoanNumber", ol.balance AS "openLoanBalance", ol.total AS "openLoanTotal", ol.penalty AS "openLoanPenalty"
+         ol.loan_number AS "openLoanNumber", ol.balance AS "openLoanBalance", ol.total AS "openLoanTotal", ol.penalty AS "openLoanPenalty",
+         -- The member's first year of loans ends 12 months after their first loan (null: no loan yet); then the 2-hectare limit ends.
+         (SELECT TO_CHAR((MIN(fl.date_approved) + make_interval(months => ${FIRST_LOAN_YEAR.months}))::date, 'YYYY-MM-DD') FROM loans fl WHERE fl.member_id = r.member_id) AS "firstLoanYearEnds"
   FROM loan_requests r LEFT JOIN members m ON m.id = r.member_id
   LEFT JOIN LATERAL (
     -- The member's open loan, which approving this application would restructure (80% paid) or which blocks it.
@@ -203,9 +213,15 @@ export async function prepareApplication(db, body, member) {
   if (Number(requestedAmount) <= 0) throw badRequest('Requested loan amount must be greater than zero.');
   const farmArea = readDecimal(body.farmArea ?? body.farm_area ?? member.farm_area_ha, 'Farm area', AREA_PATTERN, 10000);
   if (Number(farmArea) <= 0) throw badRequest('Farm area must be greater than zero.');
-  const financials = await calculateLoanFinancials(db, { farmArea, amount: requestedAmount, term });
+  // In the member's first year of loans the loan covers at most 2 hectares (loan policy rule 2).
+  const firstYear = member.id ? await firstLoanYear(db, member.id, todayDateOnly()) : null;
+  const loanArea = eligibleFarmArea(farmArea, firstYear);
+  const financials = await calculateLoanFinancials(db, { farmArea: loanArea, amount: requestedAmount, term });
   if (toCents(requestedAmount) > toCents(financials.maximum_eligible_amount)) {
-    throw badRequest(`Requested loan amount exceeds the maximum eligible amount of PHP ${Number(financials.maximum_eligible_amount).toLocaleString('en-PH', { minimumFractionDigits: 2 })} for ${Number(farmArea)} hectares.`);
+    const maximum = `PHP ${Number(financials.maximum_eligible_amount).toLocaleString('en-PH', { minimumFractionDigits: 2 })}`;
+    throw badRequest(loanArea !== String(farmArea)
+      ? `${firstYearLimitText(firstYear)}, so the most that can be borrowed is ${maximum}.`
+      : `Requested loan amount exceeds the maximum eligible amount of ${maximum} for ${Number(farmArea)} hectares.`);
   }
 
   const email = clean(body.borrowerEmail, 255) || member.email || '';
@@ -274,18 +290,32 @@ async function insertLoan(client, loan) {
 // paymentHours: when the office receives loan payments (open/close in minutes after midnight).
 export async function getLoanPolicy(req, res) {
   const hours = paymentHours();
-  return res.json({ success: true, policy: { ...LOAN_POLICY, paymentHours: { ...hours, openNow: officeOpenNow(hours) } } });
+  const deductions = {
+    savingsUpTo: centsToString(LOAN_DEDUCTIONS.savingsUpToCents), savingsSmall: centsToString(LOAN_DEDUCTIONS.savingsSmallCents),
+    savingsLarge: centsToString(LOAN_DEDUCTIONS.savingsLargeCents), capitalBuildUpPercent: LOAN_DEDUCTIONS.capitalBuildUpPercent, pcicInsurance: centsToString(LOAN_DEDUCTIONS.pcicInsuranceCents),
+  };
+  return res.json({ success: true, policy: { ...LOAN_POLICY, deductions, firstLoanYear: FIRST_LOAN_YEAR, paymentHours: { ...hours, openNow: officeOpenNow(hours) } } });
 }
 
 // Server-side calculation preview used by the application form, so the
 // numbers a user sees before submitting are the numbers that will be stored.
+// { amount, farmArea, inKindAmount?, memberId? }: a member's quote is always
+// their own; the office's is for memberId when it gives one (the 2-hectare
+// limit of a first year of loans depends on the member).
 export async function quoteLoan(req, res) {
   const amountCents = parseMoneyInput(req.body?.amount ?? 0, { allowZero: true });
+  const inKindCents = parseMoneyInput(req.body?.inKindAmount ?? 0, { allowZero: true });
   const farmAreaText = String(req.body?.farmArea ?? '0').trim() || '0';
   if (amountCents === null) throw badRequest('Amount must be a valid non-negative amount.');
+  if (inKindCents === null) throw badRequest('In-kind amount must be a valid non-negative amount.');
   if (!AREA_PATTERN.test(farmAreaText)) throw badRequest('Farm area must be a valid non-negative number.');
+  const memberId = req.user?.role === 'MEMBER' ? Number(req.user.member_id) || null
+    : req.body?.memberId ? parseId(req.body.memberId, 'member ID') : null;
+  const firstYear = memberId ? await firstLoanYear(null, memberId, todayDateOnly()) : null;
+  const loanArea = eligibleFarmArea(farmAreaText, firstYear);
   const term = LOAN_POLICY.loanTerm;
-  const financials = await calculateLoanFinancials(null, { farmArea: farmAreaText, amount: centsToString(amountCents), term });
+  const financials = await calculateLoanFinancials(null, { farmArea: loanArea, amount: centsToString(amountCents), term });
+  const release = loanRelease({ amountCents, inKindCents: Math.min(inKindCents, amountCents) });
   return res.json({
     success: true,
     quote: {
@@ -299,6 +329,14 @@ export async function quoteLoan(req, res) {
       totalRepayment: financials.total_repayment,
       monthlyPayment: financials.monthly_payment,
       withinLimit: amountCents <= toCents(financials.maximum_eligible_amount),
+      // The farm area the maximum is for, and the member's first year of loans (null without a member).
+      eligibleFarmArea: loanArea,
+      firstLoanYear: firstYear ? { ...firstYear, maxHectares: FIRST_LOAN_YEAR.maxHectares, limited: loanArea !== farmAreaText } : null,
+      // What is taken from the proceeds at release (before what a restructured loan still owes).
+      deductions: {
+        savings: centsToString(release.savingsCents), capitalBuildUp: centsToString(release.capitalBuildUpCents), pcicInsurance: centsToString(release.pcicCents),
+        total: centsToString(release.totalCents), cashReleased: centsToString(release.cashReleasedCents), paidAtRelease: centsToString(release.paidAtReleaseCents),
+      },
     },
   });
 }
@@ -465,6 +503,8 @@ export async function createLoan(req, res, _next, { takeIds, borrowerSignature =
     });
     // With 80% of an open loan paid, the new loan restructures it.
     const renewal = open ? await closeIntoNewLoan(client, req, open, { newLoanId: id, amountCents: toCents(application.requestedAmount), reason: 'Restructured by a new loan', today: todayDateOnly() }) : null;
+    // Savings, 2% Capital Build-Up and PCIC insurance come out of the proceeds (loan policy).
+    const release = await recordLoanDeductions(client, req, id, { carriedCents: carriedCentsOf(renewal) });
     if (renewal) {
       await notifyMember(client, member.id, { type: 'loan_restructured', title: 'Loan restructured', message: restructuredMessage(open, await newLoanFigures(client, id), renewal), severity: 'info', link: '/loan-status', entityType: 'loan', entityId: id, dedupeKey: `loan-restructured-${renewal.id}` });
     }
@@ -476,17 +516,17 @@ export async function createLoan(req, res, _next, { takeIds, borrowerSignature =
       entityType: 'loan',
       entityId: String(id),
       description: `Created loan for ${member.full_name}`,
-      newValues: { member_id: member.id, amount: application.requestedAmount, capital_change: capitalChange(-(renewal ? toCents(renewal.net_proceeds) : toCents(application.requestedAmount))), term: application.term, farm_area: application.farmArea, total_repayment: application.financials.total_repayment, certified: application.certified, signed: Boolean(borrowerSignature), ids: idSummary(idDocuments) },
+      newValues: { member_id: member.id, amount: application.requestedAmount, capital_change: capitalChange(-(renewal ? toCents(renewal.net_proceeds) : toCents(application.requestedAmount))), term: application.term, farm_area: application.farmArea, total_repayment: application.financials.total_repayment, deductions: deductionValues(release), certified: application.certified, signed: Boolean(borrowerSignature), ids: idSummary(idDocuments) },
       ...getRequestMeta(req),
     });
-    await notifyMember(client, member.id, { type: 'loan_approved', title: 'Loan approved', message: `A loan of PHP ${Number(application.requestedAmount).toLocaleString('en-PH', { minimumFractionDigits: 2 })} was approved for you.`, severity: 'success', link: '/loan-status', entityType: 'loan', entityId: id, dedupeKey: `loan-created-${id}` });
+    await notifyMember(client, member.id, { type: 'loan_approved', title: 'Loan approved', message: `A loan of PHP ${Number(application.requestedAmount).toLocaleString('en-PH', { minimumFractionDigits: 2 })} was approved for you. ${deductionsText(release)}`, severity: 'success', link: '/loan-status', entityType: 'loan', entityId: id, dedupeKey: `loan-created-${id}` });
     return id;
   });
   const result = await query(`${loanSelect} WHERE l.id = $1`, [loanId]);
   const loan = result.rows[0];
   void emailMember(loan.memberDatabaseId, loanDecisionEmail({
     requestId: loan.id, amount: loan.amount, interestRate: loan.interestRate, term: loan.term, status: 'approved', totalRepayment: loan.totalAmount, monthlyPayment: loan.monthlyPayment,
-    repayment: loan.repayment, dueDate: loan.dueDate, penaltyPerDay: loan.penaltyPerDay, graceDays: loan.graceDays,
+    repayment: loan.repayment, dueDate: loan.dueDate, penaltyPerDay: loan.penaltyPerDay, graceDays: loan.graceDays, deductions: emailDeductions(loan),
   }));
   void textMember(loan.memberDatabaseId, loanApprovedSms({
     amount: loan.amount, totalRepayment: loan.totalAmount, dueDate: loan.dueDate, repayment: loan.repayment, monthlyPayment: loan.monthlyPayment, term: loan.term,
@@ -509,6 +549,7 @@ export async function reviewLoanRequest(req, res) {
     let open = null;
     let renewal = null;
     let renewalMessage = '';
+    let release = null;
     if (status === 'approved') {
       const member = (await client.query(`${memberApplicationSelect} FOR UPDATE`, [requestRow.member_id])).rows[0];
       if (!member) throw badRequest('This member is no longer active, so the loan cannot be approved.');
@@ -517,6 +558,14 @@ export async function reviewLoanRequest(req, res) {
       const interestRate = requestRow.interest_rate ?? LOAN_POLICY.legacyInterestRate;
       // Applications made before the 6-month single-payment policy are approved under it too.
       const financials = await calculateLoanFinancials(client, { farmArea: requestRow.farm_area ?? 0, amount: requestRow.amount, term: LOAN_POLICY.loanTerm, interestRate });
+      // In the member's first year of loans, at most 2 hectares (also for applications sent before the rule).
+      const firstYear = await firstLoanYear(client, requestRow.member_id, todayDateOnly());
+      if (firstYear.inFirstYear) {
+        const firstYearMaximum = await calculateLoanFinancials(client, { farmArea: FIRST_LOAN_YEAR.maxHectares, amount: requestRow.amount, term: LOAN_POLICY.loanTerm, interestRate });
+        if (toCents(requestRow.amount) > toCents(firstYearMaximum.maximum_eligible_amount)) {
+          throw badRequest(`${firstYearLimitText(firstYear)}, so at most ${pesoText(toCents(firstYearMaximum.maximum_eligible_amount))} can be lent. Disapprove this application; the member may apply again for up to that amount.`);
+        }
+      }
       open = await openLoanOf(client, requestRow.member_id);
       assertMayBorrow(open, toCents(requestRow.amount));
       createdLoanId = await insertLoan(client, {
@@ -533,6 +582,8 @@ export async function reviewLoanRequest(req, res) {
         renewal = await closeIntoNewLoan(client, req, open, { newLoanId: createdLoanId, amountCents: toCents(requestRow.amount), reason: `Restructured on approval of loan application #${requestRow.id}`, today: todayDateOnly() });
         renewalMessage = restructuredMessage(open, await newLoanFigures(client, createdLoanId), renewal);
       }
+      // Savings, 2% Capital Build-Up and PCIC insurance come out of the proceeds (loan policy).
+      release = await recordLoanDeductions(client, req, createdLoanId, { carriedCents: carriedCentsOf(renewal) });
     }
     await client.query(`UPDATE loan_requests SET status = $1, reviewed_at = NOW(), reviewed_by = $2, review_notes = $3, updated_at = NOW() WHERE id = $4`, [status, currentUserId(req), reviewNotes, requestRow.id]);
     await createAuditLog({
@@ -544,14 +595,14 @@ export async function reviewLoanRequest(req, res) {
       entityId: String(requestRow.id),
       description: `Loan request ${status} for ${requestRow.member_name}`,
       oldValues: { status: requestRow.status },
-      newValues: { status, loan_id: createdLoanId, review_notes: reviewNotes, ...(createdLoanId ? { amount: requestRow.amount, capital_change: capitalChange(-(renewal ? toCents(renewal.net_proceeds) : toCents(requestRow.amount))) } : {}), ...(renewal ? { restructured_loan: open.row.loan_number, deducted: renewal.balance_carried, ...(open.penaltyCents > 0 ? { penalty_deducted: renewal.penalty_carried } : {}), net_proceeds: renewal.net_proceeds } : {}) },
+      newValues: { status, loan_id: createdLoanId, review_notes: reviewNotes, ...(createdLoanId ? { amount: requestRow.amount, capital_change: capitalChange(-(renewal ? toCents(renewal.net_proceeds) : toCents(requestRow.amount))) } : {}), ...(renewal ? { restructured_loan: open.row.loan_number, deducted: renewal.balance_carried, ...(open.penaltyCents > 0 ? { penalty_deducted: renewal.penalty_carried } : {}), net_proceeds: renewal.net_proceeds } : {}), ...(release ? { deductions: deductionValues(release) } : {}) },
       ...getRequestMeta(req),
     });
     await notifyMember(client, requestRow.member_id, {
       type: status === 'approved' ? 'loan_approved' : 'loan_declined',
       title: status === 'approved' ? 'Loan application approved' : 'Loan application declined',
       message: status === 'approved'
-        ? `Your ${requestRow.loan_type} loan application for PHP ${Number(requestRow.amount).toLocaleString('en-PH', { minimumFractionDigits: 2 })} was approved.${renewalMessage ? ` ${renewalMessage}` : ''}`
+        ? `Your ${requestRow.loan_type} loan application for PHP ${Number(requestRow.amount).toLocaleString('en-PH', { minimumFractionDigits: 2 })} was approved.${renewalMessage ? ` ${renewalMessage}` : ''} ${deductionsText(release)}`
         : `Your ${requestRow.loan_type} loan application was declined.${reviewNotes ? ` Reason: ${reviewNotes}` : ''}`,
       severity: status === 'approved' ? 'success' : 'error',
       link: '/loan-status',
@@ -567,7 +618,13 @@ export async function reviewLoanRequest(req, res) {
     [request.member_id]
   );
   const recipient = recipientResult.rows[0];
-  const loan = loanId ? (await query(`SELECT total_repayment, monthly_payment, interest_rate, term, repayment, TO_CHAR(due_date, 'YYYY-MM-DD') AS due_date, penalty_per_day, grace_days FROM loans WHERE id = $1`, [loanId])).rows[0] : null;
+  const loan = loanId ? (await query(
+    `SELECT total_repayment, monthly_payment, interest_rate, term, repayment, TO_CHAR(due_date, 'YYYY-MM-DD') AS due_date, penalty_per_day, grace_days,
+            savings_deducted AS "savingsDeducted", capital_build_up AS "capitalBuildUp", capital_build_up_to_savings AS "capitalBuildUpToSavings",
+            pcic_insurance AS "pcicInsurance", cash_released AS "cashReleased", paid_at_release AS "paidAtRelease"
+     FROM loans WHERE id = $1`,
+    [loanId]
+  )).rows[0] : null;
   // The decision is also texted to the member's mobile number.
   void textMember(request.member_id, status === 'approved'
     ? loan && loanApprovedSms({ amount: request.amount, totalRepayment: loan.total_repayment, dueDate: loan.due_date, repayment: loan.repayment, monthlyPayment: loan.monthly_payment, term: loan.term })
@@ -576,7 +633,7 @@ export async function reviewLoanRequest(req, res) {
     const email = loanDecisionEmail({
       requestId: request.id, amount: request.amount, interestRate: loan?.interest_rate, term: loan?.term ?? request.term, status, reason: reviewNotes,
       totalRepayment: loan?.total_repayment, monthlyPayment: loan?.monthly_payment, repayment: loan?.repayment, dueDate: loan?.due_date,
-      penaltyPerDay: loan?.penalty_per_day, graceDays: loan?.grace_days,
+      penaltyPerDay: loan?.penalty_per_day, graceDays: loan?.grace_days, deductions: loan ? emailDeductions(loan) : null,
     });
     void sendEmailSafely({ ...email, to: recipient.email, relatedUserId: recipient.user_id });
   }
@@ -738,9 +795,19 @@ async function closeIntoNewLoan(client, req, open, { newLoanId, amountCents, rea
   )).rows[0];
 }
 
-// The words the member is told when a new loan restructured their open one.
-const restructuredMessage = (open, newLoan, restructuring) =>
-  `Your loan ${open.row.loan_number} was restructured into the new loan ${newLoan.loan_number} of ${pesoText(toCents(newLoan.amount))}. The ${owedText(open)} still owed was deducted, so you receive ${pesoText(toCents(restructuring.net_proceeds))}. The new loan, ${pesoText(toCents(newLoan.total))} with interest, is due by ${formatDateOnly(newLoan.due_date)}.`;
+// The words the member is told when a new loan restructured their open one;
+// with `release`, also what else was taken from the proceeds and what they receive.
+const restructuredMessage = (open, newLoan, restructuring, release = null) =>
+  `Your loan ${open.row.loan_number} was restructured into the new loan ${newLoan.loan_number} of ${pesoText(toCents(newLoan.amount))}. The ${owedText(open)} still owed was deducted from it${release ? '' : `, leaving ${pesoText(toCents(restructuring.net_proceeds))}`}. The new loan, ${pesoText(toCents(newLoan.total))} with interest, is due by ${formatDateOnly(newLoan.due_date)}.${release ? ` ${deductionsText(release)}` : ''}`;
+
+// What a restructuring took from the new loan's proceeds: the old loan's balance and late penalty.
+const carriedCentsOf = (renewal) => (renewal ? toCents(renewal.balance_carried) + toCents(renewal.penalty_carried) : 0);
+
+// The deductions of a released loan (camelCase loan columns) for loanDecisionEmail; null for older loans.
+const emailDeductions = (loan) => (loan?.savingsDeducted === null || loan?.savingsDeducted === undefined ? null : {
+  savings: loan.savingsDeducted, capitalBuildUp: loan.capitalBuildUp, capitalBuildUpToSavings: loan.capitalBuildUpToSavings,
+  pcicInsurance: loan.pcicInsurance, cashReleased: loan.cashReleased, paidAtRelease: loan.paidAtRelease,
+});
 const newLoanFigures = async (client, loanId) => (await client.query(
   `SELECT loan_number, amount, due_date, COALESCE(total_repayment, ROUND(amount + ROUND(amount * interest_rate / 100, 2), 2)) AS total FROM loans WHERE id = $1`, [loanId]
 )).rows[0];
@@ -774,9 +841,14 @@ export async function restructureLoanRequest(req, res) {
     if (!member) throw badRequest('This member is no longer active, so the loan cannot be restructured into a new one.');
     const farmArea = readDecimal(req.body?.farmArea ?? row.farm_area ?? member.farm_area_ha, 'Farm area', AREA_PATTERN, 10000);
     if (Number(farmArea) <= 0) throw badRequest('Farm area must be greater than zero.');
-    const financials = await calculateLoanFinancials(client, { farmArea, amount, term: LOAN_POLICY.loanTerm });
+    // In the member's first year of loans, at most 2 hectares (loan policy rule 2).
+    const firstYear = await firstLoanYear(client, row.member_id, today);
+    const loanArea = eligibleFarmArea(farmArea, firstYear);
+    const financials = await calculateLoanFinancials(client, { farmArea: loanArea, amount, term: LOAN_POLICY.loanTerm });
     if (amountCents > toCents(financials.maximum_eligible_amount)) {
-      throw badRequest(`New loan amount exceeds the maximum eligible amount of ${pesoText(toCents(financials.maximum_eligible_amount))} for ${Number(farmArea)} hectares.`);
+      throw badRequest(loanArea !== String(farmArea)
+        ? `${firstYearLimitText(firstYear)}, so the new loan can be at most ${pesoText(toCents(financials.maximum_eligible_amount))}.`
+        : `New loan amount exceeds the maximum eligible amount of ${pesoText(toCents(financials.maximum_eligible_amount))} for ${Number(farmArea)} hectares.`);
     }
     assertMayBorrow(open, amountCents);
 
@@ -789,6 +861,8 @@ export async function restructureLoanRequest(req, res) {
       collateralType: row.collateral_type, collateralDetails: row.collateral_details, idDocuments: row.id_documents,
     });
     const result = await closeIntoNewLoan(client, req, open, { newLoanId: createdLoanId, amountCents, reason, today });
+    // Savings, 2% Capital Build-Up and PCIC insurance come out of the proceeds (loan policy).
+    const release = await recordLoanDeductions(client, req, createdLoanId, { carriedCents: carriedCentsOf(result) });
     const newLoan = await newLoanFigures(client, createdLoanId);
 
     await createAuditLog({
@@ -803,11 +877,12 @@ export async function restructureLoanRequest(req, res) {
       newValues: {
         status: 'paid', deducted: result.balance_carried, ...(open.penaltyCents > 0 ? { penalty_deducted: result.penalty_carried } : {}), new_loan_id: createdLoanId, new_loan_number: newLoan.loan_number, new_loan_amount: amount,
         net_proceeds: result.net_proceeds, capital_change: capitalChange(-toCents(result.net_proceeds)), farm_area: farmArea, due_date: newLoan.due_date, reason,
+        deductions: deductionValues(release),
       },
       ...getRequestMeta(req),
     });
     await notifyMember(client, row.member_id, {
-      type: 'loan_restructured', title: 'Loan restructured', message: restructuredMessage(open, newLoan, result),
+      type: 'loan_restructured', title: 'Loan restructured', message: restructuredMessage(open, newLoan, result, release),
       severity: 'info', link: '/loan-status', entityType: 'loan', entityId: createdLoanId, dedupeKey: `loan-restructured-${result.id}`,
     });
     return { loan: row, newLoanId: createdLoanId, restructuring: result };

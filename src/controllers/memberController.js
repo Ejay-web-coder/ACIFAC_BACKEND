@@ -172,6 +172,17 @@ export async function shareCapitalMaxCents(db, memberId = null) {
 
 // Holds share-capital checks in one line, so two payments at once can't both pass on the same totals.
 const lockShareCapital = (client) => client.query(`SELECT pg_advisory_xact_lock(hashtext('share-capital-cap'))`);
+
+/**
+ * How much more share capital the member may hold now (cents, never below 0),
+ * with the totals locked until the caller's transaction ends (as a contribution
+ * checks them). Used for the Capital Build-Up taken from a loan's proceeds.
+ */
+export async function shareCapitalRoomCents(client, memberId) {
+  await lockShareCapital(client);
+  const current = toCents((await client.query('SELECT COALESCE(SUM(amount), 0) AS total FROM share_contributions WHERE member_id = $1', [memberId])).rows[0].total);
+  return Math.max(0, (await shareCapitalMaxCents(client, memberId)) - current);
+}
 const pesosFromCents = (cents) => `PHP ${Number(centsToString(Math.max(0, cents))).toLocaleString('en-PH', { minimumFractionDigits: 2 })}`;
 
 async function getShareDetails(db, memberId) {

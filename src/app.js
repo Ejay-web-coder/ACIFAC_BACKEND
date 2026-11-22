@@ -20,6 +20,7 @@ import aboutRoutes from './routes/aboutRoutes.js';
 import policyRoutes from './routes/policyRoutes.js';
 import { announcementRoutes, eventRoutes, legalDocumentRoutes, notificationRoutes } from './routes/communicationRoutes.js';
 import { duesRoutes, pushRoutes } from './routes/duesRoutes.js';
+import { otherIncomeRoutes } from './routes/otherIncomeRoutes.js';
 import { flushPushOutbox, pushAfterResponse } from './services/pushService.js';
 import { refreshDuesReminders } from './services/dues.js';
 import { refreshLoyaltyMilestones } from './services/loyalty.js';
@@ -108,6 +109,7 @@ export function createApp() {
   app.use('/api/events', eventRoutes);
   app.use('/api/dues', duesRoutes);
   app.use('/api/push', pushRoutes);
+  app.use('/api/other-income', otherIncomeRoutes);
 
   app.use('/api', (req, res) => res.status(404).json({ success: false, message: 'Endpoint not found.' }));
   app.use(errorHandler);

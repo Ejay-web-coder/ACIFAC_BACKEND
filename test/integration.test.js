@@ -2152,7 +2152,9 @@ test('loans: one open loan per member; an application once 80% is paid restructu
   assert.deepEqual([old.loan.status, old.loan.balance, old.restructurings[0].kind, old.restructurings[0].newLoanNumber], ['paid', '0.00', 'renewal', created.id]);
   assert.match(old.restructurings[0].reason, /approval of loan application/);
   const told = (await pool.query(`SELECT message FROM notifications WHERE user_id = $1 AND type = 'loan_approved' ORDER BY id DESC LIMIT 1`, [state.memberUserId])).rows[0].message;
-  assert.match(told, /L-ONE-001 was restructured.*you receive PHP 17,950\.00/);
+  // The balance comes off first, then the loan policy's deductions (PHP 500 savings, 2% Capital Build-Up, PHP 50 PCIC).
+  assert.match(told, /L-ONE-001 was restructured.*deducted from it, leaving PHP 17,950\.00\..*The loan policy deducts PHP 500\.00 savings, PHP 400\.00 Capital Build-Up \(2%\) and PHP 50\.00 PCIC insurance from the proceeds; you receive PHP 17,000\.00 in cash\.$/);
+  assert.deepEqual([created.savingsDeducted, created.capitalBuildUp, created.pcicInsurance, created.cashReleased, created.paidAtRelease], ['500.00', '400.00', '50.00', '17000.00', '0.00']);
   // The audit log records how each step changed the capital: the payment in, the money released out.
   const capitalLog = async (action, entityId) => (await pool.query(`SELECT new_values ->> 'capital_change' AS change FROM audit_logs WHERE action = $1 AND entity_id = $2 ORDER BY id DESC LIMIT 1`, [action, String(entityId)])).rows[0]?.change;
   const paymentId = old.payments.find((row) => row.amount === '8200.00').id;
@@ -3073,7 +3075,7 @@ test('dashboard and analytics use real data', { skip }, async () => {
   const { netIncome, netIncomeBreakdown: parts } = dashboard.data.stats;
   assert.equal(dashboard.data.stats.kadiwaRevenue, undefined);
   assert.equal(dashboard.data.stats.machineryOperations, undefined);
-  assert.equal(Math.round((parts.kadiwa + parts.machinery + parts.loans) * 100), Math.round(netIncome * 100));
+  assert.equal(Math.round((parts.kadiwa + parts.machinery + parts.loans + parts.others) * 100), Math.round(netIncome * 100));
   assert.equal(parts.kadiwa, analytics.data.summary.kadiwaNetSales);
   assert.equal(parts.loans, analytics.data.summary.interestCollected);
   assert.ok(parts.loans > 0, 'the loan payments in these tests include interest');
@@ -3100,7 +3102,7 @@ test('dashboard and analytics use real data', { skip }, async () => {
   assert.ok(Math.abs(Math.round(incomeShares[0].amount * 100) - Math.round(netCents * 0.35)) <= 1);
   // The Capital card: where the cooperative's money is, by module, and their total.
   const capital = dashboard.data.stats.capital;
-  assert.deepEqual(capital.parts.map((part) => part.key), ['shareCapital', 'savings', 'loans', 'machinery', 'kadiwa']);
+  assert.deepEqual(capital.parts.map((part) => part.key), ['shareCapital', 'savings', 'loans', 'machinery', 'kadiwa', 'others']);
   const byKey = Object.fromEntries(capital.parts.map((part) => [part.key, part.amount]));
   const sql = (await pool.query(`SELECT
       (SELECT COALESCE(SUM(sc.amount), 0) FROM share_contributions sc JOIN members m ON m.id = sc.member_id WHERE m.status <> 'archived') AS shares,
@@ -3109,6 +3111,30 @@ test('dashboard and analytics use real data', { skip }, async () => {
   assert.deepEqual([byKey.shareCapital, byKey.savings, byKey.loans], [Number(sql.shares), Number(sql.savings), Number(sql.loans)]);
   assert.deepEqual([byKey.machinery, byKey.kadiwa], [parts.machinery, parts.kadiwa], 'the same cash as in the net income');
   assert.equal(Math.round(capital.total * 100), capital.parts.reduce((sum, part) => sum + Math.round(part.amount * 100), 0));
+
+  // Others: membership fees, absence fines and transfer fees collected, and other income the office records.
+  const c = (amount) => Math.round(amount * 100);
+  const others = dashboard.data.stats.othersBreakdown;
+  assert.equal(c(others.membershipFees + others.duesFines + others.recorded), c(parts.others));
+  assert.equal(byKey.others, parts.others, 'the same money as in the net income');
+  const fees = (await pool.query(`SELECT COALESCE(SUM((additional_info ->> 'membershipFee')::numeric), 0) AS total FROM members
+                                  WHERE additional_info ->> 'membershipFee' ~ '^[0-9]+(\\.[0-9]{1,2})?$' AND COALESCE(additional_info ->> 'paymentOfMembershipFee', '') <> 'No'`)).rows[0].total;
+  assert.equal(others.membershipFees, Number(fees));
+  assert.equal((await member.get('/api/other-income')).status, 403, 'the office only');
+  assert.equal((await admin.post('/api/other-income', { receivedOn: '2999-01-01', source: 'Donation', amount: '100' })).status, 400, 'not in the future');
+  assert.equal((await admin.post('/api/other-income', { receivedOn: '2026-01-05', source: '  ', amount: '100' })).status, 400, 'a source is needed');
+  assert.equal((await admin.post('/api/other-income', { receivedOn: '2026-01-05', source: 'Donation', amount: '0' })).status, 400);
+  const donation = await admin.post('/api/other-income', { receivedOn: '2026-01-05', source: 'Donation from the municipality', amount: '15000.50', reference: 'OR-77', notes: 'For the drying pavement' });
+  assert.equal(donation.status, 201, JSON.stringify(donation.data));
+  const withDonation = (await admin.get('/api/admin/dashboard')).data.stats;
+  assert.deepEqual([c(withDonation.netIncome - netIncome), c(withDonation.othersBreakdown.recorded - others.recorded), c(withDonation.capital.total - capital.total)], [1500050, 1500050, 1500050]);
+  const listed = (await admin.get('/api/other-income')).data;
+  assert.deepEqual([listed.data[0].source, listed.data[0].amount, listed.data[0].reference, listed.data[0].receivedOn, listed.data[0].notes], ['Donation from the municipality', '15000.50', 'OR-77', '2026-01-05', 'For the drying pavement']);
+  assert.equal((await pool.query(`SELECT new_values ->> 'capital_change' AS change FROM audit_logs WHERE action = 'OTHER_INCOME_RECORDED' AND entity_id = $1`, [String(donation.data.data.id)])).rows[0].change, '+15000.50');
+  assert.equal((await admin.delete(`/api/other-income/${donation.data.data.id}`)).status, 200);
+  assert.equal(c((await admin.get('/api/admin/dashboard')).data.stats.netIncome), c(netIncome), 'deleting it takes it out again');
+  assert.equal((await admin.delete(`/api/other-income/${donation.data.data.id}`)).status, 404);
+  assert.equal((await pool.query(`SELECT old_values ->> 'source' AS source FROM audit_logs WHERE action = 'OTHER_INCOME_DELETED' AND entity_id = $1`, [String(donation.data.data.id)])).rows[0].source, 'Donation from the municipality', 'the audit log keeps it');
 
   // A member's dividend: this year's net income, less 30% statutory funds, half
   // of the surplus shared by share capital. Confidential: only the office sees it.
@@ -3119,7 +3145,7 @@ test('dashboard and analytics use real data', { skip }, async () => {
   assert.equal(d.year, Number(d.asOf.slice(0, 4)));
   assert.equal(d.yearComplete, false);
   assert.deepEqual(d.rates, { statutory: 30, dividendPool: 50, patronageRefundPool: 50 });
-  assert.equal(cents(d.netIncomeParts.kadiwa + d.netIncomeParts.machinery + d.netIncomeParts.loans), cents(d.netIncome));
+  assert.equal(cents(d.netIncomeParts.kadiwa + d.netIncomeParts.machinery + d.netIncomeParts.loans + d.netIncomeParts.others), cents(d.netIncome));
   assert.equal(cents(d.statutoryTotal + d.netSurplus), cents(Math.max(0, d.netIncome)));
   assert.equal(cents(d.dividendPool + d.patronageRefundPool), cents(d.netSurplus));
   const shares = (await pool.query(
@@ -3328,7 +3354,11 @@ test('member activity log: own actions, office actions, filters, privacy', { ski
 
   const all = await member.get('/api/members/me/activity?limit=50');
   assert.equal(all.status, 200, JSON.stringify(all.data));
-  const actions = all.data.data.map((entry) => entry.action);
+  // Each loan also adds the office's savings and share capital entries (its deductions), which can push
+  // the member's older sign-in off the newest 50: their own entries are read as well.
+  const mine = (await member.get('/api/members/me/activity?actor=me&limit=50')).data.data;
+  const entries = [...all.data.data, ...mine.filter((entry) => !all.data.data.some((seen) => seen.id === entry.id))];
+  const actions = entries.map((entry) => entry.action);
   for (const action of ['LOGIN', 'PROFILE_UPDATED', 'NOTIFICATION_PREFERENCES_UPDATED', 'LOGIN_FAILURE', 'SAVINGS_DEPOSIT_CREATED', 'LOAN_APPLICATION_SUBMITTED']) assert.ok(actions.includes(action), action);
   const profile = all.data.data.find((entry) => entry.action === 'PROFILE_UPDATED');
   assert.equal(profile.actor, 'you');
@@ -3342,7 +3372,7 @@ test('member activity log: own actions, office actions, filters, privacy', { ski
   assert.equal(office.description, 'The office recorded a deposit to your savings.');
   assert.equal(typeof office.amount, 'number');
   assert.equal(all.data.data.find((entry) => entry.action === 'PROFILE_UPDATED').amount, null);
-  assert.match(all.data.data.find((entry) => entry.action === 'LOGIN').description, /^You signed in/);
+  assert.match(entries.find((entry) => entry.action === 'LOGIN').description, /^You signed in/);
   assert.ok('lastSignInDevice' in all.data.summary);
   assert.ok(!JSON.stringify(all.data).includes('testadmin'), 'administrator names are never shown');
   assert.ok(!JSON.stringify(all.data).includes(second.data.data.member_number), 'no entries about other members');
@@ -4185,7 +4215,15 @@ test('loans: restructuring after 80% paid deducts the balance from a new loan an
 
   // The member is told; the credit history keeps the late installments and counts the restructured loan.
   const told = (await pool.query(`SELECT message FROM notifications WHERE user_id = $1 AND type = 'loan_restructured'`, [state.memberUserId])).rows;
-  assert.ok(told.length === 1 && told[0].message.includes('L-RS-001') && told[0].message.includes(created.id) && told[0].message.includes('PHP 47,540.00'), JSON.stringify(told));
+  // PHP 50,000 less the PHP 2,460 owed, less PHP 500 savings, PHP 1,000 Capital Build-Up and PHP 50 PCIC.
+  assert.ok(told.length === 1 && told[0].message.includes('L-RS-001') && told[0].message.includes(created.id) && told[0].message.endsWith('you receive PHP 45,990.00 in cash.'), JSON.stringify(told));
+  // The savings and the Capital Build-Up are on the member's records, linked to the new loan.
+  const releasedLoan = (await pool.query(
+    `SELECT l.cash_released, s.amount AS savings, s.payment_method, s.reference_number AS savings_ref, c.amount AS share, c.reference_number AS share_ref
+     FROM loans l JOIN savings_transactions s ON s.id = l.savings_deduction_id JOIN share_contributions c ON c.id = l.capital_build_up_contribution_id
+     WHERE l.loan_number = $1`, [created.id]
+  )).rows[0];
+  assert.deepEqual(releasedLoan, { cash_released: '45990.00', savings: '500.00', payment_method: 'Loan deduction', savings_ref: `${created.id}-SAV`, share: '1000.00', share_ref: `${created.id}-CBU` });
   const analytics = (await admin.get('/api/admin/analytics?from=2000-01-01&to=2999-12-31')).data;
   const juan = analytics.memberAnalytics.find((row) => row.databaseId === state.memberId);
   const history = juan.loanHistory.find((row) => row.id === loanId);
@@ -4536,7 +4574,7 @@ test('loans: a 5-day grace period after the due date, then PHP 100 a day until p
   const closed = renewed.data.previousLoan;
   assert.deepEqual([closed.status, closed.balance, closed.totalPaid, closed.penaltyPaid, closed.penaltyDue, closed.penaltyDays], ['paid', '0.00', '11500.00', '1300.00', '0.00', 0]);
   const restructuredNote = (await pool.query(`SELECT message FROM notifications WHERE user_id = $1 AND type = 'loan_restructured' ORDER BY id DESC LIMIT 1`, [state.memberUserId])).rows[0].message;
-  assert.match(restructuredNote, /The PHP 2,400\.00 \(balance PHP 2,300\.00 and late penalty PHP 100\.00\) still owed was deducted, so you receive PHP 17,600\.00/);
+  assert.match(restructuredNote, /The PHP 2,400\.00 \(balance PHP 2,300\.00 and late penalty PHP 100\.00\) still owed was deducted from it\..*you receive PHP 16,650\.00 in cash\.$/);
 
   // A paid loan's penalty stops: days later nothing more is due.
   await pool.query(`UPDATE loans SET due_date = due_date - 30 WHERE id = $1`, [loanId]);
@@ -4979,4 +5017,88 @@ test('receipts name the encoder; machinery payments are told to the member; loya
   assert.deepEqual(row.standing.reasons, ['Attended 0 of 1 activities (0%, 75% needed)']);
   assert.equal((await standing('&minAttendance=0')).standing.goodStanding, true, 'the office can lower the attendance needed');
   assert.equal((await office.get(`/api/members/loyalty?asOf=${today}&minAttendance=120`)).status, 400);
+});
+
+test('loans: the loan policy at release: 2 hectares in the first year of loans; savings, 2% Capital Build-Up and PCIC insurance taken from the proceeds', { skip }, async () => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const shift = (days) => { const d = new Date(`${todayDateOnly()}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
+  const cents = (value) => Math.round(Number(value) * 100);
+  const office = new Client('10.0.60.1');
+  assert.equal((await office.post('/api/auth/login', { usernameOrEmail: 'testadmin', password: 'AdminPass1!' })).status, 200);
+  // Lito farms 3 hectares and has no loan yet, so he is in his first year of loans. He has no login: he is emailed at his member record.
+  const memberId = (await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status, farm_area_ha)
+     VALUES ('LOAN-POLICY-1', 'Lito', 'Bagong', 'lito.bagong@acifac.ph', '09179990001', 'Purok 4, Amnay', '2024-01-01', 0, 'active', 3) RETURNING id`
+  )).rows[0].id;
+  const quote = async (amount, extra = {}) => {
+    const response = await office.post('/api/loans/quote', { amount, farmArea: '3', memberId, ...extra });
+    assert.equal(response.status, 200, JSON.stringify(response.data));
+    return response.data.quote;
+  };
+  let q = await quote('150000');
+  assert.deepEqual([q.maximumEligibleAmount, q.eligibleFarmArea, q.withinLimit, q.firstLoanYear.inFirstYear, q.firstLoanYear.limited, q.firstLoanYear.endsOn], ['100000.00', '2', false, true, true, null]);
+  assert.deepEqual(q.deductions, { savings: '1000.00', capitalBuildUp: '3000.00', pcicInsurance: '50.00', total: '4050.00', cashReleased: '145950.00', paidAtRelease: '0.00' });
+  q = await quote('20000', { inKindAmount: '20000' });
+  assert.deepEqual([q.deductions.total, q.deductions.cashReleased, q.deductions.paidAtRelease], ['950.00', '0.00', '950.00'], 'farm inputs are not cash');
+
+  // Applications as the forms save them (pending), for a cash or in-kind loan.
+  const pendingRequest = async (amount, loanMode = 'cash', inKindItems = []) => (await pool.query(
+    `INSERT INTO loan_requests (member_id, member_number, member_name, loan_type, amount, term, purpose, borrower_phone, borrower_address, farm_area, loan_mode,
+       maximum_eligible_amount, interest_rate, calculated_interest, total_repayment, in_kind_items, status)
+     VALUES ($1, 'LOAN-POLICY-1', 'Lito Bagong', 'agricultural', $2::numeric, 6, 'Palay', '09179990001', 'Purok 4, Amnay', 3, $3,
+       150000, 15, ROUND($2::numeric * 0.15, 2), ROUND($2::numeric * 1.15, 2), $4::jsonb, 'pending') RETURNING id`,
+    [memberId, amount, loanMode, JSON.stringify(inKindItems)]
+  )).rows[0].id;
+
+  // One for 3 hectares (sent before the rule) cannot be approved in the first year.
+  const big = await pendingRequest('150000');
+  const refused = await office.patch(`/api/admin/loan-requests/${big}`, { status: 'approved' });
+  assert.equal(refused.status, 400, JSON.stringify(refused.data));
+  assert.match(refused.data.message, /^In a member's first year of loans \(counted from their first loan\), a loan may cover at most 2 hectares, so at most PHP 100,000\.00 can be lent\./);
+  assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM loans WHERE member_id = $1', [memberId])).rows[0].n, 0, 'nothing was released');
+  assert.equal((await office.patch(`/api/admin/loan-requests/${big}`, { status: 'declined', reason: 'Over 2 hectares in the first year of loans' })).status, 200);
+
+  // Lito already holds all but PHP 300 of what the 10% share capital limit allows.
+  const others = cents((await pool.query(`SELECT COALESCE(SUM(share_capital), 0) AS total FROM members WHERE status <> 'archived' AND id <> $1`, [memberId])).rows[0].total);
+  const held = (Math.floor((others * 10) / 90) - 30000) / 100;
+  await pool.query(`INSERT INTO share_contributions (member_id, amount, contribution_date, payment_method, notes) VALUES ($1, $2::numeric, '2024-01-01', 'Cash', 'test: near the limit')`, [memberId, held.toFixed(2)]);
+  await pool.query('UPDATE members SET share_capital = $2::numeric WHERE id = $1', [memberId, held.toFixed(2)]);
+
+  // Approving PHP 50,000: PHP 500 savings, PHP 1,000 Capital Build-Up (PHP 300 share capital, PHP 700 savings) and PHP 50 PCIC.
+  const small = await pendingRequest('50000');
+  const approved = await office.patch(`/api/admin/loan-requests/${small}`, { status: 'approved' });
+  assert.equal(approved.status, 200, JSON.stringify(approved.data));
+  const loan = (await office.get(`/api/admin/loans/${approved.data.loanId}`)).data.loan;
+  assert.deepEqual([loan.savingsDeducted, loan.capitalBuildUp, loan.capitalBuildUpToSavings, loan.pcicInsurance, loan.cashReleased, loan.paidAtRelease],
+    ['500.00', '1000.00', '700.00', '50.00', '48450.00', '0.00']);
+  const savings = (await pool.query('SELECT amount, payment_method, reference_number FROM savings_transactions WHERE member_id = $1 ORDER BY id', [memberId])).rows;
+  assert.deepEqual(savings.map((row) => [row.amount, row.payment_method, row.reference_number]), [['500.00', 'Loan deduction', `${loan.id}-SAV`], ['700.00', 'Loan deduction', `${loan.id}-CBU`]]);
+  const cbu = (await pool.query('SELECT amount FROM share_contributions WHERE member_id = $1 AND reference_number = $2', [memberId, `${loan.id}-CBU`])).rows;
+  assert.deepEqual(cbu.map((row) => row.amount), ['300.00']);
+  const audit = (await pool.query(`SELECT new_values -> 'deductions' AS deductions FROM audit_logs WHERE action = 'LOAN_APPROVED' AND entity_id = $1`, [String(small)])).rows[0].deductions;
+  assert.deepEqual(audit, { savings: '500.00', capital_build_up: '1000.00', capital_build_up_to_savings: '700.00', pcic_insurance: '50.00', cash_released: '48450.00' });
+  const mail = await waitForMail((sent) => sent.to === 'lito.bagong@acifac.ph' && sent.subject === 'ACIFAC loan application approved');
+  assert.match(mail.text, /Taken from the loan proceeds:\nSavings: PHP 500\.00\nCapital Build-Up \(2%\): PHP 1,000\.00 \(PHP 700\.00 of it to savings, over the 10% share capital limit\)\nPCIC life insurance: PHP 50\.00\nCash you receive: PHP 48,450\.00/);
+
+  // His first year of loans now runs until 12 months after this loan.
+  const endsOn = (await pool.query(`SELECT TO_CHAR(($1::date + INTERVAL '12 months')::date, 'YYYY-MM-DD') AS d`, [loan.dateApproved])).rows[0].d;
+  assert.deepEqual([(await quote('150000')).firstLoanYear.endsOn, (await office.get('/api/admin/loans?limit=100')).data.loans.find((row) => row.id === loan.id).firstLoanYearEnds], [endsOn, endsOn]);
+
+  // An in-kind loan has no cash: the PHP 950 of deductions is paid at release (the PHP 400 Capital Build-Up all to savings: no room left).
+  await settleOpenLoans(memberId);
+  const inKind = await pendingRequest('20000', 'in-kind', [{ item: 'Urea', description: '', quantity: '10', unit: 'bags', unitPrice: '2000' }]);
+  const inKindApproved = await office.patch(`/api/admin/loan-requests/${inKind}`, { status: 'approved' });
+  assert.equal(inKindApproved.status, 200, JSON.stringify(inKindApproved.data));
+  const inKindLoan = (await office.get(`/api/admin/loans/${inKindApproved.data.loanId}`)).data.loan;
+  assert.deepEqual([inKindLoan.savingsDeducted, inKindLoan.capitalBuildUp, inKindLoan.capitalBuildUpToSavings, inKindLoan.cashReleased, inKindLoan.paidAtRelease],
+    ['500.00', '400.00', '400.00', '0.00', '950.00']);
+
+  // After the first year of loans the whole farm counts.
+  await pool.query(
+    `INSERT INTO loans (loan_number, member_id, member_name, loan_type, amount, balance, interest_rate, term, status, date_approved, due_date, monthly_payment, calculated_interest, total_repayment, repayment)
+     VALUES ('L-POLICY-OLD', $1, 'Lito Bagong', 'agricultural', 5000, 0, 15, 6, 'paid', $2, $3, 5750, 750, 5750, 'single')`,
+    [memberId, shift(-800), shift(-620)]
+  );
+  q = await quote('150000');
+  assert.deepEqual([q.maximumEligibleAmount, q.eligibleFarmArea, q.withinLimit, q.firstLoanYear.inFirstYear, q.firstLoanYear.limited], ['150000.00', '3', true, false, false]);
 });

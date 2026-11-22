@@ -25,6 +25,16 @@ describe('Email messages (emailTemplates)', () => {
     expect(email.html).not.toContain('href');
   });
 
+  test('an approved loan email lists what was taken from the proceeds and the cash received', () => {
+    const base = { requestId: 41, amount: '50000.00', interestRate: '15', term: 6, status: 'approved', totalRepayment: '57500.00', repayment: 'single', dueDate: '2027-05-24' };
+    const email = loanDecisionEmail({ ...base, deductions: { savings: '500.00', capitalBuildUp: '1000.00', capitalBuildUpToSavings: '300.00', pcicInsurance: '50.00', cashReleased: '48450.00', paidAtRelease: '0.00' } });
+    expect(email.text).toContain('Taken from the loan proceeds:\nSavings: PHP 500.00\nCapital Build-Up (2%): PHP 1,000.00 (PHP 300.00 of it to savings, over the 10% share capital limit)\nPCIC life insurance: PHP 50.00\nCash you receive: PHP 48,450.00');
+    expect(email.text).not.toContain('To pay at the office');
+    const inKind = loanDecisionEmail({ ...base, amount: '20000.00', deductions: { savings: '500.00', capitalBuildUp: '400.00', capitalBuildUpToSavings: '0.00', pcicInsurance: '50.00', cashReleased: '0.00', paidAtRelease: '950.00' } });
+    expect(inKind.text).toContain('To pay at the office when the loan is released: PHP 950.00');
+    expect(loanDecisionEmail(base).text).not.toContain('Taken from the loan proceeds');
+  });
+
   test('a declined rental email gives the reason the office wrote', () => {
     const email = rentalDecisionEmail({ machineryName: 'Water Pump', startDate: '2026-12-03', endDate: '2026-12-05', status: 'declined', rentalFee: '2400.00', reason: 'The pump is <under repair> that week.' });
     expect(email.subject).toBe('ACIFAC machinery rental declined');

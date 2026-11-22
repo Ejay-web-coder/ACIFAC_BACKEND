@@ -540,6 +540,7 @@ export async function getDashboard(req, res) {
       //   Share Capital  contributions          Savings  deposits - withdrawals
       //   Loans          payments - released    Machinery  fees collected + other income - expenses
       //   Kadiwa Store   net sales (sales - expenses - cost of goods)
+      //   Others         membership fees, absence fines and transfer fees collected, other income recorded
       // Every one of these is recorded in the audit log with its capital_change.
       capital: (() => {
         const parts = [
@@ -548,11 +549,14 @@ export async function getDashboard(req, res) {
           { key: 'loans', label: 'Loans (collected - released)', amount: toCents(row.loanCash) },
           { key: 'machinery', label: 'Machinery', amount: income.parts.machinery },
           { key: 'kadiwa', label: 'Kadiwa Store', amount: income.parts.kadiwa },
+          { key: 'others', label: 'Others', amount: income.parts.others },
         ];
         return { total: centsToNumber(parts.reduce((sum, part) => sum + part.amount, 0)), parts: parts.map((part) => ({ ...part, amount: centsToNumber(part.amount) })) };
       })(),
       netIncome: centsToNumber(income.total),
       netIncomeBreakdown: Object.fromEntries(Object.entries(income.parts).map(([key, cents]) => [key, centsToNumber(cents)])),
+      // Others (in the net income and the capital) by source.
+      othersBreakdown: Object.fromEntries(Object.entries(income.others).map(([key, cents]) => [key, centsToNumber(cents)])),
       statutoryFunds: distribution.funds.map(({ key, label, percent, amount }) => ({ key, label, percent, amount: centsToNumber(amount) })),
       // What is left is shared out to the members: half as dividends on share
       // capital, half as patronage refunds (35% of the net income each).
