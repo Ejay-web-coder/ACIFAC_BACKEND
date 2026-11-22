@@ -36,6 +36,7 @@ const ACTIONS = {
   MEMBER_UPDATED: ['profile', 'Member record updated'],
   MEMBER_ARCHIVED: ['profile', 'Membership archived'],
   MEMBER_RESTORED: ['profile', 'Membership restored'],
+  MEMBER_ID_CARD_REISSUED: ['profile', 'Member ID card replaced'],
   // Savings & share capital
   SAVINGS_DEPOSIT_CREATED: ['savings', 'Savings deposit recorded'],
   SAVINGS_WITHDRAWAL_CREATED: ['savings', 'Savings withdrawal recorded'],
@@ -72,6 +73,7 @@ const FRIENDLY = {
   LOGIN_FAILURE: () => 'Someone tried to sign in to your account with a wrong password.',
   LOGIN_LOCKED: () => 'Too many wrong passwords, so signing in was locked for a while.',
   PASSWORD_CHANGED: () => 'Your password was changed.',
+  MEMBER_ID_CARD_REISSUED: () => 'The office issued you a new member ID card. Your old card no longer works.',
   PAYMENT_CREATED: () => 'The office recorded a payment on your loan.',
   SAVINGS_DEPOSIT_CREATED: () => 'The office recorded a deposit to your savings.',
   SAVINGS_WITHDRAWAL_CREATED: () => 'The office recorded a withdrawal from your savings.',

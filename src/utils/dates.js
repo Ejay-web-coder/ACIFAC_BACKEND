@@ -16,6 +16,13 @@ export function todayDateOnly(now = new Date()) {
   return `${lookup.year}-${lookup.month}-${lookup.day}`;
 }
 
+// The time of day in the cooperative's time zone as HH:MM (00:00 to 23:59).
+export function nowClock(now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-GB', { timeZone: TIME_ZONE, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(now);
+  const lookup = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${lookup.hour}:${lookup.minute}`;
+}
+
 export function formatDateOnly(value) {
   if (!isValidDateOnly(value)) return String(value ?? '');
   const [year, month, day] = value.split('-').map(Number);

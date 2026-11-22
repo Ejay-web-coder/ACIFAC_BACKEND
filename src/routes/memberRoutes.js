@@ -26,6 +26,7 @@ import { getMyLoanHistory } from '../controllers/loanController.js';
 import { previewMemberIdChecks, readMemberId } from '../controllers/memberIdController.js';
 import { getMyActivity } from '../controllers/memberActivityController.js';
 import { getMyAttendance } from '../controllers/attendanceController.js';
+import { findMemberByQr, getMemberIdCard, getMyIdCard, listMemberIdCards, reissueMemberIdCard } from '../controllers/idCardController.js';
 import { requireAdmin, requireAuth, requireMember } from '../middleware/auth.js';
 import { loanApplicationUpload, memberDocumentUpload, memberFileUpload } from '../middleware/upload.js';
 
@@ -42,10 +43,15 @@ router.get('/me/loan-history', requireMember, getMyLoanHistory);
 router.get('/me/activity', requireMember, getMyActivity);
 // Their attendance at cooperative activities (read-only) and the upcoming activities.
 router.get('/me/attendance', requireMember, getMyAttendance);
+// Their member ID card, to show its QR on the phone or download it.
+router.get('/me/id-card', requireMember, getMyIdCard);
 
 // Everything below is admin-only: member lists expose personal data.
 router.use(requireAdmin);
 router.get('/', listMembers);
+// Member ID cards: several for the batch print, and the member a scanned card belongs to.
+router.get('/id-cards', listMemberIdCards);
+router.get('/by-qr/:code', findMemberByQr);
 router.get('/statistics', getMemberStatistics);
 router.get('/archived', listArchivedMembers);
 // Loyalty awards: active members by full years of membership on the award date.
@@ -67,6 +73,9 @@ router.post('/', memberFileUpload.fields([
   { name: 'rsbsaDocument', maxCount: 1 },
 ]), createMember);
 router.get('/:id', getMember);
+router.get('/:id/id-card', getMemberIdCard);
+// A new code for a lost or damaged card: the old card stops working.
+router.post('/:id/id-card/reissue', reissueMemberIdCard);
 router.get('/:id/savings', getMemberSavings);
 // A member's dividend and patronage refund for a year: confidential, so the office only (shown under Savings).
 router.get('/:id/dividend', getMemberDividend);

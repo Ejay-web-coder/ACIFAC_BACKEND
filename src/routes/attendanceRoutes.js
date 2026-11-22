@@ -13,6 +13,7 @@ import {
   listActivityMembers,
   listAttendanceRecords,
   saveAttendance,
+  scanCheckIn,
   updateActivity,
 } from '../controllers/attendanceController.js';
 
@@ -29,6 +30,8 @@ router.put('/activities/:id', updateActivity);
 router.patch('/activities/:id/cancel', cancelActivity);
 router.get('/activities/:id/members', listActivityMembers);
 router.put('/activities/:id/attendance', saveAttendance);
+// Check-in at the door: a scanned member ID marks the member present (or late).
+router.post('/activities/:id/scan', scanCheckIn);
 router.post('/activities/:id/finalize', finalizeAttendance);
 router.get('/activities/:id/history', getActivityHistory);
 router.get('/records', listAttendanceRecords);

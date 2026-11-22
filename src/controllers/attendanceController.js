@@ -1,13 +1,14 @@
 import { query, withTransaction } from '../config/db.js';
 import { SQL_TODAY, TIME_ZONE } from '../config/env.js';
 import { createAuditLog } from '../utils/audit.js';
-import { formatDateOnly, isValidDateOnly, todayDateOnly } from '../utils/dates.js';
+import { formatDateOnly, isValidDateOnly, nowClock, todayDateOnly } from '../utils/dates.js';
 import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import {
   ACTIVITY_CATEGORIES, ACTIVITY_STATUSES, ATTENDANCE_STATUSES, ATTENDED_STATUSES, attendanceRate, parseAttendanceRecords, summarizeParticipation,
   validateActivityInput,
 } from '../services/attendance.js';
 import { DUES, syncMeetingDues } from '../services/dues.js';
+import { checkInStatus, parseIdCardCode } from '../services/idCards.js';
 import { centsToString } from '../utils/money.js';
 import { isEmailConfigured } from '../services/emailService.js';
 import { activityEmail } from '../services/emailTemplates.js';
@@ -432,58 +433,67 @@ export async function listActivityMembers(req, res) {
 
 const sameRecord = (a, b) => a.status === b.status && (a.checkInTime || null) === (b.checkInTime || null) && (a.remarks || '') === (b.remarks || '');
 
-// PUT /api/attendance/activities/:id/attendance { records: [{ memberId, status, checkInTime?, remarks? }], reason? }
-// Adds a record for each member not recorded yet and updates the others that
-// changed. One save runs at a time per activity (the activity row is locked),
-// and the unique (activity, member) constraint is the last guard against a
-// second record. Every change to an existing record is audited with its old
-// and new values; once attendance is final a correction needs a reason.
-export async function saveAttendance(req, res) {
-  const id = parseId(req.params.id, 'activity ID');
-  const { errors, records } = parseAttendanceRecords(req.body?.records);
-  if (errors.length) throw badRequest(errors[0], errors);
-  const reason = cleanString(req.body?.reason, 500);
+// Saves attendance records inside the caller's transaction, with the activity
+// row locked by the caller, so one save runs at a time per activity: adds a
+// record for each member not recorded yet and updates the others that
+// changed. The unique (activity, member) constraint is the last guard against
+// a second record. Every change to an existing record is audited with its old
+// and new values. source: 'office' (the Record Attendance list) or 'scan' (a
+// member ID scanned at the door, one record). reason: why a final attendance
+// is corrected (the caller requires it).
+async function writeAttendance(client, req, activity, records, { reason = '', source = 'office' } = {}) {
+  const id = activity.id;
   const userId = currentUserId(req);
   const meta = getRequestMeta(req);
+  const final = Boolean(activity.attendance_finalized_at);
+  const scanned = source === 'scan';
 
-  const result = await withTransaction(async (client) => {
-    const activity = await lockActivity(client, id);
-    if (activity.status === 'cancelled') throw conflict('This activity is cancelled, so attendance cannot be recorded.');
-    if (activity.activity_date > todayDateOnly()) throw badRequest('Attendance can be recorded from the day of the activity.');
-    const final = Boolean(activity.attendance_finalized_at);
-    if (final && reason.length < 3) throw badRequest('Attendance for this activity is final. Give the reason for the correction.');
+  const members = (await client.query(
+    `SELECT m.id, m.member_number, ${MEMBER_NAME} AS name, ${eligibleOn('$2::date')} AS eligible, ${invitedTo(activity.attendee_scope, '$1')} AS invited,
+            r.id AS record_id, r.attendance_status, TO_CHAR(r.check_in_time, 'HH24:MI') AS check_in_time, r.remarks
+       FROM members m
+       LEFT JOIN activity_attendance r ON r.member_id = m.id AND r.activity_id = $1
+      WHERE m.id = ANY($3::int[])`,
+    [id, activity.activity_date, records.map((record) => record.memberId)]
+  )).rows;
+  const byId = new Map(members.map((member) => [Number(member.id), member]));
+  if (records.some((record) => !byId.has(record.memberId))) throw badRequest('Some of the members were not found.');
+  const notEligible = records.find((record) => !byId.get(record.memberId).record_id && !byId.get(record.memberId).eligible);
+  if (notEligible) throw badRequest(`${byId.get(notEligible.memberId).name} was not a member on the activity date.`);
+  const notInvited = records.find((record) => !byId.get(record.memberId).record_id && !byId.get(record.memberId).invited);
+  if (notInvited) throw badRequest(`${byId.get(notInvited.memberId).name} is not one of the members who must attend this activity.`);
 
-    const members = (await client.query(
-      `SELECT m.id, m.member_number, ${MEMBER_NAME} AS name, ${eligibleOn('$2::date')} AS eligible, ${invitedTo(activity.attendee_scope, '$1')} AS invited,
-              r.id AS record_id, r.attendance_status, TO_CHAR(r.check_in_time, 'HH24:MI') AS check_in_time, r.remarks
-         FROM members m
-         LEFT JOIN activity_attendance r ON r.member_id = m.id AND r.activity_id = $1
-        WHERE m.id = ANY($3::int[])`,
-      [id, activity.activity_date, records.map((record) => record.memberId)]
+  const added = [];
+  const changed = [];
+  for (const record of records) {
+    const member = byId.get(record.memberId);
+    if (!member.record_id) { added.push(record); continue; }
+    const before = { status: member.attendance_status, checkInTime: member.check_in_time, remarks: member.remarks };
+    if (!sameRecord(before, record)) changed.push({ record, member, before });
+  }
+  const column = (list, key) => list.map((item) => item[key]);
+  if (added.length) {
+    const inserted = (await client.query(
+      `INSERT INTO activity_attendance (activity_id, member_id, attendance_status, check_in_time, remarks, source, recorded_by, updated_by)
+       SELECT $1, x.member_id, x.status, x.check_in::time, x.remarks, $7, $2, $2
+         FROM unnest($3::int[], $4::text[], $5::text[], $6::text[]) AS x(member_id, status, check_in, remarks)
+       RETURNING id, member_id`,
+      [id, userId, column(added, 'memberId'), column(added, 'status'), column(added, 'checkInTime'), column(added, 'remarks'), source]
     )).rows;
-    const byId = new Map(members.map((member) => [Number(member.id), member]));
-    if (records.some((record) => !byId.has(record.memberId))) throw badRequest('Some of the members were not found.');
-    const notEligible = records.find((record) => !byId.get(record.memberId).record_id && !byId.get(record.memberId).eligible);
-    if (notEligible) throw badRequest(`${byId.get(notEligible.memberId).name} was not a member on the activity date.`);
-    const notInvited = records.find((record) => !byId.get(record.memberId).record_id && !byId.get(record.memberId).invited);
-    if (notInvited) throw badRequest(`${byId.get(notInvited.memberId).name} is not one of the members who must attend this activity.`);
-
-    const added = [];
-    const changed = [];
-    for (const record of records) {
-      const member = byId.get(record.memberId);
-      if (!member.record_id) { added.push(record); continue; }
-      const before = { status: member.attendance_status, checkInTime: member.check_in_time, remarks: member.remarks };
-      if (!sameRecord(before, record)) changed.push({ record, member, before });
-    }
-    const column = (list, key) => list.map((item) => item[key]);
-    if (added.length) {
-      await client.query(
-        `INSERT INTO activity_attendance (activity_id, member_id, attendance_status, check_in_time, remarks, recorded_by, updated_by)
-         SELECT $1, x.member_id, x.status, x.check_in::time, x.remarks, $2, $2
-           FROM unnest($3::int[], $4::text[], $5::text[], $6::text[]) AS x(member_id, status, check_in, remarks)`,
-        [id, userId, column(added, 'memberId'), column(added, 'status'), column(added, 'checkInTime'), column(added, 'remarks')]
-      );
+    if (scanned) {
+      // A check-in at the door: who came, and when.
+      for (const row of inserted) {
+        const member = byId.get(Number(row.member_id));
+        const record = added.find((item) => item.memberId === Number(row.member_id));
+        await createAuditLog({
+          client, user: req.user, action: 'ATTENDANCE_SCANNED', module: MODULE, entityType: 'activity_attendance', entityId: String(row.id),
+          description: `${member.name} (${member.member_number}) checked in to "${activity.title}" with their member ID at ${clockText(record.checkInTime)}: ${record.status}`,
+          newValues: { attendance_status: record.status, check_in_time: record.checkInTime },
+          details: { activity_id: id, member_id: Number(member.id), member_number: member.member_number, member_name: member.name, source },
+          ...meta,
+        });
+      }
+    } else {
       await createAuditLog({
         client, user: req.user, action: 'ATTENDANCE_RECORDED', module: MODULE, entityType: 'activity', entityId: String(id),
         description: `Recorded the attendance of ${added.length} ${added.length === 1 ? 'member' : 'members'} for "${activity.title}"`,
@@ -491,30 +501,48 @@ export async function saveAttendance(req, res) {
         ...meta,
       });
     }
-    if (changed.length) {
-      const updates = changed.map(({ record, member }) => ({ ...record, recordId: member.record_id }));
-      await client.query(
-        `UPDATE activity_attendance r
-            SET attendance_status = x.status, check_in_time = x.check_in::time, remarks = x.remarks, source = 'office', updated_by = $1, updated_at = NOW()
-           FROM unnest($2::int[], $3::text[], $4::text[], $5::text[]) AS x(id, status, check_in, remarks)
-          WHERE r.id = x.id`,
-        [userId, column(updates, 'recordId'), column(updates, 'status'), column(updates, 'checkInTime'), column(updates, 'remarks')]
-      );
-      for (const { record, member, before } of changed) {
-        await createAuditLog({
-          client, user: req.user, action: final ? 'ATTENDANCE_CORRECTED' : 'ATTENDANCE_UPDATED', module: MODULE,
-          entityType: 'activity_attendance', entityId: String(member.record_id),
-          description: `${final ? 'Corrected' : 'Changed'} the attendance of ${member.name} (${member.member_number}) for "${activity.title}": ${before.status} to ${record.status}`,
-          oldValues: { attendance_status: before.status, check_in_time: before.checkInTime, remarks: before.remarks },
-          newValues: { attendance_status: record.status, check_in_time: record.checkInTime, remarks: record.remarks },
-          details: { activity_id: id, member_id: Number(member.id), member_number: member.member_number, member_name: member.name, reason: final ? reason : null },
-          ...meta,
-        });
-      }
+  }
+  if (changed.length) {
+    const updates = changed.map(({ record, member }) => ({ ...record, recordId: member.record_id }));
+    await client.query(
+      `UPDATE activity_attendance r
+          SET attendance_status = x.status, check_in_time = x.check_in::time, remarks = x.remarks, source = $6, updated_by = $1, updated_at = NOW()
+         FROM unnest($2::int[], $3::text[], $4::text[], $5::text[]) AS x(id, status, check_in, remarks)
+        WHERE r.id = x.id`,
+      [userId, column(updates, 'recordId'), column(updates, 'status'), column(updates, 'checkInTime'), column(updates, 'remarks'), source]
+    );
+    for (const { record, member, before } of changed) {
+      await createAuditLog({
+        client, user: req.user, action: final ? 'ATTENDANCE_CORRECTED' : 'ATTENDANCE_UPDATED', module: MODULE,
+        entityType: 'activity_attendance', entityId: String(member.record_id),
+        description: `${final ? 'Corrected' : 'Changed'} the attendance of ${member.name} (${member.member_number}) for "${activity.title}": ${before.status} to ${record.status}${scanned ? ` (checked in with their member ID at ${clockText(record.checkInTime)})` : ''}`,
+        oldValues: { attendance_status: before.status, check_in_time: before.checkInTime, remarks: before.remarks },
+        newValues: { attendance_status: record.status, check_in_time: record.checkInTime, remarks: record.remarks },
+        details: { activity_id: id, member_id: Number(member.id), member_number: member.member_number, member_name: member.name, reason: final ? reason : null, ...(scanned ? { source } : {}) },
+        ...meta,
+      });
     }
-    // A correction to a meeting whose dues were added adds or removes the absence fine.
-    const dues = final && activity.dues_charged_at && (added.length || changed.length) ? await syncMeetingDues(client, id, userId) : null;
-    return { added: added.length, updated: changed.length, unchanged: records.length - added.length - changed.length, dues };
+  }
+  // A correction to a meeting whose dues were added adds or removes the absence fine.
+  const dues = final && activity.dues_charged_at && (added.length || changed.length) ? await syncMeetingDues(client, id, userId) : null;
+  return { added: added.length, updated: changed.length, unchanged: records.length - added.length - changed.length, dues };
+}
+
+// PUT /api/attendance/activities/:id/attendance { records: [{ memberId, status, checkInTime?, remarks? }], reason? }
+// The Record Attendance list (see writeAttendance). Once attendance is final a
+// correction needs a reason.
+export async function saveAttendance(req, res) {
+  const id = parseId(req.params.id, 'activity ID');
+  const { errors, records } = parseAttendanceRecords(req.body?.records);
+  if (errors.length) throw badRequest(errors[0], errors);
+  const reason = cleanString(req.body?.reason, 500);
+
+  const result = await withTransaction(async (client) => {
+    const activity = await lockActivity(client, id);
+    if (activity.status === 'cancelled') throw conflict('This activity is cancelled, so attendance cannot be recorded.');
+    if (activity.activity_date > todayDateOnly()) throw badRequest('Attendance can be recorded from the day of the activity.');
+    if (activity.attendance_finalized_at && reason.length < 3) throw badRequest('Attendance for this activity is final. Give the reason for the correction.');
+    return writeAttendance(client, req, activity, records, { reason });
   });
 
   const parts = [result.added && `${result.added} added`, result.updated && `${result.updated} ${result.updated === 1 ? 'change' : 'changes'} saved`].filter(Boolean);
@@ -527,6 +555,52 @@ export async function saveAttendance(req, res) {
     message: parts.length ? `Attendance saved: ${parts.join(', ')}.${duesNote}` : 'Nothing changed: the attendance was already saved.',
     data: { ...result, activity: await loadActivity(id) },
   });
+}
+
+// POST /api/attendance/activities/:id/scan { token }: a member checks in at the
+// door by showing their member ID; token is what the QR holds ("ACIFAC:<code>").
+// The member is recorded present at the time of the scan, or late after the
+// activity's start time, through writeAttendance (the same checks as the
+// list: a member on the activity date, one of those who must attend). Only on
+// the day of the activity and until its attendance is final. A member already
+// checked in is told so and nothing changes; a member marked absent or
+// excused before arriving is changed to present or late.
+export async function scanCheckIn(req, res) {
+  const id = parseId(req.params.id, 'activity ID');
+  const code = parseIdCardCode(req.body?.token);
+  if (!code) throw badRequest('This QR code is not an ACIFAC member ID.');
+  const now = new Date();
+  const [today, clock] = [todayDateOnly(now), nowClock(now)];
+
+  const result = await withTransaction(async (client) => {
+    const activity = await lockActivity(client, id);
+    if (activity.status === 'cancelled') throw conflict('This activity is cancelled, so nobody can check in.');
+    if (activity.attendance_finalized_at) throw conflict('Attendance for this activity is final, so check-in is closed. Correct a record in the attendance list instead.');
+    if (activity.activity_date > today) throw badRequest(`Check-in opens on the day of the activity, ${formatDateOnly(activity.activity_date)}.`);
+    if (activity.activity_date < today) throw badRequest(`Scanning is only for check-in on the day of the activity. Mark the attendance of ${formatDateOnly(activity.activity_date)} in the list instead.`);
+    const member = (await client.query(
+      `SELECT m.id, m.member_number, ${MEMBER_NAME} AS name, m.status, (m.profile_photo IS NOT NULL) AS has_photo,
+              r.attendance_status, TO_CHAR(r.check_in_time, 'HH24:MI') AS check_in_time, r.remarks
+         FROM members m LEFT JOIN activity_attendance r ON r.member_id = m.id AND r.activity_id = $2
+        WHERE m.id_token = $1`,
+      [code, id]
+    )).rows[0];
+    if (!member) throw notFound('No member has this ID card. It may be an old card that was replaced.');
+    const who = { id: Number(member.id), memberNumber: member.member_number || '', name: member.name, status: member.status, hasPhoto: member.has_photo };
+    if (ATTENDED_STATUSES.includes(member.attendance_status)) {
+      return { checkedIn: false, alreadyCheckedIn: true, member: who, record: { status: member.attendance_status, checkInTime: member.check_in_time }, previousStatus: member.attendance_status };
+    }
+    const status = checkInStatus(clock, activity.start_time);
+    await writeAttendance(client, req, activity, [{ memberId: who.id, status, checkInTime: clock, remarks: member.remarks || '' }], { source: 'scan' });
+    return { checkedIn: true, alreadyCheckedIn: false, member: who, record: { status, checkInTime: clock }, previousStatus: member.attendance_status ?? null };
+  });
+
+  const { member, record, previousStatus } = result;
+  const at = record.checkInTime ? ` at ${clockText(record.checkInTime)}` : '';
+  const message = result.alreadyCheckedIn
+    ? `${member.name} already checked in${at}.`
+    : `${member.name} checked in${at}: ${record.status === 'late' ? 'late' : 'present'}${previousStatus ? ` (was marked ${previousStatus})` : ''}.`;
+  return res.status(result.checkedIn ? 201 : 200).json({ success: true, message, data: { ...result, activity: await loadActivity(id) } });
 }
 
 // POST /api/attendance/activities/:id/finalize: every active member who could
@@ -574,11 +648,12 @@ export async function finalizeAttendance(req, res) {
 const HISTORY_LABELS = {
   ACTIVITY_CREATED: 'Activity created', ACTIVITY_UPDATED: 'Activity details changed', ACTIVITY_CANCELLED: 'Activity cancelled',
   ACTIVITY_RESTORED: 'Activity restored', ATTENDANCE_RECORDED: 'Attendance recorded', ATTENDANCE_UPDATED: 'Attendance changed',
-  ATTENDANCE_CORRECTED: 'Attendance corrected', ATTENDANCE_FINALIZED: 'Attendance finalized',
+  ATTENDANCE_CORRECTED: 'Attendance corrected', ATTENDANCE_FINALIZED: 'Attendance finalized', ATTENDANCE_SCANNED: 'Checked in with member ID',
 };
 
 // GET /api/attendance/activities/:id/history: what was done to the activity and
-// its attendance records, newest first, from the audit log.
+// its attendance records, newest first, from the audit log. Each member who
+// checks in with their ID adds an entry, so a large meeting has many.
 export async function getActivityHistory(req, res) {
   const id = parseId(req.params.id, 'activity ID');
   await loadActivity(id);
@@ -589,7 +664,7 @@ export async function getActivityHistory(req, res) {
       WHERE (al.entity_type = 'activity' AND al.entity_id = $1)
          OR (al.entity_type = 'activity_attendance' AND al.entity_id IN (SELECT id::text FROM activity_attendance WHERE activity_id = $2))
       ORDER BY al.created_at DESC, al.id DESC
-      LIMIT 200`,
+      LIMIT 2000`,
     [String(id), id]
   )).rows;
   return res.json({

@@ -5308,3 +5308,153 @@ test('pay online: GCash or Maya with a screenshot; AI reads it, the office check
   assert.deepEqual((await member.get('/api/payment-channels')).data.data, []);
   assert.equal((await pay(member, { purpose: 'savings', amount: '100', channel: 'GCash', referenceNumber: '1009000055555', paidOn: today })).status, 400);
 });
+
+test('member ID cards: a random code in the QR, printing, reissue, lookup by scan and check-in at the door', { skip }, async () => {
+  const { hashPassword } = await import('../src/utils/password.js');
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const today = todayDateOnly();
+  const shift = (days) => new Date(Date.parse(`${today}T00:00:00Z`) + days * 86400000).toISOString().slice(0, 10);
+  const office = new Client('10.0.80.1');
+  assert.equal((await office.post('/api/auth/login', { usernameOrEmail: 'testadmin', password: 'AdminPass1!' })).status, 200);
+  const addMember = async (number, first, status = 'active') => (await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status)
+     VALUES ($1, $2, 'Card', $3, '09170008888', 'Purok 8', '2021-03-15', 0, $4) RETURNING id, id_token, id_issued_at`,
+    [number, first, `${first.toLowerCase()}.card@acifac.ph`, status]
+  )).rows[0];
+  const [ivy, jun, kai, lim] = [await addMember('CARD-001', 'Ivy'), await addMember('CARD-002', 'Jun'), await addMember('CARD-003', 'Kai'), await addMember('CARD-004', 'Lim', 'inactive')];
+
+  // 1. Every member has a code of their own: those added before the cards (filled in by the migration) and new ones.
+  const codes = (await pool.query(`SELECT COUNT(*)::int AS members, COUNT(DISTINCT id_token)::int AS codes, COUNT(*) FILTER (WHERE id_token !~ '^[0-9a-f]{32}$')::int AS bad FROM members`)).rows[0];
+  assert.deepEqual([codes.codes, codes.bad], [codes.members, 0]);
+  await assert.rejects(pool.query('UPDATE members SET id_token = $1 WHERE id = $2', [ivy.id_token, jun.id]), (error) => error.code === '23505');
+  await assert.rejects(pool.query(`UPDATE members SET id_token = 'not-a-code' WHERE id = $1`, [jun.id]), (error) => error.code === '23514');
+
+  // 2. The card: name, member number, member since, photo and the QR, which holds the code only.
+  await pool.query(`UPDATE members SET profile_photo = 'local://member-photos/card/ivy.png' WHERE id = $1`, [ivy.id]);
+  const card = await office.get(`/api/members/${ivy.id}/id-card`);
+  assert.equal(card.status, 200, JSON.stringify(card.data));
+  assert.deepEqual(
+    [card.data.data.name, card.data.data.memberNumber, card.data.data.memberSince, card.data.data.status, card.data.data.qr, card.data.data.photo],
+    ['Ivy Card', 'CARD-001', '2021-03-15', 'active', `ACIFAC:${ivy.id_token.toUpperCase()}`, `/api/members/${ivy.id}/documents/photo`]
+  );
+  assert.equal((await office.get(`/api/members/${jun.id}/id-card`)).data.data.photo, null, 'no 2x2 photo on file');
+  assert.equal((await office.get('/api/members/999999/id-card')).status, 404);
+
+  // 3. The batch print: active members by name, or every member not terminated; search and membership dates.
+  const batch = (search) => office.get(`/api/members/id-cards?${search}`);
+  assert.deepEqual((await batch('search=CARD-00')).data.data.map((row) => row.memberNumber), ['CARD-001', 'CARD-002', 'CARD-003']);
+  const all = (await batch('search=CARD-00&status=all')).data;
+  assert.deepEqual([all.data.map((row) => row.memberNumber), all.total], [['CARD-001', 'CARD-002', 'CARD-003', 'CARD-004'], 4]);
+  assert.ok(all.data.every((row) => row.qr === `ACIFAC:${row.token.toUpperCase()}`));
+  assert.equal((await batch('search=CARD-00&joinedFrom=2021-03-15&joinedTo=2021-03-15')).data.data.length, 3);
+  assert.equal((await batch('search=CARD-00&joinedFrom=2021-03-16')).data.data.length, 0);
+  assert.equal((await batch('status=bogus')).status, 400);
+  assert.equal((await batch('joinedTo=2021-02-30')).status, 400);
+
+  // 4. A scanned card finds its member, with or without "ACIFAC:".
+  const found = await office.get(`/api/members/by-qr/${encodeURIComponent(`ACIFAC:${jun.id_token}`)}`);
+  assert.deepEqual([found.status, found.data.data.id, found.data.data.name, found.data.data.memberNumber, found.data.data.hasPhoto], [200, jun.id, 'Jun Card', 'CARD-002', false]);
+  assert.equal((await office.get(`/api/members/by-qr/${jun.id_token.toUpperCase()}`)).data.data.id, jun.id);
+  const notCard = await office.get(`/api/members/by-qr/${encodeURIComponent('https://example.com/pay')}`);
+  assert.deepEqual([notCard.status, notCard.data.message], [400, 'This QR code is not an ACIFAC member ID.']);
+  assert.equal((await office.get(`/api/members/by-qr/${'0'.repeat(32)}`)).status, 404);
+
+  // 5. A member reaches their own card only; the office's card endpoints are not theirs.
+  const ivyUser = (await pool.query(`INSERT INTO users (member_id, username, email, password_hash, role, account_status) VALUES ($1, 'ivy.card', NULL, $2, 'MEMBER', 'ACTIVE') RETURNING id`, [ivy.id, await hashPassword('IvyPass1!')])).rows[0].id;
+  const ivyClient = new Client('10.0.80.2');
+  assert.equal((await ivyClient.post('/api/auth/login', { usernameOrEmail: 'ivy.card', password: 'IvyPass1!' })).status, 200);
+  const mine = (await ivyClient.get('/api/members/me/id-card')).data.data;
+  assert.deepEqual([mine.memberId, mine.qr, mine.photo], [ivy.id, `ACIFAC:${ivy.id_token.toUpperCase()}`, '/api/members/me/documents/photo']);
+  for (const url of [`/api/members/${jun.id}/id-card`, '/api/members/id-cards', `/api/members/by-qr/${jun.id_token}`]) assert.equal((await ivyClient.get(url)).status, 403, url);
+  assert.equal((await ivyClient.post(`/api/members/${ivy.id}/id-card/reissue`, {})).status, 403);
+  assert.equal((await office.get('/api/members/me/id-card')).status, 403);
+  assert.equal((await new Client('10.0.80.3').get(`/api/members/by-qr/${jun.id_token}`)).status, 401);
+
+  // 6. Reissuing a lost card: a new code, the old card stops working, the member is told; the codes never reach the audit log.
+  const reissued = await office.post(`/api/members/${ivy.id}/id-card/reissue`, { reason: 'Lost at the market' });
+  assert.equal(reissued.status, 200, JSON.stringify(reissued.data));
+  const code = reissued.data.data.token;
+  assert.match(code, /^[0-9a-f]{32}$/);
+  assert.notEqual(code, ivy.id_token);
+  assert.ok(new Date(reissued.data.data.issuedAt) > new Date(ivy.id_issued_at));
+  assert.equal((await office.get(`/api/members/by-qr/${ivy.id_token}`)).status, 404, 'the old card no longer works');
+  assert.equal((await office.get(`/api/members/by-qr/${code}`)).data.data.id, ivy.id);
+  assert.equal((await ivyClient.get('/api/members/me/id-card')).data.data.token, code, 'My ID shows the new code');
+  const audits = (await pool.query(`SELECT * FROM audit_logs WHERE action = 'MEMBER_ID_CARD_REISSUED' AND entity_id = $1`, [String(ivy.id)])).rows;
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0].description, 'Reissued the member ID card of Ivy Card (CARD-001): Lost at the market. The old card no longer works.');
+  assert.ok(!JSON.stringify(audits[0]).includes(code) && !JSON.stringify(audits[0]).includes(ivy.id_token), 'no code in the audit log');
+  assert.ok(audits[0].old_values.id_issued_at < audits[0].new_values.id_issued_at);
+  assert.deepEqual((await pool.query(`SELECT title, link FROM notifications WHERE user_id = $1 AND type = 'member_id_reissued'`, [ivyUser])).rows,
+    [{ title: 'Your member ID card was replaced', link: '/member-profile' }]);
+  const logEntry = (await ivyClient.get('/api/members/me/activity?category=profile')).data.data.find((row) => row.action === 'MEMBER_ID_CARD_REISSUED');
+  assert.deepEqual([logEntry?.label, logEntry?.actor, logEntry?.description], ['Member ID card replaced', 'office', 'The office issued you a new member ID card. Your old card no longer works.']);
+  // A terminated membership has no card.
+  const mae = await addMember('CARD-005', 'Mae', 'archived');
+  assert.equal((await office.get(`/api/members/${mae.id}/id-card`)).status, 409);
+  assert.equal((await office.post(`/api/members/${mae.id}/id-card/reissue`, {})).status, 409);
+
+  // 7. Check-in at the door: present until the start time, late after it, at the time of the scan.
+  const meeting = { title: 'ID Card Meeting', category: 'meeting', activityDate: today, startTime: '00:00', endTime: '23:59', venue: 'ACIFAC Hall', attendeeScope: 'selected', memberIds: [ivy.id, jun.id, kai.id] };
+  const created = await office.post('/api/attendance/activities', meeting);
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const id = created.data.data.id;
+  const scan = (token, activityId = id, client = office) => client.post(`/api/attendance/activities/${activityId}/scan`, { token });
+  const first = await scan(`ACIFAC:${code}`);
+  assert.equal(first.status, 201, JSON.stringify(first.data));
+  const { record } = first.data.data;
+  assert.match(record.checkInTime, /^\d{2}:\d{2}$/);
+  assert.equal(record.status, record.checkInTime > '00:00' ? 'late' : 'present');
+  assert.match(first.data.message, /^Ivy Card checked in at \d{1,2}:\d{2} [AP]M: (late|present)\.$/);
+  assert.deepEqual([first.data.data.member.id, first.data.data.member.hasPhoto, first.data.data.activity.recorded], [ivy.id, true, 1]);
+  // A second scan changes nothing.
+  const again = await scan(`ACIFAC:${code}`);
+  assert.deepEqual([again.status, again.data.data.alreadyCheckedIn, again.data.data.record], [200, true, record]);
+  assert.match(again.data.message, /^Ivy Card already checked in at /);
+  const rows = async () => (await pool.query(`SELECT member_id, attendance_status, TO_CHAR(check_in_time, 'HH24:MI') AS at, remarks, source FROM activity_attendance WHERE activity_id = $1 ORDER BY member_id`, [id])).rows;
+  assert.deepEqual(await rows(), [{ member_id: ivy.id, attendance_status: record.status, at: record.checkInTime, remarks: '', source: 'scan' }]);
+  // The old card, a QR that is not a member ID, and a member who need not attend are refused.
+  assert.equal((await scan(`ACIFAC:${ivy.id_token}`)).status, 404);
+  assert.equal((await scan('https://example.com/pay')).status, 400);
+  assert.equal((await scan(undefined)).status, 400);
+  const outsider = await scan(lim.id_token);
+  assert.deepEqual([outsider.status, outsider.data.message], [400, 'Lim Card is not one of the members who must attend this activity.']);
+  // Marked excused by hand before arriving: the scan checks him in and keeps the remarks.
+  assert.equal((await office.request('PUT', `/api/attendance/activities/${id}/attendance`, { body: { records: [{ memberId: jun.id, status: 'excused', remarks: 'Said he would be away' }] } })).status, 200);
+  const arrived = await scan(jun.id_token);
+  assert.deepEqual([arrived.status, arrived.data.data.previousStatus], [201, 'excused']);
+  assert.match(arrived.data.message, /\(was marked excused\)\.$/);
+  const junRow = (await rows()).find((row) => row.member_id === jun.id);
+  assert.deepEqual([['present', 'late'].includes(junRow.attendance_status), junRow.remarks, junRow.source], [true, 'Said he would be away', 'scan']);
+  // The activity's history names each check-in; members cannot check anyone in.
+  const history = (await office.get(`/api/attendance/activities/${id}/history`)).data.data;
+  assert.ok(history.some((entry) => entry.action === 'ATTENDANCE_SCANNED' && entry.label === 'Checked in with member ID' && /^Ivy Card \(CARD-001\) checked in to "ID Card Meeting" with their member ID at /.test(entry.description)), JSON.stringify(history));
+  assert.ok(history.some((entry) => entry.action === 'ATTENDANCE_UPDATED' && entry.from === 'excused' && /checked in with their member ID/.test(entry.description)));
+  assert.equal((await scan(code, id, ivyClient)).status, 403);
+  assert.equal((await office.get(`/api/attendance/activities/${id}/members?filter=unmarked`)).data.data.map((row) => row.memberId).join(), String(kai.id));
+
+  // 8. Finalizing: Kai, never scanned, is recorded absent and gets the absence fine with the meeting dues; check-in closes.
+  const finalized = await office.post(`/api/attendance/activities/${id}/finalize`);
+  assert.equal(finalized.status, 200, JSON.stringify(finalized.data));
+  assert.equal(finalized.data.data.markedAbsent, 1);
+  const duesOf = async (memberId) => (await pool.query('SELECT kind, amount FROM member_dues WHERE activity_id = $1 AND member_id = $2 ORDER BY kind', [id, memberId])).rows.map((row) => `${row.kind} ${row.amount}`);
+  assert.deepEqual(await duesOf(kai.id), ['absence_fine 250.00', 'savings 50.00', 'share_capital 250.00']);
+  assert.deepEqual(await duesOf(ivy.id), ['savings 50.00', 'share_capital 250.00']);
+  const closed = await scan(code);
+  assert.deepEqual([closed.status, closed.data.message], [409, 'Attendance for this activity is final, so check-in is closed. Correct a record in the attendance list instead.']);
+
+  // 9. Only on the day of the activity, and never for a cancelled one.
+  const seminar = { ...meeting, title: 'ID Card Seminar', category: 'education_training', memberIds: [ivy.id] };
+  const tomorrow = (await office.post('/api/attendance/activities', { ...seminar, activityDate: shift(1) })).data.data.id;
+  const early = await scan(code, tomorrow);
+  assert.equal(early.status, 400);
+  assert.match(early.data.message, /^Check-in opens on the day of the activity, /);
+  const lastWeek = (await office.post('/api/attendance/activities', { ...seminar, activityDate: shift(-7) })).data.data.id;
+  const late = await scan(code, lastWeek);
+  assert.equal(late.status, 400);
+  assert.match(late.data.message, /^Scanning is only for check-in on the day of the activity\. Mark the attendance of .+ in the list instead\.$/);
+  const rained = (await office.post('/api/attendance/activities', { ...seminar, title: 'ID Card Clean-up', category: 'community_development' })).data.data.id;
+  assert.equal((await office.patch(`/api/attendance/activities/${rained}/cancel`, { reason: 'Heavy rain' })).status, 200);
+  assert.equal((await scan(code, rained)).status, 409);
+  assert.equal(Number((await pool.query('SELECT COUNT(*) FROM activity_attendance WHERE activity_id = ANY($1::int[])', [[tomorrow, lastWeek, rained]])).rows[0].count), 0);
+});
