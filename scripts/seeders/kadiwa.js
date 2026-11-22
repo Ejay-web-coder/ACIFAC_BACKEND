@@ -98,11 +98,13 @@ async function seedSalesHistory(ctx) {
   ctx.count('Kadiwa sales', sales.length);
 
   // Members who bought on those days, with their name or member ID written on
-  // the sale (patronage points): two to four a day, a part of the day's sales.
+  // the sale (patronage points): two to four a day for each 100 members (up to
+  // three times that), a part of the day's sales.
   const buyers = ctx.members.filter((member, index) => index % 3 !== 2);
+  const perHundred = Math.min(3, Math.max(1, Math.round(ctx.scale / 1.5)));
   const purchases = sales.flatMap((sale, n) => {
     const gross = sale.totals.Groceries + sale.totals.Vegetables + sale.totals.Meat;
-    const count = 2 + (n % 3);
+    const count = (2 + (n % 3)) * perHundred;
     const picked = [...new Set(Array.from({ length: count }, (_, k) => buyers[(n * 7 + k * 13) % buyers.length]))];
     return picked.map((member, k) => ({
       saleId: ids.get(sale.saleDate), line: k + 1, member,

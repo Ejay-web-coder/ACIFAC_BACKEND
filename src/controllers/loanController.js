@@ -7,9 +7,11 @@ import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import { sendEmailSafely } from '../services/emailService.js';
 import { loanApplicationReceivedEmail, loanDecisionEmail, loanSubmittedEmail, paymentEmail } from '../services/emailTemplates.js';
 import { emailMember } from '../services/memberEmails.js';
+import { loanApprovedSms, loanDeclinedSms, textMember } from '../services/smsService.js';
 import { sendStoredFile } from '../services/storage.js';
 import { officeOpenNow, paymentHours } from '../services/officeHours.js';
 import { keepAlive } from '../utils/background.js';
+import { displayName } from '../utils/people.js';
 import { notifyAdmins, notifyMember } from '../services/notificationService.js';
 import {
   allocatePayment, calculateLoanFinancials, createInstallments, ensureInstallments, LOAN_POLICY, penaltyAccruedSql, penaltyDaysSql, penaltyDue,
@@ -57,9 +59,14 @@ const loanSelect = `
          l.collateral_details AS "collateralDetails", l.in_kind_items AS "inKindItems", l.loan_request_id AS "loanRequestId",
          COALESCE(rs.restructure_count, 0)::int AS "restructureCount", rs.last_restructured_on AS "lastRestructuredOn",
          rf.loan_number AS "renewedFromLoan", rf.balance_carried AS "renewalDeduction", rf.net_proceeds AS "netProceeds",
+         -- Who approved the loan: the reviewer of its application, else whoever recorded the restructuring that made it.
+         COALESCE(${displayName('approver')}, ${displayName('restructurer')}) AS "approvedBy",
+         COALESCE(approver.position, restructurer.position) AS "approvedByPosition",
          ${idDocumentsColumn('l')}, ${signatureColumn('l')}
   FROM loans l
   LEFT JOIN members m ON m.id = l.member_id
+  LEFT JOIN loan_requests application ON application.id = l.loan_request_id
+  LEFT JOIN users approver ON approver.id = application.reviewed_by
   LEFT JOIN LATERAL (
     SELECT SUM(p.amount - p.penalty_paid) AS total_paid, SUM(p.penalty_paid) AS penalty_paid, COUNT(*) AS payment_count FROM loan_payments p WHERE p.loan_id = l.id
   ) pay ON TRUE
@@ -76,15 +83,20 @@ const loanSelect = `
   LEFT JOIN LATERAL (SELECT COUNT(*) AS restructure_count, MAX(r.restructured_on) AS last_restructured_on FROM loan_restructurings r WHERE r.loan_id = l.id) rs ON TRUE
   LEFT JOIN LATERAL (
     -- A loan that restructured an earlier one: that loan, and what of this one paid it off (its balance and penalty).
-    SELECT o.loan_number, r.balance_carried + r.penalty_carried AS balance_carried, r.net_proceeds FROM loan_restructurings r JOIN loans o ON o.id = r.loan_id WHERE r.new_loan_id = l.id LIMIT 1
-  ) rf ON TRUE`;
+    SELECT o.loan_number, r.balance_carried + r.penalty_carried AS balance_carried, r.net_proceeds, r.recorded_by FROM loan_restructurings r JOIN loans o ON o.id = r.loan_id WHERE r.new_loan_id = l.id LIMIT 1
+  ) rf ON TRUE
+  LEFT JOIN users restructurer ON restructurer.id = rf.recorded_by`;
 
+// recordedBy: the name of the person who recorded the payment (on receipts).
 const paymentSelect = `
   SELECT p.id, p.loan_id AS "loanId", l.loan_number AS "loanNumber", l.member_id AS "memberDatabaseId", l.member_name AS "memberName",
+         COALESCE(pm.member_number, l.member_number) AS "memberNumber",
          p.amount, p.payment_date AS "paymentDate", p.principal_paid AS "principalPaid", p.interest_paid AS "interestPaid",
-         p.penalty_paid AS "penaltyPaid", p.remaining_balance AS "remainingBalance", p.created_at AS "createdAt", u.username AS "recordedBy"
+         p.penalty_paid AS "penaltyPaid", p.remaining_balance AS "remainingBalance", p.created_at AS "createdAt",
+         ${displayName('u')} AS "recordedBy", u.position AS "recordedByPosition"
   FROM loan_payments p
   JOIN loans l ON l.id = p.loan_id
+  LEFT JOIN members pm ON pm.id = l.member_id
   LEFT JOIN users u ON u.id = p.recorded_by`;
 
 const restructuringSelect = `
@@ -94,7 +106,7 @@ const restructuringSelect = `
          r.new_term AS "newTerm", r.new_monthly_payment AS "newMonthlyPayment", r.previous_due_date AS "previousDueDate",
          r.new_due_date AS "newDueDate", r.kind, r.amount_paid_before AS "amountPaidBefore", r.total_before AS "totalBefore", r.penalty_carried AS "penaltyCarried",
          r.new_loan_amount AS "newLoanAmount", r.net_proceeds AS "netProceeds", n.loan_number AS "newLoanNumber",
-         u.username AS "recordedBy", r.created_at AS "createdAt"
+         ${displayName('u')} AS "recordedBy", r.created_at AS "createdAt"
   FROM loan_restructurings r LEFT JOIN users u ON u.id = r.recorded_by LEFT JOIN loans n ON n.id = r.new_loan_id`;
 
 const requestSelect = `
@@ -476,6 +488,9 @@ export async function createLoan(req, res, _next, { takeIds, borrowerSignature =
     requestId: loan.id, amount: loan.amount, interestRate: loan.interestRate, term: loan.term, status: 'approved', totalRepayment: loan.totalAmount, monthlyPayment: loan.monthlyPayment,
     repayment: loan.repayment, dueDate: loan.dueDate, penaltyPerDay: loan.penaltyPerDay, graceDays: loan.graceDays,
   }));
+  void textMember(loan.memberDatabaseId, loanApprovedSms({
+    amount: loan.amount, totalRepayment: loan.totalAmount, dueDate: loan.dueDate, repayment: loan.repayment, monthlyPayment: loan.monthlyPayment, term: loan.term,
+  }));
   return res.status(201).json({ success: true, loan });
 }
 
@@ -552,8 +567,12 @@ export async function reviewLoanRequest(req, res) {
     [request.member_id]
   );
   const recipient = recipientResult.rows[0];
+  const loan = loanId ? (await query(`SELECT total_repayment, monthly_payment, interest_rate, term, repayment, TO_CHAR(due_date, 'YYYY-MM-DD') AS due_date, penalty_per_day, grace_days FROM loans WHERE id = $1`, [loanId])).rows[0] : null;
+  // The decision is also texted to the member's mobile number.
+  void textMember(request.member_id, status === 'approved'
+    ? loan && loanApprovedSms({ amount: request.amount, totalRepayment: loan.total_repayment, dueDate: loan.due_date, repayment: loan.repayment, monthlyPayment: loan.monthly_payment, term: loan.term })
+    : loanDeclinedSms({ amount: request.amount, reason: reviewNotes }));
   if (recipient?.email) {
-    const loan = loanId ? (await query(`SELECT total_repayment, monthly_payment, interest_rate, term, repayment, TO_CHAR(due_date, 'YYYY-MM-DD') AS due_date, penalty_per_day, grace_days FROM loans WHERE id = $1`, [loanId])).rows[0] : null;
     const email = loanDecisionEmail({
       requestId: request.id, amount: request.amount, interestRate: loan?.interest_rate, term: loan?.term ?? request.term, status, reason: reviewNotes,
       totalRepayment: loan?.total_repayment, monthlyPayment: loan?.monthly_payment, repayment: loan?.repayment, dueDate: loan?.due_date,

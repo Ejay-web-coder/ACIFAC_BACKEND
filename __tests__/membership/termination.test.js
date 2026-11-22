@@ -14,7 +14,8 @@ function memberIs(member) {
   ]);
 }
 const active = { id: 55, member_number: 'ACIFAC-2026-004', status: 'active', additional_info: { membershipType: 'Regular' } };
-const terminated = { ...active, status: 'archived', additional_info: { membershipType: 'Regular', separationDate: '2026-10-01', termination: { type: 'voluntary' } } };
+const terminated = { ...active, status: 'archived', additional_info: { membershipType: 'Regular', separationDate: '2026-10-01', termination: { type: 'involuntary', cause: 'failedObligations', date: '2026-10-01' } } };
+const resigned = (date) => ({ ...active, status: 'archived', additional_info: { membershipType: 'Regular', separationDate: date, termination: { type: 'voluntary', date } } });
 const request = (body = {}) => mockRequest({ method: 'POST', params: { id: '55' }, body, user: { id: 1, username: 'admin', role: 'ADMIN' } });
 beforeEach(() => { jest.clearAllMocks(); memberIs(active); });
 
@@ -54,6 +55,16 @@ describe('Termination of membership (archiveMember, restoreMember)', () => {
     expect(res.body).toMatchObject({ success: true, message: 'Member restored successfully.', data: { status: 'active', termination: null } });
     const [, params] = db.client.query.mock.calls.find(([sql]) => sql.includes("SET status = 'active'"));
     expect(JSON.parse(params[1])).toEqual({ membershipType: 'Regular' });
+  });
+
+  test('a member who resigned cannot come back (Membership Policy), except to undo a mistake the same day', async () => {
+    memberIs(resigned('2026-10-01'));
+    await expect(restoreMember(request(), mockResponse())).rejects.toMatchObject({ status: 409, message: expect.stringContaining('a member who resigned cannot come back') });
+    expect(db.client.query.mock.calls.some(([sql]) => sql.includes("SET status = 'active'"))).toBe(false);
+    memberIs(resigned(todayDateOnly()));
+    const res = mockResponse();
+    await restoreMember(request(), res);
+    expect(res.body).toMatchObject({ success: true, data: { status: 'active' } });
   });
 
   test('an active member cannot be restored, and an unknown member is not found', async () => {

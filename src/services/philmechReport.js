@@ -129,7 +129,7 @@ function buildMachine(machine, { services, expenses, balances, rates, implements
     deliveryDate: machine.deliveryDate ?? null,
     condition: machine.condition ?? null,
     implements: implementsList,
-    rates: rates.map(({ serviceType, unit, memberRate, nonMemberRate, effectiveFrom, effectiveTo }) => ({ serviceType, unit, memberRate, nonMemberRate, effectiveFrom, effectiveTo })),
+    rates: rates.map(({ serviceType, unit, season = null, memberRate, nonMemberRate, effectiveFrom, effectiveTo }) => ({ serviceType, unit, season, memberRate, nonMemberRate, effectiveFrom, effectiveTo })),
     summary: {
       farmers: { member: farmers.member.size, nonMember: farmers.non_member.size, total: farmers.member.size + farmers.non_member.size },
       areaHa: { member: areaText(areaBy.member), nonMember: areaText(areaBy.non_member), total: areaText(areaBy.member + areaBy.non_member) },

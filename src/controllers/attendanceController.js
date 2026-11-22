@@ -7,6 +7,76 @@ import {
   ACTIVITY_CATEGORIES, ACTIVITY_STATUSES, ATTENDANCE_STATUSES, ATTENDED_STATUSES, attendanceRate, parseAttendanceRecords, summarizeParticipation,
   validateActivityInput,
 } from '../services/attendance.js';
+import { DUES, syncMeetingDues } from '../services/dues.js';
+import { centsToString } from '../utils/money.js';
+import { isEmailConfigured } from '../services/emailService.js';
+import { activityEmail } from '../services/emailTemplates.js';
+import { emailMembersInBulk } from '../services/memberEmails.js';
+import { keepAlive } from '../utils/background.js';
+
+// "8:00 AM" from "08:00".
+function clockText(value) {
+  const [hours, minutes] = String(value).slice(0, 5).split(':').map(Number);
+  return `${((hours + 11) % 12) + 1}:${String(minutes).padStart(2, '0')} ${hours < 12 ? 'AM' : 'PM'}`;
+}
+const duePesos = (kind) => `PHP ${Number(centsToString(DUES[kind].cents)).toLocaleString('en-PH')}`;
+
+// What the members who must attend an upcoming activity are told when it is
+// created, changed or cancelled, or null when it is not announced: activities
+// on a past date (recorded after they took place), and ones no longer
+// scheduled unless the news is that they were cancelled.
+export function activityNotice(activity, change) {
+  const date = String(activity.activity_date).slice(0, 10);
+  if (date < todayDateOnly() || (change !== 'cancelled' && activity.status !== 'scheduled')) return null;
+  const meeting = activity.category === 'meeting';
+  const noun = meeting ? 'meeting' : 'activity';
+  const when = `${formatDateOnly(date)}, ${clockText(activity.start_time)} to ${clockText(activity.end_time)}`;
+  const selected = activity.attendee_scope === 'selected';
+  const who = selected ? 'You are one of the members who must attend.' : 'All members must attend.';
+  const bring = meeting ? `Bring ${duePesos('share_capital')} for share capital and ${duePesos('savings')} for savings; missing it without a valid reason has a ${duePesos('absence_fine')} fine.` : '';
+  const notice = {
+    created: { title: `New ${noun}: ${activity.title}`, message: `${when} at ${activity.venue}. ${who}${bring ? ` ${bring}` : ''}`, severity: 'info' },
+    changed: { title: `${meeting ? 'Meeting' : 'Activity'} changed: ${activity.title}`, message: `It is now on ${when} at ${activity.venue}.`, severity: 'warning' },
+    cancelled: { title: `${meeting ? 'Meeting' : 'Activity'} cancelled: ${activity.title}`, message: `The ${noun} on ${formatDateOnly(date)} was cancelled${activity.cancellation_reason ? `: ${activity.cancellation_reason}` : '.'}`, severity: 'warning' },
+  }[change];
+  return { ...notice, change, date, noun, when, selected, note: [who, bring].filter(Boolean).join(' ') };
+}
+
+// Tells the members who must attend (notification and phone), in the
+// transaction. Returns the notice, for emailActivityMembers after the commit.
+async function notifyActivityMembers(client, activity, change) {
+  const notice = activityNotice(activity, change);
+  if (!notice) return null;
+  await client.query(
+    `INSERT INTO notifications (user_id, type, title, message, severity, link, entity_type, entity_id, dedupe_key)
+     SELECT u.id, $2, LEFT($3, 200), $4, $5, '/member/attendance', 'activity', $1::int::text, $6
+     FROM members m JOIN users u ON u.member_id = m.id AND u.account_status = 'ACTIVE'
+     WHERE m.status = 'active' AND (NOT $7::boolean OR EXISTS (SELECT 1 FROM activity_invitees i WHERE i.activity_id = $1::int AND i.member_id = m.id))
+     ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING`,
+    [activity.id, `activity_${change}`, notice.title, notice.message, notice.severity, `activity-${activity.id}-${change}-${change === 'created' ? 'once' : Date.now()}`, notice.selected]
+  );
+  return notice;
+}
+
+// The same news by email, after the commit and the response, to the same
+// members, those without a login included. Never throws.
+function emailActivityMembers(activity, notice) {
+  if (!notice || !isEmailConfigured()) return;
+  const email = activityEmail({
+    change: notice.change, noun: notice.noun, title: activity.title, when: notice.when, venue: activity.venue, organizer: activity.organizer || '',
+    description: activity.description || '', note: notice.note, date: notice.date, reason: activity.cancellation_reason || '',
+  });
+  void keepAlive((async () => {
+    try {
+      const memberIds = notice.selected
+        ? (await query('SELECT member_id FROM activity_invitees WHERE activity_id = $1', [activity.id])).rows.map((row) => row.member_id)
+        : null;
+      await emailMembersInBulk(memberIds, email);
+    } catch (error) {
+      console.error('Activity email error:', error instanceof Error ? error.message : error);
+    }
+  })());
+}
 
 // Member attendance monitoring: activities, the attendance recorded at each,
 // finalization, the dashboard, reports and each member's participation.
@@ -233,7 +303,7 @@ export async function createActivity(req, res) {
   const { errors, values } = validateActivityInput(req.body, { today: todayDateOnly() });
   if (errors.length) throw badRequest(errors[0], errors);
   const userId = currentUserId(req);
-  const id = await withTransaction(async (client) => {
+  const created = await withTransaction(async (client) => {
     const row = (await client.query(
       `INSERT INTO activities (title, category, activity_date, start_time, end_time, venue, description, organizer, status, attendee_scope, created_by, updated_by)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11) RETURNING *`,
@@ -245,9 +315,10 @@ export async function createActivity(req, res) {
       description: `Created the ${ACTIVITY_CATEGORIES[row.category].toLowerCase()} activity "${row.title}" on ${formatDateOnly(row.activity_date)}, mandatory for ${scopeText(values.attendeeScope, invitees)}`,
       newValues: { ...activityAuditValues(row), invitees }, ...getRequestMeta(req),
     });
-    return row.id;
+    return { id: row.id, row, notice: await notifyActivityMembers(client, row, 'created') };
   });
-  return res.status(201).json({ success: true, message: 'Activity created.', data: await loadActivity(id) });
+  emailActivityMembers(created.row, created.notice);
+  return res.status(201).json({ success: true, message: 'Activity created.', data: await loadActivity(created.id) });
 }
 
 // PUT /api/attendance/activities/:id: edits the activity. Setting the status to
@@ -256,7 +327,7 @@ export async function createActivity(req, res) {
 export async function updateActivity(req, res) {
   const id = parseId(req.params.id, 'activity ID');
   const userId = currentUserId(req);
-  await withTransaction(async (client) => {
+  const { updated, notice } = await withTransaction(async (client) => {
     const existing = await lockActivity(client, id);
     const hasRecords = (await client.query('SELECT EXISTS (SELECT 1 FROM activity_attendance WHERE activity_id = $1) AS has', [id])).rows[0].has;
     const { errors, values } = validateActivityInput(req.body, { today: todayDateOnly(), existing, hasRecords });
@@ -287,7 +358,12 @@ export async function updateActivity(req, res) {
       description: `${verb} the activity "${updated.title}" on ${formatDateOnly(updated.activity_date)}`,
       oldValues: { ...activityAuditValues(existing), invitees: before.length }, newValues: { ...activityAuditValues(updated), invitees }, ...getRequestMeta(req),
     });
+    // Members are told when it is cancelled, or when its day, time or place changes.
+    const moved = ['activity_date', 'start_time', 'end_time', 'venue'].some((key) => String(existing[key]) !== String(updated[key]));
+    const change = cancelling ? 'cancelled' : restoring || moved ? 'changed' : null;
+    return { updated, notice: change ? await notifyActivityMembers(client, updated, change) : null };
   });
+  emailActivityMembers(updated, notice);
   return res.json({ success: true, message: 'Activity updated.', data: await loadActivity(id) });
 }
 
@@ -297,7 +373,7 @@ export async function cancelActivity(req, res) {
   const reason = cleanString(req.body?.reason, 500);
   if (reason.length < 3) throw badRequest('Give the reason the activity is cancelled.');
   const userId = currentUserId(req);
-  await withTransaction(async (client) => {
+  const { updated, notice } = await withTransaction(async (client) => {
     const existing = await lockActivity(client, id);
     if (existing.status === 'cancelled') throw conflict('This activity is already cancelled.');
     if (existing.attendance_finalized_at) throw conflict('Attendance for this activity is final: it took place and cannot be cancelled.');
@@ -311,7 +387,9 @@ export async function cancelActivity(req, res) {
       description: `Cancelled the activity "${updated.title}" on ${formatDateOnly(updated.activity_date)}`,
       oldValues: activityAuditValues(existing), newValues: activityAuditValues(updated), ...getRequestMeta(req),
     });
+    return { updated, notice: await notifyActivityMembers(client, updated, 'cancelled') };
   });
+  emailActivityMembers(updated, notice);
   return res.json({ success: true, message: 'Activity cancelled.', data: await loadActivity(id) });
 }
 
@@ -434,13 +512,19 @@ export async function saveAttendance(req, res) {
         });
       }
     }
-    return { added: added.length, updated: changed.length, unchanged: records.length - added.length - changed.length };
+    // A correction to a meeting whose dues were added adds or removes the absence fine.
+    const dues = final && activity.dues_charged_at && (added.length || changed.length) ? await syncMeetingDues(client, id, userId) : null;
+    return { added: added.length, updated: changed.length, unchanged: records.length - added.length - changed.length, dues };
   });
 
   const parts = [result.added && `${result.added} added`, result.updated && `${result.updated} ${result.updated === 1 ? 'change' : 'changes'} saved`].filter(Boolean);
+  const duesNote = !result.dues ? ''
+    : [result.dues.added && ` ${result.dues.added} ${result.dues.added === 1 ? 'due was' : 'dues were'} added.`,
+      result.dues.removedFines && ` ${result.dues.removedFines} absence ${result.dues.removedFines === 1 ? 'fine was' : 'fines were'} removed.`,
+      result.dues.keptFines && ` ${result.dues.keptFines} absence ${result.dues.keptFines === 1 ? 'fine was' : 'fines were'} already paid or waived and ${result.dues.keptFines === 1 ? 'was' : 'were'} kept; refund or adjust ${result.dues.keptFines === 1 ? 'it' : 'them'} under Dues.`].filter(Boolean).join('');
   return res.json({
     success: true,
-    message: parts.length ? `Attendance saved: ${parts.join(', ')}.` : 'Nothing changed: the attendance was already saved.',
+    message: parts.length ? `Attendance saved: ${parts.join(', ')}.${duesNote}` : 'Nothing changed: the attendance was already saved.',
     data: { ...result, activity: await loadActivity(id) },
   });
 }
@@ -475,11 +559,14 @@ export async function finalizeAttendance(req, res) {
       oldValues: { status: activity.status }, newValues: { status: 'completed' },
       details: { activity_id: id, marked_absent: absent.rowCount }, ...getRequestMeta(req),
     });
-    return { markedAbsent: absent.rowCount };
+    // A meeting's dues (share capital, savings, absence fines) are added for everyone on the list.
+    const dues = activity.category === 'meeting' ? await syncMeetingDues(client, id, userId, { first: true }) : null;
+    return { markedAbsent: absent.rowCount, dues };
   });
+  const duesNote = result.dues ? ` Meeting dues were added for ${result.dues.members} ${result.dues.members === 1 ? 'member' : 'members'}.` : '';
   return res.json({
     success: true,
-    message: `Attendance finalized. ${result.markedAbsent} unmarked ${result.markedAbsent === 1 ? 'member was' : 'members were'} recorded absent.`,
+    message: `Attendance finalized. ${result.markedAbsent} unmarked ${result.markedAbsent === 1 ? 'member was' : 'members were'} recorded absent.${duesNote}`,
     data: { ...result, activity: await loadActivity(id) },
   });
 }

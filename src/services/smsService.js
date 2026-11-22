@@ -2,6 +2,7 @@ import { query } from '../config/db.js';
 import { TIME_ZONE } from '../config/env.js';
 import { keepAlive } from '../utils/background.js';
 import { normalizePhilippineMobile } from '../utils/phone.js';
+import { formatDateOnly } from '../utils/dates.js';
 
 // Text messages go out through textbee (textbee.dev): an Android phone with the
 // cooperative's SIM runs the textbee app, and the API asks that phone to send.
@@ -96,6 +97,40 @@ export async function queueSmsForUsers(rows, template) {
   return texts.length;
 }
 
+// Queues a text for a member and sends it (now, or once the sending hours
+// begin). The member's login account decides, by its "SMS notifications"
+// setting; a member without a login is texted too, like the emails in
+// memberEmails.js. The number is the member record's (kept up to date by the
+// office), else the login account's. Terminated members are not texted.
+// Never throws; call it after the transaction has committed. Resolves to
+// whether a text was queued.
+export function textMember(memberId, message) {
+  if (!memberId || !message || !isSmsConfigured()) return Promise.resolve(false);
+  return keepAlive((async () => {
+    try {
+      const row = (await query(
+        `SELECT u.id AS user_id, COALESCE(NULLIF(TRIM(m.phone), ''), u.phone) AS phone,
+                COALESCE((u.notification_preferences ->> 'smsNotifications')::boolean, true) AS allowed
+         FROM members m
+         LEFT JOIN LATERAL (
+           SELECT id, phone, notification_preferences FROM users WHERE member_id = m.id
+           ORDER BY (account_status = 'ACTIVE') DESC, id LIMIT 1
+         ) u ON TRUE
+         WHERE m.id = $1 AND m.status <> 'archived'`,
+        [memberId]
+      )).rows[0];
+      const phone = row?.allowed ? normalizePhilippineMobile(row.phone) : null;
+      if (!phone) return false;
+      await query(`INSERT INTO sms_outbox (user_id, phone, message) VALUES ($1, $2, $3)`, [row.user_id ?? null, phone, message]);
+      await flushSmsOutbox();
+      return true;
+    } catch (error) {
+      console.error('Member text error:', error instanceof Error ? error.message : error);
+      return false;
+    }
+  })());
+}
+
 let flushing = null;
 
 // Sends queued texts, oldest first. Outside the sending hours it does nothing,
@@ -158,3 +193,82 @@ export function passwordResetCodeSms({ code, expiresInMinutes = 10 }) {
 export function loanReminderSms({ message }) {
   return `${message} Please pay at the ACIFAC office.`;
 }
+
+// What a text may hold before the signature: one SMS in all.
+export const SMS_BODY_LIMIT = 160 - signSms('').length;
+
+const pesos = (value) => `PHP ${Number(value).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const hasAmount = (value) => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
+// "Sep 30, 2026" from "2026-09-30".
+function shortDate(value) {
+  const [year, month, day] = String(value).slice(0, 10).split('-').map(Number);
+  return new Intl.DateTimeFormat('en-PH', { timeZone: 'UTC', year: 'numeric', month: 'short', day: 'numeric' }).format(new Date(Date.UTC(year, month - 1, day)));
+}
+// Names typed into the system (machines) in plain ASCII: accents dropped and
+// anything else outside it left out, so one character cannot turn the text
+// into a 70-character SMS.
+function plainText(value) {
+  return String(value ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\x20-\x7E]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// A loan application approved, or a loan the office recorded for the member.
+// repayment 'single': the whole amount is due by dueDate (YYYY-MM-DD);
+// otherwise monthly installments over `term` months.
+export function loanApprovedSms({ amount, totalRepayment, dueDate, repayment = 'single', monthlyPayment, term }) {
+  const approved = `ACIFAC: Your loan of ${pesos(amount)} was approved.`;
+  if (!hasAmount(totalRepayment)) return approved;
+  if (repayment !== 'single' && hasAmount(monthlyPayment) && term) {
+    return `${approved} Total to pay: ${pesos(totalRepayment)}, ${pesos(monthlyPayment)} a month for ${term} months.`;
+  }
+  return `${approved} Total to pay: ${pesos(totalRepayment)}${dueDate ? ` by ${formatDateOnly(String(dueDate).slice(0, 10))}` : ''}.`;
+}
+
+const shorten = (text, max) => (text.length <= max ? text : `${text.slice(0, Math.max(0, max - 3)).trimEnd()}...`);
+// text(part), with `part` shortened ("...") as much as it takes to stay one SMS.
+const fitted = (text, part) => text(shorten(part, SMS_BODY_LIMIT - text('').length));
+// A decline reason gets at least this much room; a long machine name gives way to it.
+const REASON_ROOM = 40;
+const MACHINE_NAME_MIN = 24;
+
+const ASK_THE_OFFICE = 'Please ask the ACIFAC office for details.';
+const withFullStop = (text) => (/[.!?]$/.test(text) ? text : `${text}.`);
+
+// A loan application declined, with the reason the office gave (shortened if
+// long: the email and the notification in the app have all of it).
+export function loanDeclinedSms({ amount, reason = '' }) {
+  const declined = `ACIFAC: Your loan application for ${pesos(amount)} was declined.`;
+  const why = plainText(reason);
+  if (!why) return `${declined} ${ASK_THE_OFFICE}`;
+  return fitted((part) => `${declined} Reason: ${part}`, withFullStop(why));
+}
+
+// "on Dec 3, 2026", "from Dec 3 to Dec 5, 2026", "from Dec 30, 2026 to Jan 2, 2027".
+function rentalDays(startDate, endDate) {
+  const start = String(startDate).slice(0, 10);
+  const end = String(endDate).slice(0, 10);
+  if (start === end) return `on ${shortDate(start)}`;
+  if (start.slice(0, 4) === end.slice(0, 4)) return `from ${shortDate(start).replace(/, \d{4}$/, '')} to ${shortDate(end)}`;
+  return `from ${shortDate(start)} to ${shortDate(end)}`;
+}
+
+// A member's machinery rental request approved (with the fee) or declined
+// (with the office's reason). Long names and reasons are shortened so the
+// text stays one SMS; the email and the notification in the app have all of it.
+function rentalDecisionSms({ machineryName, startDate, endDate, rentalFee, reason = '' }, status) {
+  const days = rentalDays(startDate, endDate);
+  const name = plainText(machineryName) || 'the machine';
+  const why = plainText(reason);
+  if (status === 'declined' && why) {
+    const text = (machine) => (part) => `ACIFAC: Your request to rent ${machine} ${days} was declined. Reason: ${part}`;
+    const room = SMS_BODY_LIMIT - text(name)('').length;
+    const machine = room >= REASON_ROOM ? name : shorten(name, Math.max(MACHINE_NAME_MIN, name.length - (REASON_ROOM - room)));
+    return fitted(text(machine), withFullStop(why));
+  }
+  const after = status === 'approved'
+    ? (hasAmount(rentalFee) && Number(rentalFee) > 0 ? ` Fee: ${pesos(rentalFee)}.` : '')
+    : ' Ask the office for details.';
+  return fitted((machine) => `ACIFAC: Your request to rent ${machine} ${days} was ${status}.${after}`, name);
+}
+
+export const rentalApprovedSms = (rental) => rentalDecisionSms(rental, 'approved');
+export const rentalDeclinedSms = (rental) => rentalDecisionSms(rental, 'declined');

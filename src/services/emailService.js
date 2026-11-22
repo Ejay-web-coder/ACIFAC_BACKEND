@@ -29,12 +29,14 @@ export function buildLink(path, token) {
   return `${getFrontendUrl()}${path}?token=${encodeURIComponent(token)}`;
 }
 
-export async function sendEmail({ to, subject, text, html }) {
+// `bcc`: more recipients, who do not see each other (one message to many
+// members; see memberEmails.js).
+export async function sendEmail({ to, bcc, subject, text, html }) {
   if (!isEmailConfigured()) {
     console.warn('Email service is not configured; skipping email delivery.');
     return { sent: false, skipped: true };
   }
-  await transporter.sendMail({ from: emailFrom || 'acifac@localhost', to, subject, text, html });
+  await transporter.sendMail({ from: emailFrom || 'acifac@localhost', to, ...(bcc?.length ? { bcc } : {}), subject, text, html });
   return { sent: true };
 }
 

@@ -1,14 +1,18 @@
 import { query, withTransaction } from '../config/db.js';
 import { SQL_TODAY } from '../config/env.js';
 import { capitalChange, createAuditLog } from '../utils/audit.js';
-import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
+import { formatDateOnly, isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { AppError, badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, optionalString, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import { assertValidUpload, BUCKETS, removeFile, safeOriginalName, sendStoredFile, uploadFile } from '../services/storage.js';
 import { notifyMember } from '../services/notificationService.js';
 import { emailMember } from '../services/memberEmails.js';
-import { savingsDepositEmail, savingsWithdrawalEmail, shareContributionEmail, welcomeMemberEmail } from '../services/emailTemplates.js';
+import {
+  membershipRestoredEmail, membershipTerminatedEmail, savingsDepositEmail, savingsWithdrawalEmail, shareContributionEmail, welcomeMemberEmail,
+} from '../services/emailTemplates.js';
 import { savingsTypeLabel, signedSavings } from '../services/savingsLedger.js';
+import { LOYALTY_MIN_ATTENDANCE, loyaltyStanding, membershipAgeError, restoreBlockedReason } from '../services/membershipRules.js';
+import { displayName } from '../utils/people.js';
 import { IMAGE_TYPES, MEMBER_FILE_TYPES } from '../middleware/upload.js';
 import { loanSelect, paymentSelect, requestSelect } from './loanController.js';
 import { refreshLoanStatusesInBackground } from '../services/loanService.js';
@@ -52,7 +56,7 @@ const shareContributionSelect = `
   SELECT sc.id, sc.member_id AS "memberId", sc.amount, sc.contribution_date AS "contributionDate",
          sc.payment_method AS "paymentMethod", sc.reference_number AS "referenceNumber", sc.notes,
          sc.created_at AS "createdAt", sc.updated_at AS "updatedAt", sc.recorded_by AS "recordedBy",
-         u.username AS "recordedByName"
+         ${displayName('u')} AS "recordedByName", u.position AS "recordedByPosition"
   FROM share_contributions sc
   LEFT JOIN users u ON u.id = sc.recorded_by`;
 
@@ -95,7 +99,9 @@ export function readAdditionalInfo(raw) {
   return info;
 }
 
-export function validateMemberInput(body) {
+// checkAge: false when editing a member whose birthday and membership date
+// stay the same (the limit applies when joining; updateMember checks a change).
+export function validateMemberInput(body, { checkAge = true } = {}) {
   const errors = [];
   const values = {
     firstName: cleanString(body.first_name, 100),
@@ -119,6 +125,10 @@ export function validateMemberInput(body) {
   if (body.date_of_birth) {
     if (!isValidDateOnly(body.date_of_birth)) errors.push('Date of birth is invalid.');
     else if (body.date_of_birth > todayDateOnly()) errors.push('Date of birth cannot be in the future.');
+    else if (checkAge) {
+      const ageError = membershipAgeError(cleanString(body.date_of_birth, 10), values.membershipDate);
+      if (ageError) errors.push(ageError);
+    }
   }
   for (const field of ['farm_area_ha', 'corn_area_ha', 'palay_area_ha', 'yearly_income']) {
     const amount = numericOrNull(body[field]);
@@ -228,14 +238,33 @@ export async function getMemberStatistics(req, res) {
 // completed on the award date (?asOf=YYYY-MM-DD, today if not given), longest
 // membership first. Members who joined after that day are left out. The award
 // date may be ahead, to prepare the awards for a coming general assembly.
+// Each member also has their standing for the award: good standing means, in
+// the 12 months up to the award date, attending at least ?minAttendance
+// percent (75 if not given) of the activities they had to attend (a member
+// with none is not held back by it) and paying loans on time (no payment that
+// carried a late penalty, and no loan overdue now).
 export async function getLoyaltyReport(req, res) {
   const asOf = cleanString(req.query.asOf, 10) || todayDateOnly();
   if (!isValidDateOnly(asOf)) throw badRequest('The award date must be a valid date (YYYY-MM-DD).');
+  const minAttendance = req.query.minAttendance === undefined || req.query.minAttendance === '' ? LOYALTY_MIN_ATTENDANCE : Number(req.query.minAttendance);
+  if (!Number.isInteger(minAttendance) || minAttendance < 0 || minAttendance > 100) throw badRequest('The attendance needed must be a whole percent from 0 to 100.');
   const result = await query(
     `SELECT m.id, m.member_number, TRIM(CONCAT_WS(' ', m.first_name, m.middle_name, m.last_name, m.suffix)) AS full_name,
             m.membership_date, m.barangay, m.municipality,
-            EXTRACT(YEAR FROM age($1::date::timestamp, m.membership_date::timestamp))::int AS years
+            EXTRACT(YEAR FROM age($1::date::timestamp, m.membership_date::timestamp))::int AS years,
+            att.eligible, att.attended, late.payments AS late_payments, od.loans AS overdue_loans
      FROM members m
+     LEFT JOIN LATERAL (
+       SELECT COUNT(*)::int AS eligible, COUNT(*) FILTER (WHERE r.attendance_status IN ('present', 'late'))::int AS attended
+       FROM activity_attendance r JOIN activities a ON a.id = r.activity_id
+       WHERE r.member_id = m.id AND a.status = 'completed' AND a.attendance_finalized_at IS NOT NULL
+         AND a.activity_date > ($1::date - INTERVAL '12 months') AND a.activity_date <= $1::date
+     ) att ON TRUE
+     LEFT JOIN LATERAL (
+       SELECT COUNT(*)::int AS payments FROM loan_payments p JOIN loans l ON l.id = p.loan_id
+       WHERE l.member_id = m.id AND p.penalty_paid > 0 AND p.payment_date > ($1::date - INTERVAL '12 months') AND p.payment_date <= $1::date
+     ) late ON TRUE
+     LEFT JOIN LATERAL (SELECT COUNT(*)::int AS loans FROM loans l WHERE l.member_id = m.id AND l.status = 'overdue') od ON TRUE
      WHERE m.status = 'active' AND m.membership_date <= $1::date
      ORDER BY m.membership_date ASC, m.id ASC`,
     [asOf]
@@ -244,6 +273,7 @@ export async function getLoyaltyReport(req, res) {
     success: true,
     data: {
       asOf,
+      minAttendance,
       members: result.rows.map((row) => ({
         id: Number(row.id),
         memberNumber: row.member_number || '',
@@ -252,6 +282,7 @@ export async function getLoyaltyReport(req, res) {
         years: Number(row.years),
         barangay: row.barangay || '',
         municipality: row.municipality || '',
+        standing: loyaltyStanding({ eligible: row.eligible, attended: row.attended, latePayments: row.late_payments, overdueLoans: row.overdue_loans }, minAttendance),
       })),
     },
   });
@@ -314,7 +345,7 @@ export async function getMyMemberData(req, res) {
     query(
       `SELECT r.id, r.machinery_id AS "machineryId", mc.name AS "machineryName", r.purpose, r.start_date AS "startDate", r.end_date AS "endDate",
               r.duration, r.rental_fee AS "rentalFee", r.notes, r.status, r.submitted_at AS "submittedAt", r.reviewed_at AS "reviewedAt",
-              o.status AS "operationStatus"
+              r.review_notes AS "reviewNotes", o.status AS "operationStatus"
        FROM rental_requests r
        JOIN machinery mc ON mc.id = r.machinery_id
        LEFT JOIN machinery_operations o ON o.rental_request_id = r.id
@@ -324,6 +355,21 @@ export async function getMyMemberData(req, res) {
     getSavingsDetails(null, memberId),
   ]);
   if (!memberResult.rows[0]) throw notFound('Linked member record not found.');
+  // Payments for machinery work done for the member (per-service fees), each
+  // with the balance of that service left after it and who recorded it.
+  const machineryPayments = (await query(
+    `SELECT p.id, p.amount, p.payment_date AS "paymentDate", p.notes, s.id AS "serviceId", s.service_type AS "serviceType",
+            mc.name AS "machineryName", s.service_date AS "serviceDate", s.fee_amount AS "feeAmount",
+            s.fee_amount - SUM(p.amount) OVER (PARTITION BY s.id ORDER BY p.payment_date, p.id) AS "balanceAfter",
+            ${displayName('u')} AS "recordedBy", u.position AS "recordedByPosition"
+     FROM machinery_service_payments p
+     JOIN machinery_services s ON s.id = p.service_id
+     JOIN machinery mc ON mc.id = s.machinery_id
+     LEFT JOIN users u ON u.id = p.recorded_by
+     WHERE s.member_id = $1
+     ORDER BY p.payment_date DESC, p.id DESC LIMIT 200`,
+    [memberId]
+  )).rows;
 
   const member = mapMember(memberResult.rows[0]);
   return res.status(200).json({
@@ -334,6 +380,7 @@ export async function getMyMemberData(req, res) {
       payments: paymentsResult.rows,
       loanRequests: requestsResult.rows,
       rentalRequests: rentalsResult.rows,
+      machineryPayments,
       shareDetails,
       savings,
     },
@@ -353,54 +400,58 @@ async function recordContribution(req, memberId, body) {
   if (contributionDate > todayDateOnly()) throw badRequest('Contribution date cannot be in the future.');
   if (paymentMethod && !CONTRIBUTION_METHODS.includes(paymentMethod)) throw badRequest(`Payment method must be one of: ${CONTRIBUTION_METHODS.join(', ')}.`);
 
-  return withTransaction(async (client) => {
-    const member = (await client.query('SELECT id, member_number, status, membership_date FROM members WHERE id = $1 FOR UPDATE', [memberId])).rows[0];
-    if (!member) throw notFound('Member not found.');
-    if (member.status === 'archived') throw badRequest('Contributions cannot be recorded for a member whose membership is terminated.');
-    if (referenceNumber) {
-      const duplicate = await client.query('SELECT 1 FROM share_contributions WHERE member_id = $1 AND LOWER(reference_number) = LOWER($2)', [memberId, referenceNumber]);
-      if (duplicate.rows[0]) throw conflict('A contribution with this reference number was already recorded for this member.');
-    }
-    const totalResult = await client.query('SELECT COALESCE(SUM(amount), 0) AS total FROM share_contributions WHERE member_id = $1', [memberId]);
-    const currentCents = toCents(totalResult.rows[0].total);
-    await lockShareCapital(client);
-    const maxCents = await shareCapitalMaxCents(client, memberId);
-    const remainingCents = maxCents - currentCents;
-    if (amountCents > remainingCents) {
-      throw badRequest(`A member's share capital can't be more than ${SHARE_CAPITAL_PERCENT_CAP}% of the cooperative's total share capital. This member can hold at most ${pesosFromCents(maxCents)}, so the most that can be added now is ${pesosFromCents(remainingCents)}.`);
-    }
-    const insert = await client.query(
-      `INSERT INTO share_contributions (member_id, amount, contribution_date, payment_method, reference_number, notes, recorded_by)
-       VALUES ($1, $2::numeric, $3, $4, $5, $6, $7)
-       RETURNING id, member_id AS "memberId", amount, contribution_date AS date, payment_method AS "paymentMethod", reference_number AS reference, notes`,
-      [memberId, centsToString(amountCents), contributionDate, paymentMethod, referenceNumber, notes, currentUserId(req)]
-    );
-    const newTotal = centsToString(currentCents + amountCents);
-    await client.query('UPDATE members SET share_capital = $1::numeric, updated_at = NOW() WHERE id = $2', [newTotal, memberId]);
-    await createAuditLog({
-      client,
-      user: req.user,
-      action: 'SHARE_CONTRIBUTION_CREATED',
-      module: 'Shares',
-      entityType: 'share_contribution',
-      entityId: String(insert.rows[0].id),
-      description: `Recorded share contribution for member ${member.member_number || memberId}`,
-      oldValues: { total: centsToString(currentCents) },
-      newValues: { member_id: memberId, amount: centsToString(amountCents), capital_change: capitalChange(amountCents), total: newTotal, contribution_date: contributionDate, payment_method: paymentMethod, reference_number: referenceNumber },
-      ...getRequestMeta(req),
-    });
-    await notifyMember(client, memberId, {
-      type: 'savings_recorded',
-      title: 'Share contribution recorded',
-      message: `A contribution of PHP ${Number(centsToString(amountCents)).toLocaleString('en-PH', { minimumFractionDigits: 2 })} was recorded. Your total share capital is PHP ${Number(newTotal).toLocaleString('en-PH', { minimumFractionDigits: 2 })}.`,
-      severity: 'success',
-      link: '/member-profile',
-      entityType: 'share_contribution',
-      entityId: insert.rows[0].id,
-      dedupeKey: `share-contribution-${insert.rows[0].id}`,
-    });
-    return { contribution: { ...insert.rows[0], amount: Number(insert.rows[0].amount) }, shareDetails: await getShareDetails(client, memberId) };
+  return withTransaction((client) => insertShareContribution(client, req, memberId, { amountCents, contributionDate, paymentMethod, referenceNumber, notes }));
+}
+
+// Inserts one share-capital contribution inside the caller's transaction
+// (also used by dues payments). The 10% limit is checked as for any contribution.
+export async function insertShareContribution(client, req, memberId, { amountCents, contributionDate, paymentMethod, referenceNumber, notes }) {
+  const member = (await client.query('SELECT id, member_number, status, membership_date FROM members WHERE id = $1 FOR UPDATE', [memberId])).rows[0];
+  if (!member) throw notFound('Member not found.');
+  if (member.status === 'archived') throw badRequest('Contributions cannot be recorded for a member whose membership is terminated.');
+  if (referenceNumber) {
+    const duplicate = await client.query('SELECT 1 FROM share_contributions WHERE member_id = $1 AND LOWER(reference_number) = LOWER($2)', [memberId, referenceNumber]);
+    if (duplicate.rows[0]) throw conflict('A contribution with this reference number was already recorded for this member.');
+  }
+  const totalResult = await client.query('SELECT COALESCE(SUM(amount), 0) AS total FROM share_contributions WHERE member_id = $1', [memberId]);
+  const currentCents = toCents(totalResult.rows[0].total);
+  await lockShareCapital(client);
+  const maxCents = await shareCapitalMaxCents(client, memberId);
+  const remainingCents = maxCents - currentCents;
+  if (amountCents > remainingCents) {
+    throw badRequest(`A member's share capital can't be more than ${SHARE_CAPITAL_PERCENT_CAP}% of the cooperative's total share capital. This member can hold at most ${pesosFromCents(maxCents)}, so the most that can be added now is ${pesosFromCents(remainingCents)}.`);
+  }
+  const insert = await client.query(
+    `INSERT INTO share_contributions (member_id, amount, contribution_date, payment_method, reference_number, notes, recorded_by)
+     VALUES ($1, $2::numeric, $3, $4, $5, $6, $7)
+     RETURNING id, member_id AS "memberId", amount, contribution_date AS date, payment_method AS "paymentMethod", reference_number AS reference, notes`,
+    [memberId, centsToString(amountCents), contributionDate, paymentMethod, referenceNumber, notes, currentUserId(req)]
+  );
+  const newTotal = centsToString(currentCents + amountCents);
+  await client.query('UPDATE members SET share_capital = $1::numeric, updated_at = NOW() WHERE id = $2', [newTotal, memberId]);
+  await createAuditLog({
+    client,
+    user: req.user,
+    action: 'SHARE_CONTRIBUTION_CREATED',
+    module: 'Shares',
+    entityType: 'share_contribution',
+    entityId: String(insert.rows[0].id),
+    description: `Recorded share contribution for member ${member.member_number || memberId}`,
+    oldValues: { total: centsToString(currentCents) },
+    newValues: { member_id: memberId, amount: centsToString(amountCents), capital_change: capitalChange(amountCents), total: newTotal, contribution_date: contributionDate, payment_method: paymentMethod, reference_number: referenceNumber },
+    ...getRequestMeta(req),
   });
+  await notifyMember(client, memberId, {
+    type: 'savings_recorded',
+    title: 'Share contribution recorded',
+    message: `A contribution of PHP ${Number(centsToString(amountCents)).toLocaleString('en-PH', { minimumFractionDigits: 2 })} was recorded. Your total share capital is PHP ${Number(newTotal).toLocaleString('en-PH', { minimumFractionDigits: 2 })}.`,
+    severity: 'success',
+    link: '/member-profile',
+    entityType: 'share_contribution',
+    entityId: insert.rows[0].id,
+    dedupeKey: `share-contribution-${insert.rows[0].id}`,
+  });
+  return { contribution: { ...insert.rows[0], amount: Number(insert.rows[0].amount) }, shareDetails: await getShareDetails(client, memberId) };
 }
 
 export async function addShareContribution(req, res) {
@@ -423,8 +474,9 @@ async function getSavingsDetails(db, memberId) {
     `SELECT * FROM (
        SELECT st.id, st.amount, ${savingsTypeLabel('st')} AS "type", st.transaction_date AS "date", st.payment_method AS "paymentMethod",
               st.reference_number AS "reference", st.notes, st.created_at AS "createdAt",
+              ${displayName('u')} AS "recordedBy", u.position AS "recordedByPosition",
               SUM(${signedSavings('st')}) OVER (ORDER BY st.transaction_date, st.id) AS "balance"
-       FROM savings_transactions st WHERE st.member_id = $1
+       FROM savings_transactions st LEFT JOIN users u ON u.id = st.recorded_by WHERE st.member_id = $1
      ) t ORDER BY t."date" DESC, t.id DESC LIMIT 200`,
     [memberId]
   );
@@ -604,7 +656,8 @@ export async function getMemberSavings(req, res) {
     query(
       `SELECT * FROM (
          SELECT st.id, ${savingsTypeLabel('st')} AS "type", st.amount, st.transaction_date AS "date", st.payment_method AS "paymentMethod",
-                st.reference_number AS "reference", st.notes, st.created_at AS "createdAt", u.username AS "recordedBy",
+                st.reference_number AS "reference", st.notes, st.created_at AS "createdAt", ${displayName('u')} AS "recordedBy",
+                u.position AS "recordedByPosition",
                 SUM(${signedSavings('st')}) OVER (ORDER BY st.transaction_date, st.id) AS "balance"
          FROM savings_transactions st LEFT JOIN users u ON u.id = st.recorded_by
          WHERE st.member_id = $1
@@ -632,7 +685,7 @@ export async function getMemberSavings(req, res) {
     data: rows.rows.map((row) => ({
       id: Number(row.id), type: row.type, amount: Number(row.amount), balance: Number(row.balance), date: row.date,
       paymentMethod: row.paymentMethod || 'Not specified', reference: row.reference || `SAV-${row.id}`, notes: row.notes || '',
-      recordedBy: row.recordedBy || null, createdAt: row.createdAt,
+      recordedBy: row.recordedBy || null, recordedByPosition: row.recordedByPosition || null, createdAt: row.createdAt,
     })),
     pagination: paginationMeta(page, limit, t.entries),
   });
@@ -888,13 +941,19 @@ export async function importMembers(req, res) {
 export async function updateMember(req, res) {
   const id = parseId(req.params.id, 'member ID');
   const body = req.body || {};
-  const { errors, values } = validateMemberInput(body);
+  const { errors, values } = validateMemberInput(body, { checkAge: false });
   if (errors.length) throw badRequest(errors[0], errors);
 
   const updated = await withTransaction(async (client) => {
     const before = (await client.query(`${memberSelect} WHERE m.id = $1 FOR UPDATE OF m`, [id])).rows[0];
     if (!before) throw notFound('Member not found.');
     if (before.status === 'archived') throw badRequest('Restore this member before editing.');
+    // The age limit is checked again only when the birthday or the membership date changes.
+    const birthDate = cleanString(body.date_of_birth, 10);
+    if (birthDate && (birthDate !== before.date_of_birth || values.membershipDate !== before.membership_date)) {
+      const ageError = membershipAgeError(birthDate, values.membershipDate);
+      if (ageError) throw badRequest(ageError);
+    }
     const duplicate = await findDuplicateMember(client, values, cleanString(body.date_of_birth, 10), cleanString(body.rsbsa_no, 100), id);
     if (duplicate) throw conflict(`Another member (${duplicate.member_number}) already uses this email, RSBSA number, or name and birth date.`);
     await client.query(
@@ -1015,9 +1074,12 @@ function readTermination(body) {
   return { type, cause };
 }
 
+const TERMINATION_LABELS = { automatic: 'automatic termination', voluntary: 'resignation', involuntary: 'involuntary termination' };
+
 // Terminating a member moves them to the terminated (archived) list. The kind
 // of termination, its cause and date are kept with the member, and the date
 // is the Separation date on their membership form. Restoring clears both.
+// The member is told either way (notification, phone and email).
 async function changeArchiveState(req, res, archive) {
   const id = parseId(req.params.id, 'member ID');
   const termination = archive ? { ...readTermination(req.body), date: todayDateOnly() } : null;
@@ -1027,6 +1089,8 @@ async function changeArchiveState(req, res, archive) {
     if (archive && before.status === 'archived') throw conflict('Membership is already terminated.');
     if (!archive && before.status !== 'archived') throw conflict('Membership is not terminated.');
     const { termination: previous, separationDate: _separation, ...info } = before.additional_info || {};
+    const blocked = archive ? null : restoreBlockedReason(previous);
+    if (blocked) throw conflict(blocked);
     const result = archive
       ? await client.query(
         `UPDATE members SET status = 'archived', archived_at = NOW(), archived_by = $1, additional_info = $3::jsonb, updated_at = NOW()
@@ -1051,9 +1115,25 @@ async function changeArchiveState(req, res, archive) {
       newValues: { status: row.status, archived_at: row.archived_at ?? null, archived_by: row.archived_by ?? null, termination },
       ...getRequestMeta(req),
     });
-    return { ...row, termination };
+    const kind = archive ? TERMINATION_LABELS[termination.type] : null;
+    await notifyMember(client, id, archive
+      ? {
+        type: 'membership_terminated', title: 'Membership terminated', severity: 'warning', link: '/member-profile',
+        message: `Your ACIFAC membership (${row.member_number}) was terminated on ${formatDateOnly(termination.date)} (${kind}). For your share capital and savings, please visit the ACIFAC office.`,
+        entityType: 'member', entityId: id, dedupeKey: `membership-terminated-${id}-${Date.now()}`,
+      }
+      : {
+        type: 'membership_restored', title: 'Membership restored', severity: 'success', link: '/member-profile',
+        message: `Your ACIFAC membership (${row.member_number}) was restored. You are an active member again.`,
+        entityType: 'member', entityId: id, dedupeKey: `membership-restored-${id}-${Date.now()}`,
+      });
+    return { ...row, termination, kind };
   });
-  return res.status(200).json({ success: true, message: archive ? 'Membership terminated.' : 'Member restored successfully.', data: member });
+  void emailMember(id, (recipient) => (archive
+    ? membershipTerminatedEmail({ memberName: recipient.full_name, memberNumber: member.member_number, kind: member.kind, date: member.termination.date })
+    : membershipRestoredEmail({ memberName: recipient.full_name, memberNumber: member.member_number })), { includeTerminated: true });
+  const { kind: _kind, ...data } = member;
+  return res.status(200).json({ success: true, message: archive ? 'Membership terminated.' : 'Member restored successfully.', data });
 }
 
 export const archiveMember = (req, res) => changeArchiveState(req, res, true);

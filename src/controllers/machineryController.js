@@ -1,7 +1,7 @@
 import { query, withTransaction } from '../config/db.js';
 import { SQL_TODAY } from '../config/env.js';
 import { createAuditLog } from '../utils/audit.js';
-import { isValidDateOnly, todayDateOnly } from '../utils/dates.js';
+import { formatDateOnly, isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { badRequest, cleanString, conflict, currentUserId, forbidden, getRequestMeta, notFound, optionalString, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput } from '../utils/money.js';
 import { notifyAdmins, notifyMember } from '../services/notificationService.js';
@@ -9,6 +9,7 @@ import { sendEmailSafely } from '../services/emailService.js';
 import { rentalDecisionEmail, rentalRequestReceivedEmail } from '../services/emailTemplates.js';
 import { keepAlive } from '../utils/background.js';
 import { emailMember } from '../services/memberEmails.js';
+import { rentalApprovedSms, rentalDeclinedSms, textMember } from '../services/smsService.js';
 
 // Rental duration keeps the existing ACIFAC rule: days = end_date - start_date,
 // minimum 1 (a same-day rental counts as one day). Fee = daily_fee x days.
@@ -21,7 +22,8 @@ const requestSelect = `
          r.member_id AS "memberDatabaseId", r.member_name AS "memberName",
          COALESCE(mb.member_number, r.member_id::text) AS "memberId", r.purpose,
          r.start_date AS "startDate", r.end_date AS "endDate", r.duration,
-         r.rental_fee AS "rentalFee", r.notes, r.status, r.submitted_at AS "submittedAt", r.reviewed_at AS "reviewedAt"
+         r.rental_fee AS "rentalFee", r.notes, r.status, r.submitted_at AS "submittedAt", r.reviewed_at AS "reviewedAt",
+         r.review_notes AS "reviewNotes"
   FROM rental_requests r
   JOIN machinery m ON m.id = r.machinery_id
   LEFT JOIN members mb ON mb.id = r.member_id`;
@@ -39,6 +41,18 @@ const machinerySelect = `
          delivery_date AS "deliveryDate", condition, parent_machinery_id AS "parentMachineryId", pricing_mode AS "pricingMode",
          purchase_cost AS "purchaseCost"
   FROM machinery`;
+
+// Combined Harvester Policy: a harvest is scheduled with the manager at least
+// one week before the harvest day, and members come first (a non-member's
+// request waits while a member asks for the same days).
+export const HARVESTER_NOTICE_DAYS = 7;
+export const isHarvester = (machine) => /harvest/i.test(`${machine?.type ?? ''}`);
+
+export function addDays(dateOnly, days) {
+  const date = new Date(`${dateOnly}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
 
 const CONDITIONS = ['operational', 'non_operational', 'always_repair', 'idle'];
 const PRICING_MODES = ['per_day', 'per_service'];
@@ -124,7 +138,8 @@ export async function listMachineryData(req, res) {
   const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 50, maxLimit: 200 });
   const [machinery, requests, operations, operationCount, summary] = await Promise.all([
     query(`${machinerySelect} ORDER BY id`),
-    query(`${requestSelect} ORDER BY (r.status = 'pending') DESC, r.submitted_at DESC LIMIT 200`),
+    // Pending requests first, members' before non-members' (members come first).
+    query(`${requestSelect} ORDER BY (r.status = 'pending') DESC, (r.status = 'pending' AND r.client_category = 'member') DESC, r.submitted_at DESC LIMIT 200`),
     query(`${operationSelect} ORDER BY o.start_date DESC, o.id DESC LIMIT $1 OFFSET $2`, [limit, offset]),
     query('SELECT COUNT(*)::int AS total FROM machinery_operations'),
     query(
@@ -308,10 +323,18 @@ export async function updateMachinery(req, res) {
 // the member (memberId); a non-member's (clientCategory 'non_member', office
 // only) has just the renter's name (clientName). A per-service machine's fee is
 // charged when its work is recorded under Services; a per-day one's is its daily fee.
-export async function insertRentalRequest(client, req, { machineryId, memberId, clientCategory = 'member', clientName = '', purpose, notes, startDate, endDate }) {
-  const machine = (await client.query('SELECT id, name, daily_fee, status, pricing_mode FROM machinery WHERE id = $1 FOR UPDATE', [cleanString(String(machineryId), 20)])).rows[0];
+// requireNotice: the booking form checks the harvester's one week of notice;
+// a paper form scanned later was handed in on its own date, so OCR does not.
+export async function insertRentalRequest(client, req, { machineryId, memberId, clientCategory = 'member', clientName = '', purpose, notes, startDate, endDate, requireNotice = false }) {
+  const machine = (await client.query('SELECT id, name, type, daily_fee, status, pricing_mode FROM machinery WHERE id = $1 FOR UPDATE', [cleanString(String(machineryId), 20)])).rows[0];
   if (!machine) throw notFound('Machinery not found.');
   if (machine.status === 'maintenance') throw conflict('That machinery is under maintenance and cannot be booked right now.');
+  if (requireNotice && isHarvester(machine)) {
+    const earliest = addDays(todayDateOnly(), HARVESTER_NOTICE_DAYS);
+    if (startDate < earliest) {
+      throw badRequest(`A harvester is scheduled at least one week before the harvest (Combined Harvester Policy). The earliest harvest day you can book now is ${formatDateOnly(earliest)}.`);
+    }
+  }
   await assertNoOverlap(client, machine.id, startDate, endDate);
   let renter;
   if (clientCategory === 'non_member') {
@@ -349,22 +372,26 @@ export async function createRentalRequest(req, res) {
     if (req.user.role !== 'ADMIN') throw forbidden('Only the cooperative office can record a rental for a non-member.');
     const clientName = cleanString(req.body?.clientName, 200);
     if (!clientName) throw badRequest('Enter the non-member\'s full name.');
-    const request = await withTransaction((client) => insertRentalRequest(client, req, { machineryId, clientCategory, clientName, purpose, notes, startDate, endDate }));
+    const request = await withTransaction((client) => insertRentalRequest(client, req, { machineryId, clientCategory, clientName, purpose, notes, startDate, endDate, requireNotice: true }));
     return res.status(201).json({ success: true, request });
   }
 
   const requestedMemberId = req.user.role === 'ADMIN' ? parseId(memberDatabaseId, 'member') : Number(req.user.member_id);
   if (!Number.isInteger(requestedMemberId) || requestedMemberId <= 0) throw badRequest('A valid member is required.');
 
-  const request = await withTransaction((client) => insertRentalRequest(client, req, { machineryId, memberId: requestedMemberId, purpose, notes, startDate, endDate }));
+  const request = await withTransaction((client) => insertRentalRequest(client, req, { machineryId, memberId: requestedMemberId, purpose, notes, startDate, endDate, requireNotice: true }));
   void emailMember(request.memberDatabaseId, (recipient) => rentalRequestReceivedEmail({ memberName: recipient.full_name, machineryName: request.machineryName, startDate: request.startDate, endDate: request.endDate, rentalFee: request.rentalFee }));
   return res.status(201).json({ success: true, request });
 }
 
+// PATCH /api/machinery/requests/:id { status: 'approved' | 'declined', reason }
+// A decline needs the reason; the member is told it (email, text, notification).
 export async function reviewRentalRequest(req, res) {
   const id = parseId(req.params.id, 'rental request ID');
   const status = req.body?.status;
   if (!['approved', 'declined'].includes(status)) throw badRequest('Invalid request status.');
+  const reason = status === 'declined' ? cleanString(req.body?.reason, 1000) : '';
+  if (status === 'declined' && reason.length < 3) throw badRequest('Give the reason the request is declined.');
 
   const request = await withTransaction(async (client) => {
     const row = (await client.query('SELECT r.*, m.name AS machinery_name FROM rental_requests r JOIN machinery m ON m.id = r.machinery_id WHERE r.id = $1 FOR UPDATE OF r', [id])).rows[0];
@@ -372,9 +399,22 @@ export async function reviewRentalRequest(req, res) {
     if (row.status !== 'pending') throw conflict('Rental request was already reviewed.');
     if (status === 'approved') {
       // Locking the machine row serialises concurrent approvals for it.
-      const machine = (await client.query('SELECT status FROM machinery WHERE id = $1 FOR UPDATE', [row.machinery_id])).rows[0];
+      const machine = (await client.query('SELECT status, type FROM machinery WHERE id = $1 FOR UPDATE', [row.machinery_id])).rows[0];
       if (machine.status === 'maintenance') throw conflict('This machine is under maintenance. Set it back to available before approving.');
       if (row.end_date < todayDateOnly()) throw badRequest('This request\'s rental period has already passed.');
+      // Members first: a member waiting for some of the same days is answered before a non-member.
+      if (row.client_category === 'non_member' && isHarvester(machine)) {
+        const member = (await client.query(
+          `SELECT member_name, start_date, end_date FROM rental_requests
+           WHERE machinery_id = $1 AND status = 'pending' AND client_category = 'member' AND id <> $2
+             AND start_date <= $4::date AND end_date >= $3::date
+           ORDER BY submitted_at LIMIT 1`,
+          [row.machinery_id, row.id, row.start_date, row.end_date]
+        )).rows[0];
+        if (member) {
+          throw conflict(`Members come first for the harvester (Combined Harvester Policy): ${member.member_name} also asked for ${formatDateOnly(member.start_date)}${member.end_date > member.start_date ? ` to ${formatDateOnly(member.end_date)}` : ''}. Approve or decline that request first.`);
+        }
+      }
       await assertNoOverlap(client, row.machinery_id, row.start_date, row.end_date, row.id);
       await client.query(
         `INSERT INTO machinery_operations (rental_request_id, machinery_id, machinery_name, client_category, member_id, member_name, purpose, start_date, end_date, duration, rental_fee, status)
@@ -382,14 +422,14 @@ export async function reviewRentalRequest(req, res) {
         [row.id, row.machinery_id, row.machinery_name, row.member_id, row.member_name, row.purpose, row.start_date, row.end_date, row.duration, row.rental_fee, row.client_category]
       );
     }
-    await client.query('UPDATE rental_requests SET status = $1, reviewed_at = NOW(), reviewed_by = $2 WHERE id = $3', [status, currentUserId(req), id]);
+    await client.query('UPDATE rental_requests SET status = $1, reviewed_at = NOW(), reviewed_by = $2, review_notes = $4 WHERE id = $3', [status, currentUserId(req), id, reason || null]);
     await refreshRentalStatuses(client);
-    await createAuditLog({ client, user: req.user, action: status === 'approved' ? 'RENTAL_APPROVED' : 'RENTAL_DECLINED', module: 'Machinery', entityType: 'rental_request', entityId: String(id), description: `Rental request ${status} for ${row.member_name}${row.member_id ? '' : ' (non-member)'}`, oldValues: { status: row.status }, newValues: { status }, ...getRequestMeta(req) });
+    await createAuditLog({ client, user: req.user, action: status === 'approved' ? 'RENTAL_APPROVED' : 'RENTAL_DECLINED', module: 'Machinery', entityType: 'rental_request', entityId: String(id), description: `Rental request ${status} for ${row.member_name}${row.member_id ? '' : ' (non-member)'}`, oldValues: { status: row.status }, newValues: { status, ...(reason ? { reason } : {}) }, ...getRequestMeta(req) });
     // A non-member has no account to notify.
     if (row.member_id) await notifyMember(client, row.member_id, {
       type: status === 'approved' ? 'rental_approved' : 'rental_declined',
       title: status === 'approved' ? 'Rental request approved' : 'Rental request declined',
-      message: `Your request for ${row.machinery_name} (${row.start_date} to ${row.end_date}) was ${status}.`,
+      message: `Your request for ${row.machinery_name} (${row.start_date} to ${row.end_date}) was ${status}.${reason ? ` Reason: ${reason}` : ''}`,
       severity: status === 'approved' ? 'success' : 'error',
       link: '/rental-booking',
       entityType: 'rental_request',
@@ -403,8 +443,13 @@ export async function reviewRentalRequest(req, res) {
     ? (await query(`SELECT u.id AS user_id, COALESCE(u.email, m.email) AS email FROM members m LEFT JOIN users u ON u.member_id = m.id WHERE m.id = $1`, [request.member_id])).rows[0]
     : null;
   if (recipient?.email) {
-    const email = rentalDecisionEmail({ machineryName: request.machinery_name, startDate: request.start_date, endDate: request.end_date, status, rentalFee: request.rental_fee });
+    const email = rentalDecisionEmail({ machineryName: request.machinery_name, startDate: request.start_date, endDate: request.end_date, status, rentalFee: request.rental_fee, reason });
     void sendEmailSafely({ ...email, to: recipient.email, relatedUserId: recipient.user_id });
+  }
+  // The decision is also texted to the member's mobile number (a non-member has none on record).
+  if (request.member_id) {
+    const rental = { machineryName: request.machinery_name, startDate: request.start_date, endDate: request.end_date, rentalFee: request.rental_fee, reason };
+    void textMember(request.member_id, status === 'approved' ? rentalApprovedSms(rental) : rentalDeclinedSms(rental));
   }
   return res.json({ success: true, message: `Rental request ${status}.` });
 }

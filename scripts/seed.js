@@ -7,6 +7,11 @@ import '../src/config/env.js';
 //
 //   npm run seed              migrate, then fill a database that has no members yet
 //   npm run seed -- --fresh   empty a LOCAL database first (all tables), then the same
+//   npm run seed -- --members=495
+//                             make 495 sample members instead of 100, each with
+//                             the records of every part of the system (savings,
+//                             loans, services, rentals, Kadiwa purchases,
+//                             attendance, dues), the machinery and store work scaled to match
 //   npm run seed -- --add-members=500
 //                             also add 500 members, each with an active login (member001 ...);
 //                             on a database this seeder already filled, adds only them
@@ -41,6 +46,7 @@ const SEEDERS = [
   ['machinery', './seeders/machinery.js'],
   ['Kadiwa store', './seeders/kadiwa.js'],
   ['activities and attendance', './seeders/attendance.js'],
+  ['dues', './seeders/dues.js'],
   ['announcements', './seeders/announcements.js'],
 ];
 
@@ -48,6 +54,8 @@ const fresh = process.argv.includes('--fresh');
 const alongsideExisting = process.argv.includes('--alongside-existing');
 const addMembersArg = process.argv.find((arg) => arg.startsWith('--add-members'));
 const addMembers = addMembersArg === undefined ? 0 : Number(addMembersArg.split('=')[1] ?? process.argv[process.argv.indexOf(addMembersArg) + 1]);
+const membersArg = process.argv.find((arg) => arg.startsWith('--members'));
+const sampleMembers = membersArg === undefined ? null : Number(membersArg.split('=')[1] ?? process.argv[process.argv.indexOf(membersArg) + 1]);
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 const DEFAULT_PASSWORDS = { admin: 'Admin@12345', member: 'Member@12345' };
 
@@ -57,6 +65,8 @@ function fail(message) {
 }
 
 if (addMembersArg !== undefined && (!Number.isInteger(addMembers) || addMembers < 1 || addMembers > 20000)) fail('Use --add-members=N with N from 1 to 20000.');
+// At least the 15 named members the other seeders give their records to.
+if (membersArg !== undefined && (!Number.isInteger(sampleMembers) || sampleMembers < 15 || sampleMembers > 5000)) fail('Use --members=N with N from 15 to 5000.');
 
 // Same choice of database as src/config/db.js.
 const databaseUrl = process.env.SUPABASE_DB_URL || process.env.DATABASE_URL;
@@ -114,8 +124,12 @@ function createContext(client) {
     admin: null,               // { id, username, role, full_name }: who records everything
     req: null,                 // the admin as the app's controller helpers expect a request
     alongside: false,          // true when real members are there too (--alongside-existing)
+    sampleMemberCount: sampleMembers ?? undefined, // --members=N (members.js makes 100 without it)
+    // How much busier than with 100 members the machinery and the store are (1 for 100 or fewer).
+    get scale() { return Math.max(1, ctx.members.length / 100); },
     members: [],               // { id, key, memberNumber, fullName, email, phone, address, farmArea, membershipDate }
     loanIds: [],               // the sample loans
+    activities: [],            // past sample activities with final attendance: { id, title, category, date, end }
     logins: [],                // [role, username, password] to print at the end
     member(key) {
       const found = ctx.members.find((member) => member.key === key);
@@ -174,6 +188,10 @@ async function seed(pool) {
       // The office's bell is for real work: notifications about the sample records come already read.
       await client.query(`UPDATE notifications SET read_at = NOW() WHERE read_at IS NULL AND created_at = NOW() AND user_id IN (SELECT id FROM users WHERE role = 'ADMIN')`);
     }
+    // The notifications of the sample records are history, not news: none is
+    // sent to a phone (phone notifications send those with pushed_at empty).
+    const pushColumn = (await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'notifications' AND column_name = 'pushed_at'`)).rows.length;
+    if (pushColumn) await client.query('UPDATE notifications SET pushed_at = NOW() WHERE pushed_at IS NULL AND xmin = pg_current_xact_id()::xid');
     await createAuditLog({
       client, user: context.req.user, action: onlyAdd ? 'SAMPLE_MEMBERS_ADDED' : 'DATABASE_SEEDED', module: 'System', entityType: 'database',
       description: onlyAdd ? `Added ${addMembers} sample members with logins (npm run seed).` : 'Filled the database with sample data (npm run seed).',
@@ -186,6 +204,14 @@ async function seed(pool) {
   for (const [label, amount] of ctx.counts) console.log(`  ${String(amount).padStart(4)}  ${label}`);
   for (const reason of ctx.skippedList) console.log(`  skipped: ${reason}`);
   console.log(`  (${roundTrips} database round trips)`);
+  // Net income as the dashboard works it out, of everything in the database (sample and real records).
+  const { netIncomeCents, centsToNumber } = await import('../src/services/netIncome.js');
+  const peso = (cents) => `PHP ${centsToNumber(cents).toLocaleString('en-PH', { minimumFractionDigits: 2 })}`;
+  const year = ctx.today.slice(0, 4);
+  for (const [label, range] of [['all time', {}], [year, { from: `${year}-01-01`, to: `${year}-12-31` }]]) {
+    const income = await netIncomeCents(range);
+    console.log(`Net income, ${label}: ${peso(income.total)} (Kadiwa ${peso(income.parts.kadiwa)}, machinery ${peso(income.parts.machinery)}, loans ${peso(income.parts.loans)})`);
+  }
   console.log('\nSign in with:');
   for (const [role, username, password] of ctx.logins) console.log(`  ${role.padEnd(13)} ${username.padEnd(15)} ${password}`);
 }

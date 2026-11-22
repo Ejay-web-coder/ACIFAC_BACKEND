@@ -14,12 +14,12 @@ const pending = () => ({ id: 15, status: 'pending', machinery_id: 'M-003', machi
 function databaseHas({ request = pending(), machineStatus = 'available', booked = null } = {}) {
   answer(db.client.query, [
     ['FROM rental_requests r JOIN machinery m', { rows: request ? [request] : [] }],
-    ['SELECT status FROM machinery WHERE id = $1', { rows: [{ status: machineStatus }] }],
+    ['SELECT status, type FROM machinery WHERE id = $1', { rows: [{ status: machineStatus, type: 'Water Pump' }] }],
     ['FROM machinery_operations o', { rows: booked ? [booked] : [] }],
     ['SELECT id FROM users WHERE member_id = $1', { rows: [{ id: 7 }] }],
   ]);
 }
-const review = (status, id = 15) => mockRequest({ method: 'PATCH', params: { id: String(id) }, body: { status }, user: ADMIN });
+const review = (status, id = 15, reason = status === 'declined' ? 'The pump is under repair that week.' : undefined) => mockRequest({ method: 'PATCH', params: { id: String(id) }, body: { status, reason }, user: ADMIN });
 const statements = () => db.client.query.mock.calls.map(([sql]) => sql);
 beforeEach(() => { jest.clearAllMocks(); databaseHas(); });
 
@@ -34,11 +34,30 @@ describe('Rental request review (machineryController.reviewRentalRequest)', () =
     expect(params[2]).toBe('Rental request approved');
   });
 
-  test('declining a request books nothing and tells the member', async () => {
+  test('declining a request books nothing, keeps the reason and tells the member why', async () => {
     const res = mockResponse();
     await reviewRentalRequest(review('declined'), res);
     expect(res.body.message).toBe('Rental request declined.');
     expect(statements().some((sql) => sql.includes('INSERT INTO machinery_operations'))).toBe(false);
+    const [, saved] = db.client.query.mock.calls.find(([sql]) => sql.includes('UPDATE rental_requests SET status'));
+    expect(saved).toEqual(['declined', 1, 15, 'The pump is under repair that week.']);
+    const [, note] = db.client.query.mock.calls.find(([sql, values]) => sql.includes('INSERT INTO notifications') && Array.isArray(values));
+    expect(note[2]).toBe('Rental request declined');
+    expect(note[3]).toMatch(/was declined\. Reason: The pump is under repair that week\.$/);
+  });
+
+  test('a decline needs the reason', async () => {
+    for (const body of [{ status: 'declined' }, ...['', '  ', 'no', 42].map((reason) => ({ status: 'declined', reason }))]) {
+      await expect(reviewRentalRequest(mockRequest({ method: 'PATCH', params: { id: '15' }, body, user: ADMIN }), mockResponse()))
+        .rejects.toMatchObject({ status: 400, message: 'Give the reason the request is declined.' });
+    }
+    expect(statements().some((sql) => sql.includes('UPDATE rental_requests SET status'))).toBe(false);
+  });
+
+  test('an approval keeps no reason', async () => {
+    await reviewRentalRequest(mockRequest({ method: 'PATCH', params: { id: '15' }, body: { status: 'approved', reason: 'ignored' }, user: ADMIN }), mockResponse());
+    const [, saved] = db.client.query.mock.calls.find(([sql]) => sql.includes('UPDATE rental_requests SET status'));
+    expect(saved[3]).toBeNull();
   });
 
   test('rejects a status other than approved or declined', async () => {

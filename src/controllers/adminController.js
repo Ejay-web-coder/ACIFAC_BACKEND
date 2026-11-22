@@ -292,6 +292,64 @@ const AUDIT_FULL_NAME_SQL = `COALESCE(al.user_full_name_snapshot, NULLIF(TRIM(CO
 // The administrator's position when they acted; entries older than the snapshot show the current one.
 const AUDIT_POSITION_SQL = `COALESCE(al.user_position_snapshot, CASE WHEN al.user_role_snapshot = 'ADMIN' THEN NULLIF(TRIM(au.position), '') END)`;
 
+// Who each action was for: the account it was done to (target_user_id, e.g.
+// the vendor of a confirmed Kadiwa sale), else the member found through the
+// record it was done to (a loan's member, a payment's member, the client of a
+// machinery service, the member an OCR scan was saved as, ...), or the
+// audience of an announcement. `page` is one page of audit_logs rows. A walk-in client
+// or buyer has only a name; a record deleted since falls back to the name or
+// member kept in the entry's values. NULL when the action is not about anyone
+// (a machine, a product, a policy).
+const AUDIT_VALUE = (key) => `NULLIF(TRIM(COALESCE(page.new_values ->> '${key}', page.old_values ->> '${key}', page.details ->> '${key}')), '')`;
+const AUDIT_TARGET_SQL = `
+  LEFT JOIN LATERAL (SELECT CASE WHEN page.entity_id ~ '^[0-9]{1,9}$' THEN page.entity_id::int END AS id) ent ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT x.member_id, x.name, x.user_id FROM (
+      SELECT NULL::int AS member_id, NULL::text AS name, ent.id AS user_id WHERE page.entity_type = 'user'
+      UNION ALL SELECT ent.id, NULL, NULL WHERE page.entity_type = 'member'
+      UNION ALL SELECT member_id, NULL, NULL FROM loans WHERE page.entity_type = 'loan' AND id = ent.id
+      UNION ALL SELECT member_id, NULL, NULL FROM loan_requests WHERE page.entity_type = 'loan_request' AND id = ent.id
+      UNION ALL SELECT l.member_id, NULL, NULL FROM loan_payments p JOIN loans l ON l.id = p.loan_id WHERE page.entity_type = 'loan_payment' AND p.id = ent.id
+      UNION ALL SELECT member_id, NULL, NULL FROM share_contributions WHERE page.entity_type = 'share_contribution' AND id = ent.id
+      UNION ALL SELECT member_id, NULL, NULL FROM savings_transactions WHERE page.entity_type = 'savings_transaction' AND id = ent.id
+      UNION ALL SELECT member_id, NULL, NULL FROM member_dues WHERE page.entity_type = 'member_due' AND id = ent.id
+      UNION ALL SELECT member_id, NULL, NULL FROM member_dues_payments WHERE page.entity_type = 'member_dues_payment' AND id = ent.id
+      UNION ALL SELECT member_id, NULL, NULL FROM activity_attendance WHERE page.entity_type = 'activity_attendance' AND id = ent.id
+      UNION ALL SELECT member_id, member_name, NULL FROM rental_requests WHERE page.entity_type = 'rental_request' AND id = ent.id
+      UNION ALL SELECT member_id, member_name, NULL FROM machinery_operations WHERE page.entity_type = 'machinery_operation' AND id = ent.id
+      UNION ALL SELECT member_id, client_name, NULL FROM machinery_services WHERE page.entity_type = 'machinery_service' AND id = ent.id
+      UNION ALL SELECT s.member_id, s.client_name, NULL FROM machinery_service_payments p JOIN machinery_services s ON s.id = p.service_id
+        WHERE page.entity_type = 'machinery_service_payment' AND p.id = ent.id
+      UNION ALL SELECT NULL, NULLIF(TRIM(buyer), ''), NULL FROM machinery_bag_sales WHERE page.entity_type = 'machinery_bag_sale' AND id = ent.id
+      UNION ALL SELECT NULL, CASE audience WHEN 'All' THEN 'Everyone' ELSE audience END, NULL FROM announcements WHERE page.entity_type = 'announcement' AND id = ent.id
+      UNION ALL SELECT m.id, NULL, NULL FROM document_scans d JOIN members m ON m.member_number = d.posted_record_id
+        WHERE page.entity_type = 'document_scan' AND d.id = ent.id AND d.posted_module = 'members'
+      UNION ALL SELECT r.member_id, NULL, NULL FROM document_scans d JOIN loan_requests r ON r.id::text = d.posted_record_id
+        WHERE page.entity_type = 'document_scan' AND d.id = ent.id AND d.posted_module = 'loans'
+      UNION ALL SELECT t.member_id, NULL, NULL FROM document_scans d JOIN savings_transactions t ON t.id::text = d.posted_record_id
+        WHERE page.entity_type = 'document_scan' AND d.id = ent.id AND d.posted_module = 'savings'
+      UNION ALL SELECT r.member_id, r.member_name, NULL FROM document_scans d JOIN rental_requests r ON r.id::text = d.posted_record_id
+        WHERE page.entity_type = 'document_scan' AND d.id = ent.id AND d.posted_module = 'machinery'
+    ) x LIMIT 1
+  ) found ON TRUE
+  LEFT JOIN users tu ON tu.id = COALESCE(page.target_user_id, found.user_id)
+  LEFT JOIN members tm ON tm.id = COALESCE(found.member_id, tu.member_id,
+    CASE WHEN ${AUDIT_VALUE('member_id')} ~ '^[0-9]{1,9}$' THEN ${AUDIT_VALUE('member_id')}::int END)`;
+const AUDIT_TARGET_COLUMNS_SQL = `
+  COALESCE(NULLIF(TRIM(CONCAT_WS(' ', tm.first_name, tm.last_name)), ''), NULLIF(TRIM(tu.full_name), ''), tu.username, NULLIF(TRIM(found.name), ''),
+    ${AUDIT_VALUE('client_name')}, ${AUDIT_VALUE('member_name')}, ${AUDIT_VALUE('buyer')}, ${AUDIT_VALUE('vendor')},
+    CASE WHEN page.entity_type = 'member' THEN ${AUDIT_VALUE('name')} END,
+    CASE WHEN page.entity_type = 'announcement' THEN CASE ${AUDIT_VALUE('audience')} WHEN 'All' THEN 'Everyone' ELSE ${AUDIT_VALUE('audience')} END END) AS target_name,
+  tm.member_number AS target_member_number,
+  tu.id AS target_account_id,
+  tu.role AS target_role,
+  CASE WHEN tm.id IS NOT NULL THEN 'member'
+       WHEN tu.id IS NOT NULL THEN 'account'
+       WHEN page.entity_type = 'announcement' THEN 'audience'
+       WHEN page.entity_type = 'member' AND ${AUDIT_VALUE('name')} IS NOT NULL THEN 'member'
+       WHEN COALESCE(found.name, ${AUDIT_VALUE('client_name')}, ${AUDIT_VALUE('member_name')}, ${AUDIT_VALUE('buyer')}, ${AUDIT_VALUE('vendor')}) IS NOT NULL THEN 'name'
+  END AS target_kind`;
+
 export async function listAuditLogs(req, res) {
   const { page, limit, offset } = parsePagination(req.query, { defaultLimit: 25, maxLimit: 100 });
   const filters = {
@@ -330,14 +388,25 @@ export async function listAuditLogs(req, res) {
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const [totalResult, logsResult] = await Promise.all([
     query(`SELECT COUNT(*)::int AS total ${AUDIT_FROM_SQL} ${whereClause}`, params),
+    // The page is picked first, so who each action was for is looked up for
+    // those rows only. `details` keeps only what the other columns do not
+    // already say (the reason a sign-in failed, the member of an attendance).
     query(
-      `SELECT al.id, al.user_id, al.user_name_snapshot, al.user_role_snapshot, ${AUDIT_FULL_NAME_SQL} AS user_full_name, ${AUDIT_POSITION_SQL} AS user_position,
-              al.action, al.module, al.entity_type, al.entity_id, al.description, al.old_values, al.new_values,
-              al.target_user_id, al.ip_address, al.status, al.created_at
-       ${AUDIT_FROM_SQL}
-       ${whereClause}
-       ORDER BY al.created_at DESC, al.id DESC
-       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      `WITH page AS (
+         SELECT al.id, al.user_id, al.user_name_snapshot, al.user_role_snapshot, ${AUDIT_FULL_NAME_SQL} AS user_full_name, ${AUDIT_POSITION_SQL} AS user_position,
+                al.action, al.module, al.entity_type, al.entity_id, al.description, al.old_values, al.new_values,
+                al.target_user_id, al.ip_address, al.user_agent, al.status, al.created_at,
+                CASE WHEN jsonb_typeof(al.details) = 'object'
+                     THEN al.details - 'module' - 'entity_type' - 'entity_id' - 'description' - 'old_values' - 'new_values' - 'status'
+                     ELSE '{}'::jsonb END AS details
+         ${AUDIT_FROM_SQL}
+         ${whereClause}
+         ORDER BY al.created_at DESC, al.id DESC
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+       )
+       SELECT page.*, ${AUDIT_TARGET_COLUMNS_SQL}
+       FROM page ${AUDIT_TARGET_SQL}
+       ORDER BY page.created_at DESC, page.id DESC`,
       [...params, limit, offset]
     ),
   ]);

@@ -69,5 +69,7 @@ export default async function seedAttendance(ctx) {
        WHERE id = $1`,
       [id, date, activity.end, adminId]
     );
+    // For the dues seeder: meetings with final attendance are charged their dues.
+    ctx.activities.push({ id, title: activity.title, category: activity.category, date, end: activity.end });
   }
 }

@@ -52,21 +52,25 @@ const RENTAL_EVERY = 16;
 const purposeFor = (machine) => (/pump|irrigat/i.test(`${machine.name} ${machine.type}`) ? 'Irrigating the rice field'
   : /thresh/i.test(`${machine.name} ${machine.type}`) ? 'Threshing palay' : 'Land preparation');
 
-// The services of the year: the named ones, then about one every six days for the generated members.
+// The services of the year: the named ones, then about one every six days for
+// each 100 members (more members, more fields to work).
 function servicePlan(ctx) {
   const plan = NAMED_SERVICES.map(([serviceType, daysAgo, who, areaHa, totalBags, paid]) => ({ serviceType, daysAgo, who, areaHa, totalBags, paid }));
   const generated = ctx.members.slice(15);
-  for (let daysAgo = 360, n = 0; daysAgo > 3; daysAgo -= 5 + (n % 3), n += 1) {
+  const perVisit = Math.max(1, Math.round(ctx.scale));
+  for (let daysAgo = 360, step = 0, n = 0; daysAgo > 3; daysAgo -= 5 + (step % 3), step += 1) {
     const month = Number(addDays(ctx.today, -daysAgo).slice(5, 7));
-    const member = n % 6 === 5 ? null : generated[(n * 7) % generated.length];
-    const area = member ? member.farmArea : ['0.8', '1', '1.5'][n % 3];
     const harvest = HARVEST_MONTHS.has(month);
-    plan.push({
-      serviceType: harvest ? 'Harvesting' : PREPARATION[n % PREPARATION.length], daysAgo, who: member ? member.key : NON_MEMBERS[n % NON_MEMBERS.length],
-      areaHa: area, totalBags: harvest ? String(Math.round(Number(area) * (85 + (n % 4) * 10))) : null,
-      // Recent work is more often still unpaid.
-      paid: daysAgo < 30 && n % 3 === 0 ? 'none' : n % 7 === 3 ? 'partial' : 'full',
-    });
+    for (let k = 0; k < perVisit; k += 1, n += 1) {
+      const member = n % 6 === 5 ? null : generated[(n * 7) % generated.length];
+      const area = member ? member.farmArea : ['0.8', '1', '1.5'][n % 3];
+      plan.push({
+        serviceType: harvest ? 'Harvesting' : PREPARATION[n % PREPARATION.length], daysAgo: Math.max(4, daysAgo - (k % 3)), who: member ? member.key : NON_MEMBERS[n % NON_MEMBERS.length],
+        areaHa: area, totalBags: harvest ? String(Math.round(Number(area) * (85 + (n % 4) * 10))) : null,
+        // Recent work is more often still unpaid.
+        paid: daysAgo < 30 && n % 3 === 0 ? 'none' : n % 7 === 3 ? 'partial' : 'full',
+      });
+    }
   }
   return plan;
 }
@@ -189,7 +193,8 @@ async function seedRentals(ctx) {
   )).rows;
   const generated = ctx.members.slice(15);
   const plan = [...NAMED_RENTALS];
-  for (let startsIn = -360, n = 0; startsIn < -2; startsIn += RENTAL_EVERY + (n % 4), n += 1) {
+  const every = Math.max(3, Math.round(RENTAL_EVERY / ctx.scale));
+  for (let startsIn = -360, n = 0; startsIn < -2; startsIn += every + (n % 4), n += 1) {
     plan.push([startsIn, 1 + (n % 3), n % 5 === 4 ? { name: ['Ramon Bello', 'Susan Robles', 'Carlo Dimaano'][n % 3] } : generated[(n * 11) % generated.length].key, 'approved']);
   }
 
@@ -268,8 +273,49 @@ async function seedRentals(ctx) {
   }
 }
 
+// Bag Sales: the cooperative keeps the bags of palay harvest fees are paid in
+// and sells them to a buyer in town a few weeks later at the price of the day.
+// Each harvest month's bags are sold in two lots (most of them, the rest kept
+// for a better price), so the bags on hand never go below what the sample
+// harvests brought in. (Not part of net income: the fee is, when it is paid.)
+const BAG_BUYERS = ['Santa Cruz Rice Mill', 'JRM Palay Trading', 'San Jose Grains Center', 'NFA Occidental Mindoro'];
+async function seedBagSales(ctx, services) {
+  const { client, today } = ctx;
+  if (!(await client.query(`SELECT to_regclass('public.machinery_bag_sales') AS t`)).rows[0].t) return;
+  const months = new Map();
+  for (const service of services) {
+    if (!service.bagsUnit || !service.paid || !(Number(service.bagValue) > 0)) continue;
+    const month = service.date.slice(0, 7);
+    const entry = months.get(month) ?? { lastDay: service.date, bagHundredths: 0 };
+    if (entry.lastDay < service.date) entry.lastDay = service.date;
+    // Bags received, as Bag Sales counts them: amount paid / value of a bag, to 2 decimals.
+    entry.bagHundredths += Math.round((toCents(service.paid) / toCents(service.bagValue)) * 100);
+    months.set(month, entry);
+  }
+  const sales = [];
+  [...months.values()].sort((a, b) => a.lastDay.localeCompare(b.lastDay)).forEach(({ lastDay, bagHundredths }, n) => {
+    const whole = Math.floor(bagHundredths / 100);
+    [[0.55, 9], [0.3, 24]].forEach(([part, after], lot) => {
+      const bags = Math.floor(whole * part);
+      const saleDate = addDays(lastDay, after);
+      if (bags < 1 || saleDate > today) return;
+      // PHP 850 to 1,050 a bag of 50 kg, by the market.
+      sales.push({ saleDate, bags: String(bags), price: String(850 + ((n * 3 + lot * 5) % 5) * 50), buyer: BAG_BUYERS[(n + lot) % BAG_BUYERS.length] });
+    });
+  });
+  if (!sales.length) return;
+  await client.query(
+    `INSERT INTO machinery_bag_sales (sale_date, bags, price_per_bag, buyer, notes, recorded_by, created_at, updated_at)
+     SELECT r.day, r.bags, r.price, r.buyer, 'Palay from harvest fees', $5, ${stampSql('r.day', '14:00')}, ${stampSql('r.day', '14:00')}
+     FROM unnest($1::date[], $2::numeric[], $3::numeric[], $4::text[]) AS r(day, bags, price, buyer)`,
+    [sales.map((s) => s.saleDate), sales.map((s) => s.bags), sales.map((s) => s.price), sales.map((s) => s.buyer), ctx.admin.id]
+  );
+  ctx.count('bag sales', sales.length);
+}
+
 export default async function seedMachinery(ctx) {
   const services = await seedServices(ctx);
   await seedExpenses(ctx, services);
+  await seedBagSales(ctx, services);
   await seedRentals(ctx);
 }

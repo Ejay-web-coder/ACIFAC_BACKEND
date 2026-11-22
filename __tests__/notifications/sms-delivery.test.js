@@ -10,7 +10,7 @@ const fetchMock = jest.fn();
 globalThis.fetch = fetchMock;
 const db = mockDatabase();
 jest.unstable_mockModule('../../src/config/db.js', () => db.module);
-const { isSmsConfigured, queueSmsForUsers, sendSmsSafely } = await import('../../src/services/smsService.js');
+const { isSmsConfigured, queueSmsForUsers, sendSmsSafely, textMember } = await import('../../src/services/smsService.js');
 
 beforeEach(() => { jest.clearAllMocks(); jest.spyOn(console, 'error').mockImplementation(() => {}); });
 
@@ -53,5 +53,41 @@ describe('Text message delivery (sendSmsSafely, queueSmsForUsers)', () => {
   test('edge case: an empty list queues nothing and asks the database nothing', async () => {
     await expect(queueSmsForUsers([], () => 'x')).resolves.toBe(0);
     expect(db.module.query).not.toHaveBeenCalled();
+  });
+});
+
+describe('Texting one member (textMember: loan and rental approvals)', () => {
+  const memberRow = (row) => answer(db.module.query, [['FROM members m', { rows: row ? [row] : [] }]]);
+  const queued = () => db.module.query.mock.calls.filter(([sql]) => sql.includes('INSERT INTO sms_outbox'));
+
+  test('queues the text for the number on the member record, under their login account', async () => {
+    memberRow({ user_id: 7, phone: '0917 123 4567', allowed: true });
+    await expect(textMember(3, 'ACIFAC: Your loan was approved.')).resolves.toBe(true);
+    expect(queued()[0][1]).toEqual([7, '+639171234567', 'ACIFAC: Your loan was approved.']);
+    const [sql, params] = db.module.query.mock.calls[0];
+    expect(params).toEqual([3]);
+    expect(sql).toContain("m.status <> 'archived'");
+  });
+
+  test('a member without a login is texted too, with no account on the text', async () => {
+    memberRow({ user_id: null, phone: '09181112222', allowed: true });
+    await expect(textMember(4, 'Approved.')).resolves.toBe(true);
+    expect(queued()[0][1]).toEqual([null, '+639181112222', 'Approved.']);
+  });
+
+  test('a member who switched SMS off, has no mobile number or was terminated is not texted', async () => {
+    memberRow({ user_id: 7, phone: '09171234567', allowed: false });
+    await expect(textMember(3, 'x')).resolves.toBe(false);
+    memberRow({ user_id: 7, phone: '(043) 288-1234', allowed: true });
+    await expect(textMember(3, 'x')).resolves.toBe(false);
+    memberRow(null);
+    await expect(textMember(3, 'x')).resolves.toBe(false);
+    expect(queued()).toHaveLength(0);
+  });
+
+  test('edge case: a database error is caught, never thrown', async () => {
+    answer(db.module.query, [['FROM members m', new Error('connection reset')]]);
+    await expect(textMember(3, 'x')).resolves.toBe(false);
+    await expect(textMember(null, 'x')).resolves.toBe(false);
   });
 });

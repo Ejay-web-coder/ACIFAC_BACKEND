@@ -9,6 +9,7 @@ import { insertRentalRequest } from '../controllers/machineryController.js';
 import { insertInventoryItems, insertKadiwaSale } from '../controllers/kadiwaController.js';
 import { goodsForForm, parseExpenseLines, parseGoodsLines } from './kadiwaGoods.js';
 import { readInventoryForm, readSalesForm } from './kadiwaFormReading.js';
+import { recorderName } from '../utils/people.js';
 import { loanApplicationReceivedEmail, rentalRequestReceivedEmail, savingsDepositEmail, welcomeMemberEmail } from './emailTemplates.js';
 
 // Scanned cooperative forms: what each one contains, how the AI must report
@@ -171,7 +172,7 @@ export const FORM_DEFINITIONS = {
     module: 'kadiwa', moduleLabel: 'Kadiwa Store sales', signatureExpected: false, legacy: true,
     description: 'Kadiwa store daily / new sales form with sales per category.',
     fields: [
-      f('encoderName', 'Encoder / Prepared By', { required: true }), f('saleDate', 'Sale Date', { kind: 'date' }),
+      f('encoderName', 'Encoder / Prepared By'), f('saleDate', 'Sale Date', { kind: 'date' }),
       f('groceriesPrice', 'Groceries Sales', { kind: 'money' }), f('vegetablesPrice', 'Vegetables Sales', { kind: 'money' }),
       f('meatPrice', 'Meat Sales', { kind: 'money' }), f('totalExpenses', 'Total Expenses', { kind: 'money' }),
       f('netSales', 'Net Sales written on the form', { kind: 'money' }),
@@ -1254,9 +1255,9 @@ async function saveToModule(client, req, scan, documentType, data, target) {
     if (!reading.goods.length && !reading.items.length) throw badRequest('No goods or store items sold were read from the form.');
     const goods = parseGoodsLines(reading.goods.map(({ name, unit, category, price, quantity, amount }) => ({ name, unit, category, price, quantity, amount })));
     const expenseLines = parseExpenseLines(reading.expenses.length ? reading.expenses : [{ description: 'None', amount: '0' }]);
-    const encoderName = String(data.preparedBy || req.user?.full_name || req.user?.username || 'Administrator').trim().slice(0, 200);
+    // Recorded under the account that posts the scan; the name on the paper goes to the audit log.
     const saleId = await insertKadiwaSale(client, req, {
-      encoderName, saleDate: data.saleDate, manual: { Groceries: 0, Vegetables: 0, Meat: 0 },
+      encoderName: recorderName(req.user).slice(0, 200), preparedOnPaper: String(data.preparedBy || '').trim().slice(0, 200), saleDate: data.saleDate, manual: { Groceries: 0, Vegetables: 0, Meat: 0 },
       expensesCents: expenseLines.reduce((sum, line) => sum + line.cents, 0), items: reading.items.map(({ inventoryId, quantity }) => ({ inventoryId, quantity })), goods, expenseLines,
     });
     return { module: 'kadiwa', recordId: saleId, label: `Kadiwa sale ${saleId} recorded` };
@@ -1266,7 +1267,7 @@ async function saveToModule(client, req, scan, documentType, data, target) {
     const manual = { Groceries: moneyCents(data.groceriesPrice), Vegetables: moneyCents(data.vegetablesPrice), Meat: moneyCents(data.meatPrice) };
     const expensesCents = moneyCents(data.totalExpenses);
     if ([...Object.values(manual), expensesCents].some((value) => value === null)) throw badRequest('Sales amounts must be non-negative with at most two decimals.');
-    const saleId = await insertKadiwaSale(client, req, { encoderName: String(data.encoderName || '').slice(0, 200), saleDate: isValidDateOnly(data.saleDate) && data.saleDate <= todayDateOnly() ? data.saleDate : null, manual, expensesCents, items: [] });
+    const saleId = await insertKadiwaSale(client, req, { encoderName: recorderName(req.user).slice(0, 200), preparedOnPaper: String(data.encoderName || '').trim().slice(0, 200), saleDate: isValidDateOnly(data.saleDate) && data.saleDate <= todayDateOnly() ? data.saleDate : null, manual, expensesCents, items: [] });
     return { module: 'kadiwa', recordId: saleId, label: `Kadiwa sale ${saleId} recorded` };
   }
 

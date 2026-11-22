@@ -378,6 +378,10 @@ test('members: create, validate, duplicate, view document, update, archive, rest
   const audit = await admin.get('/api/admin/audit-logs?module=Members');
   const actions = audit.data.data.map((row) => row.action);
   for (const action of ['MEMBER_CREATED', 'MEMBER_UPDATED', 'MEMBER_ARCHIVED', 'MEMBER_RESTORED']) assert.ok(actions.includes(action), action);
+  // Each entry says who it was for: here the member whose membership was ended.
+  const ended = (await pool.query(`SELECT first_name || ' ' || last_name AS name, member_number FROM members WHERE id = $1`, [state.secondMemberId])).rows[0];
+  const archivedEntry = audit.data.data.find((row) => row.action === 'MEMBER_ARCHIVED');
+  assert.deepEqual([archivedEntry.target_name, archivedEntry.target_member_number, archivedEntry.target_kind], [ended.name, ended.member_number, 'member']);
 });
 
 test('accounts: create member login, setup link, forced password change', { skip }, async () => {
@@ -684,6 +688,11 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   const approve = await admin.patch(`/api/admin/loan-requests/${applied.data.request.id}`, { status: 'approved' });
   assert.equal(approve.status, 200, JSON.stringify(approve.data));
   state.loanId = approve.data.loanId;
+  // The approval is also texted to the mobile number on the member record.
+  const approvedText = await waitForText((text) => text.message.startsWith('ACIFAC: Your loan of PHP 50,000.00 was approved.'));
+  assert.deepEqual(approvedText.recipients, ['+639178888888']);
+  assert.match(approvedText.message, /^ACIFAC: Your loan of PHP 50,000\.00 was approved\. Total to pay: PHP 57,500\.00 by [A-Z][a-z]+ \d{1,2}, \d{4}\.\n- ACIFAC Administrator$/);
+  assert.ok(approvedText.message.length <= 160, approvedText.message);
   const detail = await admin.get(`/api/admin/loans/${state.loanId}`);
   assert.equal(detail.data.loan.totalAmount, '57500.00');
   assert.equal(detail.data.loan.balance, '57500.00');
@@ -786,8 +795,20 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   assert.equal(combined.data.request.inKindItems.length, 2);
   await admin.patch(`/api/admin/loan-requests/${combined.data.request.id}`, { status: 'declined', reason: 'test cleanup' });
   assert.equal(decline.status, 200);
+  // Declines are texted too, with the reason (both are out before the SMS test below counts texts).
+  const declinedText = await waitForText((text) => text.message.startsWith('ACIFAC: Your loan application for PHP 1,000.00 was declined. Reason: Incomplete documents.'));
+  assert.deepEqual(declinedText.recipients, ['+639178888888']);
+  await waitForText((text) => text.message.startsWith('ACIFAC: Your loan application for PHP 27,500.25 was declined. Reason: test cleanup.'));
   const memberNotes = await member.get('/api/notifications');
   assert.ok(memberNotes.data.data.some((n) => n.type === 'loan_declined' && /Incomplete documents/.test(n.message)));
+
+  // The audit log names the borrower each payment and loan decision was for.
+  const borrower = (await pool.query(`SELECT first_name || ' ' || last_name AS name, member_number FROM members WHERE id = $1`, [state.memberId])).rows[0];
+  const payments = (await admin.get('/api/admin/audit-logs?module=Payments&limit=100')).data.data.filter((row) => row.entity_type === 'loan_payment');
+  assert.ok(payments.length > 0);
+  for (const row of payments) assert.deepEqual([row.target_name, row.target_member_number, row.target_kind], [borrower.name, borrower.member_number, 'member']);
+  const requestEntries = (await admin.get('/api/admin/audit-logs?module=Loans&limit=100')).data.data.filter((row) => row.entity_type === 'loan_request' && row.entity_id === String(declined.data.request.id));
+  assert.deepEqual(requestEntries.map((row) => [row.action, row.target_name]), [['LOAN_REJECTED', borrower.name], ['LOAN_APPLICATION_SUBMITTED', borrower.name]]);
 });
 
 test('sms: a text the phone gateway refuses is retried later; members can switch SMS off', { skip }, async () => {
@@ -824,17 +845,22 @@ test('machinery: catalogue, request, approve, overlap protection, member status'
   const today = todayDateOnly();
   const plus = (days) => { const d = new Date(`${today}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
 
-  const request = await member.post('/api/machinery/requests', { machineryId: machine.id, startDate: plus(1), endDate: plus(3), purpose: 'Land preparation' });
+  // The first machine is a harvester, booked at least a week ahead.
+  const request = await member.post('/api/machinery/requests', { machineryId: machine.id, startDate: plus(8), endDate: plus(10), purpose: 'Land preparation' });
   assert.equal(request.status, 201, JSON.stringify(request.data));
   assert.equal(Number(request.data.request.duration), 2);
   assert.equal(Number(request.data.request.rentalFee), Number(machine.dailyFee) * 2);
-  const other = await admin.post('/api/machinery/requests', { machineryId: machine.id, memberDatabaseId: state.secondMemberId, startDate: plus(2), endDate: plus(4), purpose: 'Hauling' });
+  const other = await admin.post('/api/machinery/requests', { machineryId: machine.id, memberDatabaseId: state.secondMemberId, startDate: plus(9), endDate: plus(11), purpose: 'Hauling' });
   assert.equal(other.status, 201);
 
   assert.equal((await admin.patch(`/api/machinery/requests/${request.data.request.id}`, { status: 'approved' })).status, 200);
+  // The member is texted that the rental was approved.
+  const rentalText = await waitForText((text) => text.message.startsWith('ACIFAC: Your request to rent ') && text.message.includes(' was approved.'));
+  assert.deepEqual(rentalText.recipients, ['+639178888888']);
+  assert.ok(rentalText.message.length <= 160, rentalText.message);
   const overlap = await admin.patch(`/api/machinery/requests/${other.data.request.id}`, { status: 'approved' });
   assert.equal(overlap.status, 409);
-  const booked = await member.post('/api/machinery/requests', { machineryId: machine.id, startDate: plus(2), endDate: plus(2), purpose: 'x' });
+  const booked = await member.post('/api/machinery/requests', { machineryId: machine.id, startDate: plus(9), endDate: plus(9), purpose: 'x' });
   assert.equal(booked.status, 409);
 
   const mine = await member.get('/api/members/me');
@@ -877,6 +903,7 @@ test('machinery: the office rents to a non-member by name only', { skip }, async
 
   const notesBefore = (await pool.query(`SELECT COUNT(*)::int AS count FROM notifications WHERE type IN ('rental_approved', 'rental_declined')`)).rows[0].count;
   const mailsBefore = sentEmails.length;
+  const textsBefore = sentTexts.length;
   const created = await admin.post('/api/machinery/requests', { ...base, clientName: 'Rosa Reyes', memberDatabaseId: state.memberId });
   assert.equal(created.status, 201, JSON.stringify(created.data));
   const request = created.data.request;
@@ -893,9 +920,13 @@ test('machinery: the office rents to a non-member by name only', { skip }, async
   await new Promise((resolve) => setTimeout(resolve, 200));
   assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM notifications WHERE type IN ('rental_approved', 'rental_declined')`)).rows[0].count, notesBefore);
   assert.equal(sentEmails.length, mailsBefore);
+  assert.equal(sentTexts.length, textsBefore, 'nor texted');
   assert.ok(!(await member.get('/api/members/me')).data.data.rentalRequests.some((row) => row.id === request.id), 'not in any member\'s history');
   const audit = (await pool.query(`SELECT description FROM audit_logs WHERE entity_type = 'rental_request' AND entity_id = $1 ORDER BY id`, [String(request.id)])).rows.map((row) => row.description);
   assert.deepEqual(audit, [`Rental request for ${pump.name} by Rosa Reyes (non-member)`, 'Rental request approved for Rosa Reyes (non-member)']);
+  // In the audit log the rental is for the non-member, by name only.
+  const logged = (await admin.get('/api/admin/audit-logs?module=Machinery&limit=100')).data.data.filter((row) => row.entity_type === 'rental_request' && row.entity_id === String(request.id));
+  assert.deepEqual(logged.map((row) => [row.target_name, row.target_kind, row.target_member_number]), [['Rosa Reyes', 'name', null], ['Rosa Reyes', 'name', null]]);
 
   // The database itself keeps the two kinds apart.
   await assert.rejects(pool.query(`UPDATE rental_requests SET member_id = $1 WHERE id = $2`, [state.memberId, request.id]), /rental_request_client_valid/);
@@ -922,10 +953,19 @@ test('machinery services: dated rates, fees, payments, expenses and the PhilMech
       ['Tudling', 'per_ha', '1800.00', '1800.00', '2026-01-01', null],
     ], `${id} keeps the tractor's rates`);
   }
+  // sql/069: the all-year harvest rate (10 / 12 bags per 100) ends the day before the
+  // Combined Harvester Policy's seasonal shares begin: dry season 9 / 10 bags per 100,
+  // wet season 4 / 5 bags per hectare.
+  const migrated = (await pool.query(`SELECT applied_at FROM app_schema_migrations WHERE filename LIKE '069_%'`)).rows[0].applied_at;
+  const seasonsFrom = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(migrated);
+  const dayBefore = new Date(Date.parse(`${seasonsFrom}T00:00:00Z`) - 86400000).toISOString().slice(0, 10);
   for (const id of ['HK-01', 'HK-02']) {
     const rates = (await admin.get(`/api/machinery/${id}/rates`)).data.rates;
-    assert.deepEqual(rates.map((rate) => [rate.serviceType, rate.unit, rate.memberRate, rate.nonMemberRate, rate.effectiveFrom, rate.effectiveTo]),
-      [['Harvesting', 'per_100_bags', '10.00', '12.00', '2020-12-08', null]], `${id} keeps the harvester's rates`);
+    assert.deepEqual(rates.map((rate) => [rate.serviceType, rate.unit, rate.season, rate.memberRate, rate.nonMemberRate, rate.effectiveFrom, rate.effectiveTo]).sort(), [
+      ['Harvesting', 'bags_per_ha', 'wet', '4.00', '5.00', seasonsFrom, null],
+      ['Harvesting', 'per_100_bags', null, '10.00', '12.00', '2020-12-08', dayBefore],
+      ['Harvesting', 'per_100_bags', 'dry', '9.00', '10.00', seasonsFrom, null],
+    ], `${id} has the policy's seasonal rates`);
   }
 
   // Members book any machine of the fleet; its fee is charged when the work is recorded here.
@@ -934,7 +974,20 @@ test('machinery services: dated rates, fees, payments, expenses and the PhilMech
   const booking = await member.post('/api/machinery/requests', { machineryId: tractor.id, startDate: '2099-01-01', endDate: '2099-01-03', purpose: 'Land preparation' });
   assert.equal(booking.status, 201, JSON.stringify(booking.data));
   assert.deepEqual([booking.data.request.duration, Number(booking.data.request.rentalFee)], [2, 0]);
-  assert.equal((await admin.patch(`/api/machinery/requests/${booking.data.request.id}`, { status: 'declined' })).status, 200);
+  // A decline needs the reason; the member gets it by email, text and notification, and sees it under Rental Booking.
+  const noReason = await admin.patch(`/api/machinery/requests/${booking.data.request.id}`, { status: 'declined' });
+  assert.deepEqual([noReason.status, noReason.data.message], [400, 'Give the reason the request is declined.']);
+  assert.equal((await admin.patch(`/api/machinery/requests/${booking.data.request.id}`, { status: 'declined', reason: 'The tractor is in the shop for repairs.' })).status, 200);
+  const declinedMail = await waitForMail((mail) => mail.subject === 'ACIFAC machinery rental declined' && mail.text.includes('Reason: The tractor is in the shop for repairs.'));
+  assert.ok(declinedMail.to, 'sent to the member');
+  // The text has as much of the reason as fits one SMS; the email has all of it.
+  const declinedRental = await waitForText((text) => text.message.startsWith(`ACIFAC: Your request to rent ${tractor.name} from Jan 1 to Jan 3, 2099 was declined. Reason: The tractor is in the shop`));
+  assert.deepEqual(declinedRental.recipients, ['+639178888888']);
+  assert.ok(declinedRental.message.length <= 160, declinedRental.message);
+  const mineNow = (await member.get('/api/members/me')).data.data.rentalRequests.find((row) => row.id === booking.data.request.id);
+  assert.deepEqual([mineNow.status, mineNow.reviewNotes], ['declined', 'The tractor is in the shop for repairs.']);
+  assert.equal((await admin.get('/api/machinery')).data.requests.find((row) => row.id === booking.data.request.id).reviewNotes, 'The tractor is in the shop for repairs.');
+  assert.ok((await member.get('/api/notifications?limit=100')).data.data.some((note) => note.type === 'rental_declined' && /Reason: The tractor is in the shop for repairs\.$/.test(note.message)));
   assert.equal((await member.get('/api/machinery/day-rentals')).status, 404, 'Day Rentals are gone');
   assert.equal((await member.get('/api/machinery/services')).status, 403);
 
@@ -1187,7 +1240,7 @@ test('machinery: the booking calendar shows which machine is free each day; a bo
   const wrong = await admin.post('/api/machinery/services', { machineryId: 'HK-01', croppingPeriod: '1st', year: 2026, serviceType: 'Harvesting', serviceDate: '2026-05-05', clientCategory: 'non_member', clientName: 'Mario Reyes', totalBags: '100', bagValue: '1000', rentalRequestId: office.data.request.id });
   assert.equal(wrong.status, 400, 'a booking belongs to its own machine');
   assert.equal((await admin.request('DELETE', `/api/machinery/services/${service.data.service.id}`)).status, 200);
-  assert.equal((await admin.patch(`/api/machinery/requests/${asked.data.request.id}`, { status: 'declined' })).status, 200);
+  assert.equal((await admin.patch(`/api/machinery/requests/${asked.data.request.id}`, { status: 'declined', reason: 'test cleanup' })).status, 200);
 
   // The office is told on the day an approved booking starts, once per admin, member or non-member.
   const { refreshRentalStatuses } = await import('../src/controllers/machineryController.js');
@@ -1486,7 +1539,8 @@ test('kadiwa: a sale is the daily form of goods sold, reported per 15 days and p
   const first = await admin.post(url, day1);
   assert.equal(first.status, 201, JSON.stringify(first.data));
   const sale = first.data.sale;
-  assert.deepEqual([sale.saleDate, sale.seller], ['2026-09-01', 'Ana Seller']);
+  // The seller is the person who saves the sale: a typed name is not taken.
+  assert.deepEqual([sale.saleDate, sale.seller], ['2026-09-01', recorder]);
   assert.match(sale.id, /^S-2026-/);
   // Groceries: egg 520 + groceries 745 + rice from the store 1 x price; vegetables: kalabasa 517 + patola 115; meat: pork 300.
   const riceCents = Math.round(Number(rice.price) * 100);
@@ -1514,6 +1568,7 @@ test('kadiwa: a sale is the daily form of goods sold, reported per 15 days and p
   const third = await admin.post(url, { sellerName: ' ', saleDate: '2026-09-20', expenses: [{ description: 'None', amount: '0' }], goods: [{ name: 'SITAW', unit: 'BALOT', price: '15', amount: '565' }] });
   assert.equal(third.status, 201, JSON.stringify(third.data));
   assert.equal(third.data.sale.seller, recorder, 'recorded under the person who saved it');
+  assert.equal(second.data.sale.seller, recorder, 'a typed seller name is ignored');
 
   // September 1 to 15: every good added up, like the 15-day summary.
   const half = await admin.get(`${url}?from=2026-09-01&to=2026-09-15`);
@@ -2395,7 +2450,11 @@ test('ocr: the printed Kadiwa forms add products to the inventory and record a s
   assert.equal(sold.posted?.module, 'kadiwa', JSON.stringify(sold.verification));
   const day = (await admin.get('/api/kadiwa/sales?from=2026-01-21&to=2026-01-21')).data.sales;
   const sale = day.find((entry) => entry.id === sold.posted.recordId);
-  assert.equal(sale.seller, 'Maria Santos');
+  // Recorded under the account that posted the scan; the name on the paper is kept in the audit log.
+  assert.equal(sale.seller, (await pool.query(`SELECT COALESCE(NULLIF(BTRIM(full_name), ''), username) AS name FROM users WHERE username = 'testadmin'`)).rows[0].name);
+  const scannedAudit = (await pool.query(`SELECT description, new_values FROM audit_logs WHERE action = 'KADIWA_SALE_CREATED' AND entity_id = $1`, [sale.id])).rows[0];
+  assert.equal(scannedAudit.new_values.prepared_on_paper, 'Maria Santos');
+  assert.ok(scannedAudit.description.endsWith('(prepared by Maria Santos on the paper form)'), scannedAudit.description);
   assert.deepEqual(sale.goods.map((good) => [good.name, Number(good.amount)]), [['PORK', 600]]);
   assert.deepEqual(sale.items.map((item) => [item.inventoryId, Number(item.quantity)]), [[beef.id, 2]]);
   assert.deepEqual(sale.expenses.map((line) => [line.description, Number(line.amount)]), [['Ice', 20]]);
@@ -2855,12 +2914,30 @@ test('notifications, announcements and live updates', { skip }, async () => {
   const vendor = new Client();
   assert.equal((await vendor.post('/api/auth/login', { usernameOrEmail: 'ann.vendor', password: 'Vendor123!' })).status, 200);
   const posted = {};
+  // Announcements for all and for members are also emailed to the members, every
+  // address as BCC; sample addresses (@example.com, like this member's) are skipped,
+  // so the member's login has a real-looking address while these are posted.
+  const loginEmail = (await pool.query('SELECT email FROM users WHERE id = $1', [state.memberUserId])).rows[0].email;
+  await pool.query(`UPDATE users SET email = 'juan.delacruz@acifac.ph' WHERE id = $1`, [state.memberUserId]);
+  const emailedMembers = {};
   for (const audience of ['All', 'Members Only', 'Admins Only', 'Vendors Only']) {
     const response = await admin.post('/api/announcements', { title: `For ${audience}`, message: 'Hello', audience });
     assert.equal(response.status, 201, JSON.stringify(response.data));
     assert.equal(response.data.data.audience, audience);
     posted[audience] = response.data.data.id;
+    emailedMembers[audience] = response.data.emailedMembers;
   }
+  await pool.query('UPDATE users SET email = $2 WHERE id = $1', [state.memberUserId, loginEmail]);
+  assert.equal(emailedMembers['Admins Only'], 0);
+  assert.equal(emailedMembers['Vendors Only'], 0);
+  for (const audience of ['All', 'Members Only']) {
+    const mail = await waitForMail((sent) => sent.subject === `ACIFAC announcement: For ${audience}`);
+    assert.equal(mail.to, 'undisclosed-recipients:;');
+    assert.ok(mail.bcc.includes('juan.delacruz@acifac.ph'), JSON.stringify(mail.bcc));
+    assert.ok(!mail.bcc.some((address) => /@example\.(com|net|org)$/i.test(address)), 'sample addresses are skipped');
+    assert.equal(mail.bcc.length, emailedMembers[audience]);
+  }
+  assert.ok(!sentEmails.some((sent) => /^ACIFAC announcement: For (Admins|Vendors) Only$/.test(sent.subject)), 'not emailed to members');
   const sees = async (client) => {
     const ids = (await client.get('/api/announcements?limit=100')).data.data.map((row) => row.id);
     return Object.keys(posted).filter((audience) => ids.includes(posted[audience]));
@@ -3833,8 +3910,16 @@ test('attendance: activities, recording, duplicates, finalization, rates, cancel
   assert.equal(created.status, 201, JSON.stringify(created.data));
   const m1 = created.data.data.id;
   assert.deepEqual([created.data.data.status, created.data.data.final, created.data.data.categoryLabel], ['scheduled', false, 'Meeting']);
+  // An upcoming activity is emailed to the members who must attend, those without a
+  // login (Ben) included; sample addresses (@example.com) are skipped.
+  await pool.query(`UPDATE members SET email = 'ben.cruz@acifac.ph' WHERE id = $1`, [ben]);
   const seminar = { ...meeting, title: 'Organic Farming Seminar', category: 'education_training', activityDate: nextWeek };
   const training = (await office.post('/api/attendance/activities', seminar)).data.data;
+  const seminarMail = await waitForMail((sent) => sent.subject === 'ACIFAC activity: Organic Farming Seminar');
+  assert.ok(seminarMail.bcc.includes('ben.cruz@acifac.ph'), JSON.stringify(seminarMail.bcc));
+  assert.ok(!seminarMail.bcc.some((address) => /@example\.(com|net|org)$/i.test(address)), 'sample addresses are skipped');
+  assert.match(seminarMail.text, /When: .+, 8:00 AM to 10:00 AM\nWhere: ACIFAC Hall\nOrganized by: Board of Directors/);
+  assert.ok(!sentEmails.some((sent) => sent.subject === 'ACIFAC meeting: Monthly Meeting'), 'an activity recorded after its day is not emailed');
 
   // Recording: future activities wait for their day; only members on the activity date are listed.
   assert.equal((await office.request('PUT', `/api/attendance/activities/${training.id}/attendance`, { body: { records: [{ memberId: ana, status: 'present' }] } })).status, 400);
@@ -4089,8 +4174,10 @@ test('loans: restructuring after 80% paid deducts the balance from a new loan an
   const dueDays = (Date.parse(created.dueDate) - Date.parse(today)) / 86400000;
   assert.ok(dueDays >= 181 && dueDays <= 186, String(dueDays));
   const detail = (await admin.get(`/api/admin/loans/${loanId}`)).data;
+  // Who recorded it is shown by name (the username only when the account has none).
+  const recorderName = (await pool.query(`SELECT COALESCE(NULLIF(BTRIM(full_name), ''), username) AS name FROM users WHERE username = 'testadmin'`)).rows[0].name;
   assert.deepEqual(detail.restructurings.map((row) => [row.kind, row.reason, row.newLoanNumber, row.newLoanAmount, row.recordedBy]),
-    [['renewal', 'Next cropping season', created.id, '50000.00', 'testadmin']]);
+    [['renewal', 'Next cropping season', created.id, '50000.00', recorderName]]);
   // Payments are listed newest first: the deduction is the last one.
   assert.deepEqual([detail.payments[0].amount, detail.payments[0].remainingBalance], ['2460.00', '0.00']);
   assert.ok(detail.installments.every((row) => row.status === 'paid' || row.status === 'paid_late'));
@@ -4461,4 +4548,435 @@ test('loans: a 5-day grace period after the due date, then PHP 100 a day until p
   assert.ok((analytics.revenue.find((row) => row.category === 'Loan Penalties')?.amount ?? 0) >= 1300, JSON.stringify(analytics.revenue));
   assert.ok(analytics.summary.penaltiesCollected >= 1300);
   await settleOpenLoans(state.memberId);
+});
+
+test('membership policy: 18 to 65 years old on the membership date; a member who resigned cannot come back; the member is told', { skip }, async () => {
+  const { hashPassword } = await import('../src/utils/password.js');
+  const add = async (first, birthday) => admin.request('POST', '/api/members', { form: await memberForm({ first_name: first, last_name: 'Edad', email: `${first.toLowerCase()}.edad@example.com`, date_of_birth: birthday, membership_date: '2026-01-15', share_capital: '0' }) });
+  const tooYoung = await add('Bata', '2008-01-16');
+  assert.equal(tooYoung.status, 400);
+  assert.equal(tooYoung.data.message, 'A member must be 18 to 65 years old on the membership date (Membership Policy). With this birthday the applicant was 17 on January 15, 2026.');
+  const tooOld = await add('Lolo', '1960-01-14');
+  assert.equal(tooOld.status, 400);
+  assert.match(tooOld.data.message, /was 66 on January 15, 2026/);
+  assert.equal((await add('Labing', '2008-01-15')).status, 201, 'turning 18 on the membership date is allowed');
+  const oldest = await add('Animnapu', '1960-01-16');
+  assert.equal(oldest.status, 201, 'still 65 on the membership date');
+  // The import checks the same.
+  const imported = await admin.post('/api/members/import', { rows: [{ first_name: 'Import', last_name: 'Bata', phone: '09170001111', address: 'Purok 5', membership_date: '2026-01-15', date_of_birth: '2012-02-02' }] });
+  assert.equal(imported.data.data.failed, 1);
+  assert.match(imported.data.data.results[0].errors[0], /18 to 65 years old/);
+
+  // Editing a member keeps working when the birthday and membership date stay the same, even if they no longer fit.
+  const legacy = (await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, phone, address, membership_date, date_of_birth, share_capital, status)
+     VALUES ('AGE-LEGACY', 'Matanda', 'Na', '09170002222', 'Purok 6', '2015-03-01', '1940-03-01', 0, 'active') RETURNING id`
+  )).rows[0].id;
+  const edit = { first_name: 'Matanda', last_name: 'Na', phone: '09170002223', address: 'Purok 6', membership_date: '2015-03-01', date_of_birth: '1940-03-01', status: 'active' };
+  const kept = await admin.put(`/api/members/${legacy}`, edit);
+  assert.equal(kept.status, 200, JSON.stringify(kept.data));
+  const moved = await admin.put(`/api/members/${legacy}`, { ...edit, membership_date: '2016-03-01' });
+  assert.equal(moved.status, 400);
+  assert.match(moved.data.message, /was 76 on March 1, 2016/);
+
+  // A member who resigned (voluntary termination) cannot be restored, except to undo a mistake on the same day.
+  const resigneeId = oldest.data.data.id;
+  const userId = (await pool.query(`INSERT INTO users (member_id, username, email, password_hash, role, account_status) VALUES ($1, 'animnapu.edad', NULL, $2, 'MEMBER', 'ACTIVE') RETURNING id`, [resigneeId, await hashPassword('Resign1!')])).rows[0].id;
+  const notes = async (type) => (await pool.query('SELECT title, message, link FROM notifications WHERE user_id = $1 AND type = $2 ORDER BY id', [userId, type])).rows;
+  assert.equal((await admin.patch(`/api/members/${resigneeId}/archive`, { terminationType: 'voluntary' })).status, 200);
+  const terminated = await notes('membership_terminated');
+  assert.equal(terminated.length, 1);
+  assert.match(terminated[0].message, /^Your ACIFAC membership \(ACIFAC-\d{4}-\d{3}\) was terminated on .+ \(resignation\)\./);
+  await waitForMail((mail) => mail.to === 'animnapu.edad@example.com' && mail.subject === 'Your ACIFAC membership was terminated');
+  const undo = await admin.patch(`/api/members/${resigneeId}/restore`);
+  assert.equal(undo.status, 200, 'a resignation recorded by mistake is undone the same day');
+  assert.equal((await notes('membership_restored')).length, 1);
+  await waitForMail((mail) => mail.to === 'animnapu.edad@example.com' && mail.subject === 'Your ACIFAC membership was restored');
+  assert.equal((await admin.patch(`/api/members/${resigneeId}/archive`, { terminationType: 'voluntary' })).status, 200);
+  await pool.query(`UPDATE members SET additional_info = jsonb_set(additional_info, '{termination,date}', '"2026-02-01"') WHERE id = $1`, [resigneeId]);
+  const blocked = await admin.patch(`/api/members/${resigneeId}/restore`);
+  assert.equal(blocked.status, 409);
+  assert.match(blocked.data.message, /resigned, and a member who resigned cannot come back/);
+  assert.equal((await pool.query('SELECT status FROM members WHERE id = $1', [resigneeId])).rows[0].status, 'archived');
+  // Other kinds of termination can still be restored.
+  await pool.query(`UPDATE members SET additional_info = jsonb_set(additional_info, '{termination,type}', '"involuntary"') WHERE id = $1`, [resigneeId]);
+  assert.equal((await admin.patch(`/api/members/${resigneeId}/restore`)).status, 200);
+});
+
+test('harvester: booked a week ahead, members first; dry and wet season shares', { skip }, async () => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const today = todayDateOnly();
+  const plus = (days) => { const d = new Date(`${today}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
+  const { hashPassword } = await import('../src/utils/password.js');
+  const farmer = (await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status)
+     VALUES ('HARV-001', 'Hilda', 'Ani', 'hilda.ani@example.com', '09170003333', 'Purok 7', '2020-01-01', 0, 'active') RETURNING id`
+  )).rows[0].id;
+  await pool.query(`INSERT INTO users (member_id, username, email, password_hash, role, account_status) VALUES ($1, 'hilda.ani', NULL, $2, 'MEMBER', 'ACTIVE')`, [farmer, await hashPassword('HildaPass1!')]);
+  const hilda = new Client('10.0.30.1');
+  assert.equal((await hilda.post('/api/auth/login', { usernameOrEmail: 'hilda.ani', password: 'HildaPass1!' })).status, 200);
+  const book = (client, body) => client.post('/api/machinery/requests', { machineryId: 'HK-01', purpose: 'Harvesting', ...body });
+
+  const early = await book(hilda, { startDate: plus(6), endDate: plus(6) });
+  assert.equal(early.status, 400);
+  assert.match(early.data.message, /at least one week before the harvest .*The earliest harvest day you can book now is/);
+  assert.equal((await book(admin, { clientCategory: 'non_member', clientName: 'Nonoy Reyes', startDate: plus(2), endDate: plus(2) })).status, 400, 'the office follows the same rule');
+  const mine = await book(hilda, { startDate: plus(7), endDate: plus(7) });
+  assert.equal(mine.status, 201, JSON.stringify(mine.data));
+  const guest = await book(admin, { clientCategory: 'non_member', clientName: 'Nonoy Reyes', startDate: plus(7), endDate: plus(8) });
+  assert.equal(guest.status, 201, JSON.stringify(guest.data));
+  // Other machines need no week's notice.
+  const tractor = await hilda.post('/api/machinery/requests', { machineryId: 'RT-02', startDate: plus(3), endDate: plus(3), purpose: 'Land preparation' });
+  assert.equal(tractor.status, 201, JSON.stringify(tractor.data));
+  assert.equal((await admin.patch(`/api/machinery/requests/${tractor.data.request.id}`, { status: 'declined', reason: 'test cleanup' })).status, 200);
+
+  // Members first: the member's request is listed and answered before the non-member's.
+  const pending = (await admin.get('/api/machinery')).data.requests.filter((row) => row.status === 'pending');
+  const position = (id) => pending.findIndex((row) => row.id === id);
+  assert.ok(position(mine.data.request.id) >= 0 && position(mine.data.request.id) < position(guest.data.request.id), 'the member\'s request is listed first');
+  const firstGuest = pending.findIndex((row) => row.clientCategory === 'non_member');
+  assert.ok(pending.slice(firstGuest).every((row) => row.clientCategory === 'non_member'), 'no member request is listed after a non-member\'s');
+  const waiting = await admin.patch(`/api/machinery/requests/${guest.data.request.id}`, { status: 'approved' });
+  assert.equal(waiting.status, 409);
+  assert.match(waiting.data.message, /^Members come first for the harvester \(Combined Harvester Policy\): Hilda Ani also asked for/);
+  assert.equal((await admin.patch(`/api/machinery/requests/${mine.data.request.id}`, { status: 'declined', reason: 'test cleanup' })).status, 200);
+  assert.equal((await admin.patch(`/api/machinery/requests/${guest.data.request.id}`, { status: 'approved' })).status, 200);
+  await pool.query(`UPDATE machinery_operations SET status = 'completed' WHERE rental_request_id = $1`, [guest.data.request.id]);
+
+  // Wet season (June to November): bags per hectare, 4 for members and 5 for non-members.
+  const quote = (body) => admin.post('/api/machinery/services/quote', { machineryId: 'HK-01', serviceType: 'Harvesting', serviceDate: today, bagValue: '1000', ...body });
+  const wetDate = ['06', '07', '08', '09', '10', '11'].includes(today.slice(5, 7));
+  const wet = await quote({ clientCategory: 'member', areaHa: '2', season: 'wet' });
+  assert.equal(wet.status, 200, JSON.stringify(wet.data));
+  assert.deepEqual([wet.data.quote.unit, wet.data.quote.season, wet.data.quote.feeBags, wet.data.quote.feeAmount], ['bags_per_ha', 'wet', '8.00', '8000.00']);
+  const wetGuest = await quote({ clientCategory: 'non_member', areaHa: '1.5', season: 'wet' });
+  assert.deepEqual([wetGuest.data.quote.feeBags, wetGuest.data.quote.feeAmount], ['7.50', '7500.00']);
+  assert.match((await quote({ clientCategory: 'member', season: 'wet' })).data.message, /^Area \(ha\) must be/, 'the area is needed');
+  // Dry season (December to May): 9 bags per 100 for members, 10 for non-members.
+  const dry = await quote({ clientCategory: 'member', totalBags: '150', season: 'dry' });
+  assert.deepEqual([dry.data.quote.unit, dry.data.quote.season, dry.data.quote.feeBags, dry.data.quote.feeAmount], ['per_100_bags', 'dry', '13.50', '13500.00']);
+  assert.deepEqual([(await quote({ clientCategory: 'non_member', totalBags: '150', season: 'dry' })).data.quote.feeBags], ['15.00']);
+  // Without a season the date decides.
+  assert.equal((await quote({ clientCategory: 'member', areaHa: '2', totalBags: '150' })).data.quote.season, wetDate ? 'wet' : 'dry');
+  assert.equal((await quote({ clientCategory: 'member', areaHa: '2', season: 'summer' })).status, 400);
+
+  // A wet-season harvest is paid in bags like any other: the bags count in the stock.
+  const before = (await admin.get('/api/machinery/bag-sales')).data.stock;
+  const recorded = await admin.post('/api/machinery/services', {
+    machineryId: 'HK-01', serviceType: 'Harvesting', serviceDate: today, season: 'wet', croppingPeriod: '2nd', year: Number(today.slice(0, 4)),
+    clientCategory: 'member', memberDatabaseId: farmer, areaHa: '1', totalBags: '90', bagValue: '1100', amountPaid: '2200',
+  });
+  assert.equal(recorded.status, 201, JSON.stringify(recorded.data));
+  assert.deepEqual([recorded.data.service.unit, recorded.data.service.season, recorded.data.service.feeBags, recorded.data.service.feeAmount, recorded.data.service.totalBags], ['bags_per_ha', 'wet', '4.00', '4400.00', '90.00']);
+  const after = (await admin.get('/api/machinery/bag-sales')).data.stock;
+  assert.equal(Number(after.received) - Number(before.received), 2);
+  assert.equal(Number(after.toCollect) - Number(before.toCollect), 2);
+
+  // Seasonal rates change per season: a new wet rate ends the open wet rate only.
+  const newWet = await admin.post('/api/machinery/HK-02/rates', { serviceType: 'Harvesting', unit: 'bags_per_ha', season: 'wet', memberRate: '4.5', nonMemberRate: '5.5', effectiveFrom: plus(30) });
+  assert.equal(newWet.status, 201, JSON.stringify(newWet.data));
+  const rates = (await admin.get('/api/machinery/HK-02/rates')).data.rates;
+  assert.equal(rates.find((rate) => rate.season === 'wet' && rate.memberRate === '4.00').effectiveTo, plus(29));
+  assert.equal(rates.find((rate) => rate.season === 'dry').effectiveTo, null, 'the dry season rate stays');
+  const wrongUnit = await admin.post('/api/machinery/HK-02/rates', { serviceType: 'Harvesting', unit: 'per_100_bags', season: 'wet', memberRate: '9', nonMemberRate: '10', effectiveFrom: plus(60) });
+  assert.equal(wrongUnit.status, 400);
+  const allYear = await admin.post('/api/machinery/HK-02/rates', { serviceType: 'Harvesting', unit: 'per_100_bags', memberRate: '9', nonMemberRate: '10', effectiveFrom: plus(60) });
+  assert.equal(allYear.status, 409, 'an all-year rate cannot run beside the seasonal ones');
+  assert.match(allYear.data.message, /(dry|wet) season/);
+  await assert.rejects(pool.query(`INSERT INTO machinery_service_rates (machinery_id, service_type, unit, member_rate, non_member_rate, effective_from, season) VALUES ('HK-02', 'Harvesting', 'per_100_bags', 9, 10, $1, 'dry')`, [plus(90)]), /overlaps another rate period/);
+  await assert.rejects(pool.query(`INSERT INTO machinery_service_rates (machinery_id, service_type, unit, member_rate, non_member_rate, effective_from, season) VALUES ('HK-02', 'Harvesting', 'per_100_bags', 9, 10, $1, 'summer')`, [plus(90)]), /season_check/);
+});
+
+test('dues: share capital and savings per meeting, absence fines, transfer fee, payments, waivers, reminders; members are told about activities', { skip }, async () => {
+  const { hashPassword } = await import('../src/utils/password.js');
+  const { todayDateOnly, formatDateOnly } = await import('../src/utils/dates.js');
+  const { refreshDuesReminders } = await import('../src/services/dues.js');
+  const shift = (days) => new Date(Date.parse(`${todayDateOnly()}T00:00:00Z`) + days * 86400000).toISOString().slice(0, 10);
+  const [today, twoWeeksAgo, nextWeek] = [todayDateOnly(), shift(-14), shift(7)];
+  const addMember = async (number, first) => (await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status)
+     VALUES ($1, $2, 'Bayad', $3, '09170000000', 'Purok 4', '2020-01-01', 0, 'active') RETURNING id`,
+    [number, first, `${first.toLowerCase()}.dues@example.com`]
+  )).rows[0].id;
+  const [pia, quin, rex] = [await addMember('DUE-001', 'Pia'), await addMember('DUE-002', 'Quin'), await addMember('DUE-003', 'Rex')];
+  const login = async (memberId, username) => {
+    const userId = (await pool.query(`INSERT INTO users (member_id, username, email, password_hash, role, account_status) VALUES ($1, $2, NULL, $3, 'MEMBER', 'ACTIVE') RETURNING id`, [memberId, username, await hashPassword('DuesPass1!')])).rows[0].id;
+    const client = new Client(`10.0.20.${memberId % 250}`);
+    const signedIn = await client.post('/api/auth/login', { usernameOrEmail: username, password: 'DuesPass1!' });
+    assert.equal(signedIn.status, 200, JSON.stringify(signedIn.data));
+    return { userId, client };
+  };
+  const piaLogin = await login(pia, 'pia.dues');
+  const rexLogin = await login(rex, 'rex.dues');
+  const notes = async (userId, type) => (await pool.query('SELECT title, message, severity, link FROM notifications WHERE user_id = $1 AND type = $2 ORDER BY id', [userId, type])).rows;
+  const meeting = { title: 'Dues Test Meeting', category: 'meeting', startTime: '08:00', endTime: '10:00', venue: 'ACIFAC Hall', attendeeScope: 'selected', memberIds: [pia, quin, rex] };
+
+  // An upcoming meeting is announced to the members who must attend; a change and a cancellation too.
+  const upcoming = await admin.post('/api/attendance/activities', { ...meeting, title: 'Upcoming Assembly', activityDate: nextWeek });
+  assert.equal(upcoming.status, 201, JSON.stringify(upcoming.data));
+  const announced = await notes(piaLogin.userId, 'activity_created');
+  assert.equal(announced.length, 1);
+  assert.equal(announced[0].title, 'New meeting: Upcoming Assembly');
+  assert.match(announced[0].message, /8:00 AM to 10:00 AM at ACIFAC Hall\. You are one of the members who must attend\. Bring PHP 250 for share capital and PHP 50 for savings; missing it without a valid reason has a PHP 250 fine\.$/);
+  assert.equal(announced[0].link, '/member/attendance');
+  assert.equal((await notes(state.memberUserId, 'activity_created')).filter((row) => row.title.includes('Upcoming Assembly')).length, 0, 'members not chosen are not told');
+  const moved = await admin.put(`/api/attendance/activities/${upcoming.data.data.id}`, { ...meeting, title: 'Upcoming Assembly', activityDate: nextWeek, venue: 'Barangay Hall' });
+  assert.equal(moved.status, 200, JSON.stringify(moved.data));
+  assert.match((await notes(piaLogin.userId, 'activity_changed'))[0].message, /at Barangay Hall\.$/);
+  assert.equal((await admin.patch(`/api/attendance/activities/${upcoming.data.data.id}/cancel`, { reason: 'Typhoon signal no. 2' })).status, 200);
+  assert.equal((await notes(piaLogin.userId, 'activity_cancelled'))[0].message, `The meeting on ${formatDateOnly(nextWeek)} was cancelled: Typhoon signal no. 2`);
+  // A meeting entered after it took place is not announced.
+  const past = await admin.post('/api/attendance/activities', { ...meeting, activityDate: twoWeeksAgo });
+  assert.equal(past.status, 201);
+  assert.equal((await notes(piaLogin.userId, 'activity_created')).length, 1);
+
+  // Finalizing the meeting adds PHP 250 share capital and PHP 50 savings for each member on the list,
+  // and the PHP 250 fine for those absent without a valid reason ("excused" is a valid reason).
+  const id = past.data.data.id;
+  const save = (records, reason) => admin.request('PUT', `/api/attendance/activities/${id}/attendance`, { body: { records, reason } });
+  assert.equal((await save([{ memberId: pia, status: 'present' }, { memberId: rex, status: 'excused', remarks: 'Sick' }])).status, 200);
+  const finalized = await admin.post(`/api/attendance/activities/${id}/finalize`);
+  assert.equal(finalized.status, 200, JSON.stringify(finalized.data));
+  assert.equal(finalized.data.message, 'Attendance finalized. 1 unmarked member was recorded absent. Meeting dues were added for 3 members.');
+  const duesOf = async (memberId) => (await pool.query('SELECT id, kind, amount::text, due_date::text, payment_id, waived_at FROM member_dues WHERE member_id = $1 ORDER BY kind, id', [memberId])).rows;
+  assert.deepEqual((await duesOf(pia)).map((due) => [due.kind, due.amount, due.due_date]), [['savings', '50.00', twoWeeksAgo], ['share_capital', '250.00', twoWeeksAgo]]);
+  assert.deepEqual((await duesOf(quin)).map((due) => [due.kind, due.amount]), [['absence_fine', '250.00'], ['savings', '50.00'], ['share_capital', '250.00']]);
+  assert.deepEqual((await duesOf(rex)).map((due) => due.kind), ['savings', 'share_capital']);
+  const charged = await notes(piaLogin.userId, 'dues_charged');
+  assert.deepEqual([charged[0].title, charged[0].link], ['Meeting dues: Dues Test Meeting', '/member/dues']);
+  assert.match(charged[0].message, /: PHP 250\.00 share capital and PHP 50\.00 savings\. Total PHP 300\.00\. Please pay at the ACIFAC office\.$/);
+
+  // Corrections: Quin had a valid reason after all (fine removed), Rex had none (fine added).
+  const corrected = await save([{ memberId: quin, status: 'excused', remarks: 'Letter received' }, { memberId: rex, status: 'absent' }], 'Excuse letters checked');
+  assert.equal(corrected.status, 200, JSON.stringify(corrected.data));
+  assert.match(corrected.data.message, /1 due was added\. 1 absence fine was removed\.$/);
+  assert.ok(!(await duesOf(quin)).some((due) => due.kind === 'absence_fine'));
+  assert.ok((await duesOf(rex)).some((due) => due.kind === 'absence_fine'));
+  assert.match((await notes(rexLogin.userId, 'dues_charged')).at(-1).message, /corrected to absent without a valid reason, so a PHP 250\.00 fine was added/);
+
+  // The office's list: what each member owes, most first.
+  const list = await admin.get('/api/dues?search=DUE-00');
+  assert.equal(list.status, 200, JSON.stringify(list.data));
+  assert.deepEqual(list.data.data.map((row) => [row.memberNumber, row.unpaid, row.unpaidShareCapital, row.unpaidSavings, row.unpaidFines]), [
+    ['DUE-003', 550, 250, 50, 250], ['DUE-001', 300, 250, 50, 0], ['DUE-002', 300, 250, 50, 0],
+  ]);
+  assert.equal(list.data.rates.share_capital.amount, 250);
+  assert.equal((await piaLogin.client.get('/api/dues')).status, 403, 'members see only their own dues');
+  const own = await piaLogin.client.get('/api/dues/me');
+  assert.deepEqual([own.status, own.data.summary.unpaid, own.data.dues.length], [200, 300, 2]);
+
+  // Paying Pia's dues: the share capital part is a share contribution, the savings part a savings deposit.
+  const piaDues = (await duesOf(pia)).map((due) => due.id);
+  assert.equal((await admin.post('/api/dues/payments', { memberId: pia, dueIds: piaDues, paymentDate: shift(-15) })).status, 400, 'not before the meeting');
+  assert.equal((await admin.post('/api/dues/payments', { memberId: rex, dueIds: piaDues })).status, 400, 'another member\'s dues');
+  const gcash = await admin.post('/api/dues/payments', { memberId: pia, dueIds: piaDues, paymentDate: today, paymentMethod: 'GCash' });
+  assert.deepEqual([gcash.status, gcash.data.message], [400, 'Dues are paid in cash only.']);
+  const paid =await admin.post('/api/dues/payments', { memberId: pia, dueIds: piaDues, paymentDate: today, paymentMethod: 'Cash', reference: 'OR-DUES-1' });
+  assert.equal(paid.status, 201, JSON.stringify(paid.data));
+  assert.deepEqual([paid.data.payment.amount, paid.data.summary.unpaid, paid.data.summary.paid], [300, 0, 300]);
+  const shares = (await pool.query('SELECT amount::text, reference_number FROM share_contributions WHERE member_id = $1', [pia])).rows;
+  assert.deepEqual(shares, [{ amount: '250.00', reference_number: 'OR-DUES-1' }]);
+  assert.equal((await pool.query('SELECT share_capital::text FROM members WHERE id = $1', [pia])).rows[0].share_capital, '250.00');
+  assert.deepEqual((await pool.query(`SELECT transaction_type, amount::text FROM savings_transactions WHERE member_id = $1`, [pia])).rows, [{ transaction_type: 'deposit', amount: '50.00' }]);
+  const link = (await pool.query('SELECT share_contribution_id, savings_transaction_id FROM member_dues_payments WHERE member_id = $1', [pia])).rows[0];
+  assert.ok(link.share_contribution_id && link.savings_transaction_id);
+  assert.equal((await admin.post('/api/dues/payments', { memberId: pia, dueIds: piaDues })).status, 409, 'already paid');
+  assert.match((await notes(piaLogin.userId, 'dues_paid'))[0].message, /^A payment of PHP 300\.00 for 2 dues was recorded/);
+
+  // Waiving Rex's fine needs a reason; a transfer fee for Quin is PHP 500.
+  const rexFine = (await duesOf(rex)).find((due) => due.kind === 'absence_fine').id;
+  assert.equal((await admin.patch(`/api/dues/${rexFine}/waive`, { reason: '' })).status, 400);
+  const waived = await admin.patch(`/api/dues/${rexFine}/waive`, { reason: 'Board excused: flooded road' });
+  assert.equal(waived.status, 200, JSON.stringify(waived.data));
+  assert.deepEqual([waived.data.summary.unpaid, waived.data.summary.waived], [300, 250]);
+  assert.equal((await admin.patch(`/api/dues/${rexFine}/waive`, { reason: 'again' })).status, 409);
+  assert.equal((await admin.post('/api/dues/transfer-fee', { memberId: quin })).status, 400, 'who it is transferred to');
+  const fee = await admin.post('/api/dues/transfer-fee', { memberId: quin, transferTo: 'Rosa Bayad (daughter)' });
+  assert.equal(fee.status, 201, JSON.stringify(fee.data));
+  assert.deepEqual(fee.data.dues.filter((due) => due.kind === 'transfer_fee').map((due) => [due.amount, due.status, due.description]), [[500, 'unpaid', 'Transfer fee: membership transferred to Rosa Bayad (daughter)']]);
+  const quinDetail = await admin.get(`/api/dues/members/${quin}`);
+  assert.deepEqual([quinDetail.data.member.memberNumber, quinDetail.data.summary.unpaid, quinDetail.data.summary.unpaidFees], ['DUE-002', 800, 500]);
+  const settled = await admin.get('/api/dues?filter=settled&search=DUE-00');
+  assert.deepEqual(settled.data.data.map((row) => row.memberNumber), ['DUE-001']);
+
+  // A meeting finalized before dues were kept can be charged from the Dues page, once.
+  const older = (await admin.post('/api/attendance/activities', { ...meeting, title: 'Older Meeting', activityDate: shift(-30) })).data.data.id;
+  assert.equal((await admin.post(`/api/attendance/activities/${older}/finalize`)).status, 200);
+  await pool.query('DELETE FROM member_dues WHERE activity_id = $1', [older]);
+  await pool.query('UPDATE activities SET dues_charged_at = NULL WHERE id = $1', [older]);
+  const listed = (await admin.get('/api/dues/meetings')).data.data.find((row) => row.id === older);
+  assert.deepEqual([listed.duesChargedAt, listed.members, listed.absent], [null, 3, 3]);
+  const charge = await admin.post(`/api/dues/meetings/${older}/charge`);
+  assert.equal(charge.status, 201, JSON.stringify(charge.data));
+  assert.deepEqual([charge.data.data.members, charge.data.data.added], [3, 9]);
+  assert.equal((await admin.post(`/api/dues/meetings/${older}/charge`)).status, 409);
+  assert.equal((await admin.post(`/api/dues/meetings/${upcoming.data.data.id}/charge`)).status, 400, 'a meeting that did not take place');
+
+  // Unpaid for over a week: reminded once a month (notification and email).
+  await refreshDuesReminders();
+  await refreshDuesReminders();
+  const reminders = await notes(rexLogin.userId, 'dues_reminder');
+  assert.equal(reminders.length, 1);
+  assert.match(reminders[0].message, /^You have 5 unpaid dues totalling PHP 850\.00, the oldest from .+\. Please pay at the ACIFAC office\.$/);
+  await waitForMail((mail) => mail.to === 'rex.dues@example.com' && mail.subject === 'ACIFAC: unpaid dues');
+  assert.equal((await notes(piaLogin.userId, 'dues_reminder')).length, 1, 'Pia owes the older meeting\'s dues');
+
+  // The database keeps dues consistent.
+  await assert.rejects(pool.query(`INSERT INTO member_dues (member_id, kind, amount, due_date) VALUES ($1, 'share_capital', 250, $2)`, [pia, today]), /member_dues_meeting_kinds/);
+  await assert.rejects(pool.query(`UPDATE member_dues SET waived_at = NOW(), waive_reason = ' ' WHERE id = $1`, [piaDues[1]]), /member_dues_/);
+  await assert.rejects(pool.query(`INSERT INTO member_dues (member_id, kind, amount, due_date, activity_id) VALUES ($1, 'savings', 50, $2, $3)`, [pia, today, id]), (error) => error.code === '23505');
+});
+
+test('phone notifications: a browser subscribes, each notification is pushed once, browsers that are gone are dropped', { skip }, async () => {
+  const crypto = await import('node:crypto');
+  const { flushPushOutbox, setPushSenderForTesting } = await import('../src/services/pushService.js');
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const { hashPassword } = await import('../src/utils/password.js');
+  const pabloId = (await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status)
+     VALUES ('PUSH-001', 'Pablo', 'Tulak', 'pablo.tulak@example.com', '09170004444', 'Purok 8', '2020-01-01', 0, 'active') RETURNING id`
+  )).rows[0].id;
+  const pabloUserId = (await pool.query(`INSERT INTO users (member_id, username, email, password_hash, role, account_status) VALUES ($1, 'pablo.tulak', NULL, $2, 'MEMBER', 'ACTIVE') RETURNING id`, [pabloId, await hashPassword('PabloPass1!')])).rows[0].id;
+  const phone = new Client('10.0.40.1');
+  assert.equal((await phone.post('/api/auth/login', { usernameOrEmail: 'pablo.tulak', password: 'PabloPass1!' })).status, 200);
+  const sent = [];
+  let answer = { ok: true, status: 201, gone: false };
+  setPushSenderForTesting(async (subscription, payload, vapid) => { sent.push({ endpoint: subscription.endpoint, payload, vapid }); return answer; });
+  try {
+    const key = await phone.get('/api/push/key');
+    assert.equal(key.status, 200, JSON.stringify(key.data));
+    assert.equal(Buffer.from(key.data.publicKey, 'base64url').length, 65);
+    assert.equal((await admin.get('/api/push/key')).data.publicKey, key.data.publicKey, 'one server key');
+    const browser = crypto.createECDH('prime256v1');
+    browser.generateKeys();
+    const keys = { p256dh: browser.getPublicKey().toString('base64url'), auth: crypto.randomBytes(16).toString('base64url') };
+    assert.equal((await phone.post('/api/push/subscriptions', { endpoint: 'https://push.example.com/abc', keys })).status, 400, 'only the browsers\' push services');
+    assert.equal((await phone.post('/api/push/subscriptions', { endpoint: 'https://fcm.googleapis.com/fcm/send/abc', keys: { p256dh: 'short', auth: keys.auth } })).status, 400);
+    assert.equal((await new Client().post('/api/push/subscriptions', { endpoint: 'https://fcm.googleapis.com/fcm/send/abc', keys })).status, 401);
+    await flushPushOutbox();
+    sent.length = 0;
+    const endpoint = 'https://fcm.googleapis.com/fcm/send/pablo-phone';
+    assert.equal((await phone.post('/api/push/subscriptions', { endpoint, keys })).status, 201);
+    assert.equal((await phone.get('/api/push/key')).data.devices, 1);
+
+    // A request that notifies the member sends it to the phone after the response.
+    const changesBefore = Number((await pool.query(`SELECT COUNT(*) FROM data_changes WHERE table_name = 'notifications'`)).rows[0].count);
+    const contribution = await admin.post(`/api/members/${pabloId}/share-contributions`, { amount: '10', contributionDate: todayDateOnly(), paymentMethod: 'Cash' });
+    assert.equal(contribution.status, 201, JSON.stringify(contribution.data));
+    const deadline = Date.now() + 5000;
+    while (!sent.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    await flushPushOutbox();
+    assert.equal(sent.length, 1, JSON.stringify(sent));
+    assert.deepEqual([sent[0].endpoint, sent[0].payload.title, sent[0].payload.link, sent[0].vapid.publicKey], [endpoint, 'Share contribution recorded', '/member-profile', key.data.publicKey]);
+    assert.match(sent[0].payload.body, /^A contribution of PHP 10\.00 was recorded/);
+    await flushPushOutbox();
+    assert.equal(sent.length, 1, 'pushed once');
+    assert.equal(Number((await pool.query(`SELECT COUNT(*) FROM data_changes WHERE table_name = 'notifications'`)).rows[0].count) - changesBefore, 1, 'marking it pushed is not a change the page reloads for');
+    assert.equal((await pool.query(`SELECT COUNT(*)::int AS n FROM notifications WHERE user_id = $1 AND pushed_at IS NULL`, [pabloUserId])).rows[0].n, 0);
+
+    // The push service says the browser is gone: the subscription is deleted.
+    answer = { ok: false, status: 410, gone: true };
+    await pool.query(`INSERT INTO notifications (user_id, type, title, message) VALUES ($1, 'test', 'Gone test', 'x')`, [pabloUserId]);
+    await flushPushOutbox();
+    assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM push_subscriptions WHERE endpoint = $1', [endpoint])).rows[0].n, 0);
+
+    // Turning it off on a device removes only that device.
+    answer = { ok: true, status: 201, gone: false };
+    assert.equal((await phone.post('/api/push/subscriptions', { endpoint, keys })).status, 201);
+    assert.equal((await phone.post('/api/push/subscriptions/remove', { endpoint })).status, 200);
+    assert.equal((await phone.get('/api/push/key')).data.devices, 0);
+    // A notification already more than a day old when first seen is not pushed.
+    assert.equal((await phone.post('/api/push/subscriptions', { endpoint, keys })).status, 201);
+    sent.length = 0;
+    await pool.query(`INSERT INTO notifications (user_id, type, title, message, created_at) VALUES ($1, 'test', 'Old one', 'x', NOW() - INTERVAL '2 days')`, [pabloUserId]);
+    await flushPushOutbox();
+    assert.equal(sent.length, 0);
+    assert.equal((await phone.post('/api/push/subscriptions/remove', { endpoint })).status, 200);
+  } finally {
+    setPushSenderForTesting(null);
+  }
+});
+
+test('receipts name the encoder; machinery payments are told to the member; loyalty standing and milestones', { skip }, async () => {
+  const { hashPassword } = await import('../src/utils/password.js');
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const { refreshLoyaltyMilestones } = await import('../src/services/loyalty.js');
+  const today = todayDateOnly();
+  const shift = (days) => new Date(Date.parse(`${today}T00:00:00Z`) + days * 86400000).toISOString().slice(0, 10);
+
+  // An office account with a name and position, and a member who joined exactly 5 years ago.
+  await pool.query(`INSERT INTO users (username, email, password_hash, role, account_status, must_change_password, full_name, position)
+                    VALUES ('lorna.encoder', 'lorna@acifac.local', $1, 'ADMIN', 'ACTIVE', FALSE, 'Lorna Cruz', 'Treasurer')`, [await hashPassword('LornaPass1!')]);
+  const office = new Client('10.0.50.1');
+  assert.equal((await office.post('/api/auth/login', { usernameOrEmail: 'lorna.encoder', password: 'LornaPass1!' })).status, 200);
+  const memberId = (await pool.query(
+    `INSERT INTO members (member_number, first_name, last_name, email, phone, address, membership_date, share_capital, status)
+     VALUES ('RCPT-001', 'Rita', 'Resibo', 'rita.resibo@example.com', '09170005555', 'Purok 9', ((NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '5 years')::date, 0, 'active') RETURNING id`
+  )).rows[0].id;
+  const userId = (await pool.query(`INSERT INTO users (member_id, username, email, password_hash, role, account_status) VALUES ($1, 'rita.resibo', NULL, $2, 'MEMBER', 'ACTIVE') RETURNING id`, [memberId, await hashPassword('RitaPass1!')])).rows[0].id;
+  const rita = new Client('10.0.50.2');
+  assert.equal((await rita.post('/api/auth/login', { usernameOrEmail: 'rita.resibo', password: 'RitaPass1!' })).status, 200);
+  const notes = async (type) => (await pool.query('SELECT title, message, link FROM notifications WHERE user_id = $1 AND type = $2 ORDER BY id', [userId, type])).rows;
+
+  // A savings deposit: the member's receipt names the person who recorded it.
+  assert.equal((await office.post('/api/members/savings', { memberId, amount: '500', date: today, paymentMethod: 'Cash', reference: 'OR-RC-1' })).status, 201);
+  const mine = (await rita.get('/api/members/me')).data.data;
+  assert.deepEqual([mine.savings.transactions[0].recordedBy, mine.savings.transactions[0].recordedByPosition], ['Lorna Cruz', 'Treasurer']);
+  const officeView = (await office.get(`/api/members/${memberId}/savings`)).data.data[0];
+  assert.deepEqual([officeView.recordedBy, officeView.recordedByPosition], ['Lorna Cruz', 'Treasurer']);
+
+  // Machinery: a fee paid in part when the work is recorded, then more, then a payment voided; the member is told each time.
+  const recorded = await office.post('/api/machinery/services', {
+    machineryId: 'RT-01', serviceType: 'Rotavator', serviceDate: '2026-06-10', croppingPeriod: '1st', year: 2026,
+    clientCategory: 'member', memberDatabaseId: memberId, areaHa: '1', amountPaid: '1000', paymentDate: '2026-06-10',
+  });
+  assert.equal(recorded.status, 201, JSON.stringify(recorded.data));
+  const serviceId = recorded.data.service.id;
+  assert.equal(recorded.data.service.feeAmount, '3800.00');
+  const paid = await office.post(`/api/machinery/services/${serviceId}/payments`, { amount: '800', paymentDate: '2026-06-15' });
+  assert.equal(paid.status, 201, JSON.stringify(paid.data));
+  assert.deepEqual(paid.data.payments.map((payment) => [payment.amount, payment.recordedBy, payment.recordedByPosition]), [['1000.00', 'Lorna Cruz', 'Treasurer'], ['800.00', 'Lorna Cruz', 'Treasurer']]);
+  const told = await notes('machinery_payment');
+  assert.equal(told.length, 2);
+  assert.equal(told[0].title, 'Machinery payment recorded');
+  assert.equal(told[1].message, 'A payment of PHP 800.00 for Rotavator by Rotavator w/ Tractor 1 on June 10, 2026 was recorded on June 15, 2026. Balance: PHP 2,000.00.');
+  assert.equal(told[1].link, '/transaction');
+  await waitForMail((mail) => mail.to === 'rita.resibo@example.com' && mail.subject === 'ACIFAC machinery payment recorded' && /PHP 800\.00/.test(mail.text));
+  const history = (await rita.get('/api/members/me')).data.data.machineryPayments;
+  assert.deepEqual(history.map((row) => [row.amount, row.balanceAfter, row.serviceType, row.machineryName, row.recordedBy]), [
+    ['800.00', '2000.00', 'Rotavator', 'Rotavator w/ Tractor 1', 'Lorna Cruz'], ['1000.00', '2800.00', 'Rotavator', 'Rotavator w/ Tractor 1', 'Lorna Cruz'],
+  ]);
+  const voided = await office.request('DELETE', `/api/machinery/services/${serviceId}/payments/${paid.data.payments[1].id}`);
+  assert.equal(voided.status, 200, JSON.stringify(voided.data));
+  assert.match((await notes('machinery_payment_voided'))[0].message, /^The PHP 800\.00 payment of June 15, 2026 for Rotavator .* was cancelled by the office\. Balance: PHP 2,800\.00\.$/);
+  // A non-member's payment tells nobody.
+  const before = Number((await pool.query(`SELECT COUNT(*) FROM notifications WHERE type = 'machinery_payment'`)).rows[0].count);
+  const guest = await office.post('/api/machinery/services', {
+    machineryId: 'RT-01', serviceType: 'Rotavator', serviceDate: '2026-06-11', croppingPeriod: '1st', year: 2026,
+    clientCategory: 'non_member', clientName: 'Walang Account', areaHa: '1', amountPaid: '500',
+  });
+  assert.equal(guest.status, 201, JSON.stringify(guest.data));
+  assert.equal(Number((await pool.query(`SELECT COUNT(*) FROM notifications WHERE type = 'machinery_payment'`)).rows[0].count), before);
+
+  // Loyalty: 5 years today is a milestone, told once (notification and email).
+  await refreshLoyaltyMilestones();
+  await refreshLoyaltyMilestones();
+  const milestone = await notes('loyalty_milestone');
+  assert.equal(milestone.length, 1);
+  assert.equal(milestone[0].title, '5 years as a member');
+  assert.match(milestone[0].message, /^Congratulations! On .+ you completed 5 years as a member of ACIFAC\./);
+  await waitForMail((mail) => mail.to === 'rita.resibo@example.com' && mail.subject === 'ACIFAC: 5 years as a member');
+
+  // Good standing: no activity to attend and no late payment.
+  const standing = async (query = '') => (await office.get(`/api/members/loyalty?asOf=${today}${query}`)).data.data.members.find((row) => row.id === memberId);
+  let row = await standing();
+  assert.deepEqual([row.years, row.standing.goodStanding, row.standing.attendanceRate, row.standing.reasons], [5, true, null, []]);
+  // Missing the one activity she had to attend in the last 12 months takes her out of good standing.
+  const training = (await office.post('/api/attendance/activities', { title: 'Loyalty Test Training', category: 'education_training', activityDate: shift(-3), startTime: '08:00', endTime: '10:00', venue: 'Hall', attendeeScope: 'selected', memberIds: [memberId] })).data.data.id;
+  assert.equal((await office.post(`/api/attendance/activities/${training}/finalize`)).status, 200);
+  row = await standing();
+  assert.deepEqual([row.standing.goodStanding, row.standing.attended, row.standing.eligible, row.standing.attendanceRate], [false, 0, 1, 0]);
+  assert.deepEqual(row.standing.reasons, ['Attended 0 of 1 activities (0%, 75% needed)']);
+  assert.equal((await standing('&minAttendance=0')).standing.goodStanding, true, 'the office can lower the attendance needed');
+  assert.equal((await office.get(`/api/members/loyalty?asOf=${today}&minAttendance=120`)).status, 400);
 });

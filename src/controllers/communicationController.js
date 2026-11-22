@@ -2,6 +2,9 @@ import { query, withTransaction } from '../config/db.js';
 import { createAuditLog } from '../utils/audit.js';
 import { badRequest, cleanString, currentUserId, getRequestMeta, notFound, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { createNotifications } from '../services/notificationService.js';
+import { announcementEmail } from '../services/emailTemplates.js';
+import { bulkEmailRecipients, emailInBulk } from '../services/memberEmails.js';
+import { todayDateOnly } from '../utils/dates.js';
 import { assertValidUpload, BUCKETS, removeFile, safeOriginalName, sendStoredFile, uploadFile } from '../services/storage.js';
 import { DOCUMENT_TYPES } from '../middleware/upload.js';
 
@@ -42,6 +45,8 @@ export async function markAllNotificationsRead(req, res) {
 const AUDIENCES = ['All', 'Members Only', 'Admins Only', 'Vendors Only'];
 const AUDIENCE_ROLE = { 'Members Only': 'MEMBER', 'Admins Only': 'ADMIN', 'Vendors Only': 'VENDOR' };
 const readAudience = (value) => (value === 'All Members' ? 'All' : AUDIENCES.includes(value) ? value : null);
+// The audiences whose announcements members also get by email.
+const MEMBER_AUDIENCES = ['All', 'Members Only'];
 // The audiences a role sees: an administrator sees every announcement.
 export const audiencesFor = (role) => (role === 'ADMIN' ? AUDIENCES : ['All', ...Object.keys(AUDIENCE_ROLE).filter((audience) => AUDIENCE_ROLE[audience] === role)]);
 
@@ -90,7 +95,16 @@ export async function createAnnouncement(req, res) {
     await createAuditLog({ client, user: req.user, action: 'ANNOUNCEMENT_CREATED', module: 'Announcements', entityType: 'announcement', entityId: String(inserted.id), description: `Posted announcement "${title}"`, newValues: { title, audience }, ...getRequestMeta(req) });
     return inserted;
   });
-  return res.status(201).json({ success: true, data: announcement, message: 'Announcement posted.' });
+  // One for all or for members is also emailed to the active members, with or
+  // without a login (after the response; see memberEmails.emailInBulk).
+  const addresses = MEMBER_AUDIENCES.includes(audience)
+    ? await bulkEmailRecipients(null).catch((error) => { console.error('Announcement email recipients:', error.message); return []; })
+    : [];
+  void emailInBulk(addresses, announcementEmail({ title, message, postedOn: todayDateOnly(), postedBy: cleanString(req.user?.full_name, 200) }));
+  return res.status(201).json({
+    success: true, data: announcement, emailedMembers: addresses.length,
+    message: addresses.length ? `Announcement posted. It is being emailed to ${addresses.length} ${addresses.length === 1 ? 'member' : 'members'}.` : 'Announcement posted.',
+  });
 }
 
 // PATCH /api/announcements/:id/done: the announcement has served its purpose

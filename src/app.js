@@ -19,6 +19,10 @@ import orgChartRoutes from './routes/orgChartRoutes.js';
 import aboutRoutes from './routes/aboutRoutes.js';
 import policyRoutes from './routes/policyRoutes.js';
 import { announcementRoutes, eventRoutes, legalDocumentRoutes, notificationRoutes } from './routes/communicationRoutes.js';
+import { duesRoutes, pushRoutes } from './routes/duesRoutes.js';
+import { flushPushOutbox, pushAfterResponse } from './services/pushService.js';
+import { refreshDuesReminders } from './services/dues.js';
+import { refreshLoyaltyMilestones } from './services/loyalty.js';
 import { isListening } from './services/events.js';
 import { refreshLoanStatuses } from './services/loanService.js';
 import { refreshRentalStatuses } from './controllers/machineryController.js';
@@ -65,8 +69,9 @@ export function createApp() {
     if (!secret || req.headers.authorization !== `Bearer ${secret}`) {
       return res.status(401).json({ success: false, message: 'Unauthorized.' });
     }
-    await Promise.all([refreshLoanStatuses({ force: true }), refreshRentalStatuses()]);
+    await Promise.all([refreshLoanStatuses({ force: true }), refreshRentalStatuses(), refreshDuesReminders(), refreshLoyaltyMilestones()]);
     await flushSmsOutbox();
+    await flushPushOutbox();
     // Scans still queued for another AI reading (the OCR Scanner page also reads them while it is open).
     await retryDueScans({ limit: 1 }).catch((error) => console.warn('OCR retry queue:', error.message));
     return res.status(200).json({ ok: true });
@@ -82,6 +87,8 @@ export function createApp() {
     message: { success: false, message: 'Too many requests. Please slow down.' },
   }));
   app.use('/api', noStore, csrfProtection);
+  // Notifications a request created also go to the phones that turned them on.
+  app.use('/api', pushAfterResponse);
 
   app.use('/api/auth', authRoutes);
   app.use('/api/admin', adminRoutes);
@@ -99,6 +106,8 @@ export function createApp() {
   app.use('/api/announcements', announcementRoutes);
   app.use('/api/legal-documents', legalDocumentRoutes);
   app.use('/api/events', eventRoutes);
+  app.use('/api/dues', duesRoutes);
+  app.use('/api/push', pushRoutes);
 
   app.use('/api', (req, res) => res.status(404).json({ success: false, message: 'Endpoint not found.' }));
   app.use(errorHandler);

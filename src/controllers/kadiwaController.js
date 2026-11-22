@@ -8,6 +8,7 @@ import { goodsForForm, parseExpenseLines, parseGoodsLines, presentSaleLines, sal
 import { formatDateOnly, isValidDateOnly, todayDateOnly } from '../utils/dates.js';
 import { PESOS_PER_BUSINESS_POINT } from '../services/patronage.js';
 import { kadiwaProductAnalytics, kadiwaSalesTrend } from '../services/kadiwaProducts.js';
+import { recorderName } from '../utils/people.js';
 
 const CATEGORIES = ['Groceries', 'Vegetables', 'Meat', 'Other'];
 const CATEGORY_COLUMN = { Groceries: 'groceries', Vegetables: 'vegetables', Meat: 'meat', Other: null };
@@ -240,7 +241,9 @@ export async function listKadiwaSales(req, res) {
 // and for how much (their patronage business); together never more than the day's sales.
 // pending: a vendor's sale, counted nowhere until an administrator confirms it.
 // branchId: the branch where it was sold; store items come from its stock only.
-export async function insertKadiwaSale(client, req, { encoderName, saleDate = null, manual, expensesCents, items, goods = [], expenseLines = [], memberPurchases = [], pending = false, branchId = MAIN_BRANCH_ID }) {
+// preparedOnPaper: the name written on a scanned paper form, kept in the audit
+// log (the sale itself is recorded under the account that saved it).
+export async function insertKadiwaSale(client, req, { encoderName, preparedOnPaper = '', saleDate = null, manual, expensesCents, items, goods = [], expenseLines = [], memberPurchases = [], pending = false, branchId = MAIN_BRANCH_ID }) {
   const totals = { ...manual };
   for (const good of goods) totals[good.category] = (totals[good.category] || 0) + toCents(good.amount);
   const lines = [];
@@ -357,9 +360,9 @@ export async function insertKadiwaSale(client, req, { encoderName, saleDate = nu
     module: 'Kadiwa',
     entityType: 'kadiwa_sale',
     entityId: id,
-    description: pending ? `Vendor ${encoderName} sent Kadiwa sale ${id} for review` : `Recorded Kadiwa sale ${id}${encoderName ? ` by ${encoderName}` : ''}`,
+    description: pending ? `Vendor ${encoderName} sent Kadiwa sale ${id} for review` : `Recorded Kadiwa sale ${id}${encoderName ? ` by ${encoderName}` : ''}${preparedOnPaper && preparedOnPaper !== encoderName ? ` (prepared by ${preparedOnPaper} on the paper form)` : ''}`,
     newValues: {
-      seller: encoderName, branch_id: branchId, sale_date: saleDate, total_expenses: centsToString(expensesCents), cost_of_goods: centsToString(costCents), net_sales: centsToString(net),
+      seller: encoderName, ...(preparedOnPaper ? { prepared_on_paper: preparedOnPaper } : {}), branch_id: branchId, sale_date: saleDate, total_expenses: centsToString(expensesCents), cost_of_goods: centsToString(costCents), net_sales: centsToString(net),
       // The capital changes only when the sale counts: now, or when an administrator confirms a vendor's sale.
       ...(pending ? { status: 'pending' } : { capital_change: capitalChange(net) }),
       goods: goods.map((good) => ({ name: good.name, amount: good.amount })),
@@ -428,8 +431,8 @@ function parseSaleDate(value) {
 // each with what it was for and the amount; required with the goods, their sum
 // is the sale's expenses). Store items sold from the inventory (`items`)
 // decrement the stock and count as GROCERIES. The older per-category amounts
-// and `totalExpenses` are still accepted. A seller name is optional: without
-// one, the sale is recorded under the name of the person who saves it.
+// and `totalExpenses` are still accepted. The seller is the person who saves
+// the sale; a typed name is not taken.
 // Store items sold from the inventory: [{ inventoryId, quantity }].
 function parseStoreItems(value) {
   const rawItems = Array.isArray(value) ? value.slice(0, 100) : [];
@@ -450,10 +453,11 @@ function readSaleBody(body, { expensesOptional = false } = {}) {
   return { saleDate: parseSaleDate(body.saleDate), goods, expenseLines: expenseLines || [], expensesCents };
 }
 
+// The seller is always the person who saves the sale (their account's name);
+// a typed seller name (sellerName, encoderName) is ignored.
 export async function createKadiwaSale(req, res) {
   const body = req.body || {};
-  const sellerName = cleanString(body.sellerName ?? body.encoderName, 200)
-    || cleanString(req.user?.full_name ?? '', 200) || cleanString(req.user?.username ?? '', 200) || 'Administrator';
+  const sellerName = recorderName(req.user).slice(0, 200);
   const { saleDate, goods, expenseLines, expensesCents } = readSaleBody(body);
   const manual = {};
   for (const [field, category] of [['groceriesPrice', 'Groceries'], ['vegetablesPrice', 'Vegetables'], ['meatPrice', 'Meat']]) {

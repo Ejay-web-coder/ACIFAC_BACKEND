@@ -13,7 +13,8 @@ import '../src/config/env.js';
 //  - the sample members (registered by the seeder, emails @example.com) and
 //    everything that points at them, also if it was recorded later through the
 //    app: their logins, loans and applications, payments, savings, share
-//    capital, rentals, machinery services, attendance and notifications;
+//    capital, dues and dues payments, rentals, machinery services, attendance
+//    and notifications (the seeder's bag sales go as its own rows);
 //  - the seeder's Kadiwa products, by the moment the seeder created them. A
 //    product that real sales sold is only marked deleted, as the inventory's own
 //    Delete does, so those sales keep their lines.
@@ -83,6 +84,8 @@ async function removeSampleData(client) {
      SELECT id FROM machinery_operations
      WHERE member_id IN (SELECT id FROM sample_members) OR rental_request_id IN (SELECT id FROM sample_rentals) OR ${seeded()}`, [runs]
   );
+  // Bag sales the seeder wrote (palay of its harvest fees).
+  if (await tableExists(client, 'machinery_bag_sales')) await run('bag sales', `DELETE FROM machinery_bag_sales WHERE ${seeded()}`, [runs]);
   await run('machinery rental payments', 'DELETE FROM machinery_rental_payments WHERE operation_id IN (SELECT id FROM sample_operations)');
   await run('machinery bookings', 'DELETE FROM machinery_operations WHERE id IN (SELECT id FROM sample_operations)');
   await run('machinery services (with their payments)', `DELETE FROM machinery_services WHERE member_id IN (SELECT id FROM sample_members) OR ${seeded()}`, [runs]);
@@ -104,10 +107,17 @@ async function removeSampleData(client) {
   await run('loans', 'DELETE FROM loans WHERE id IN (SELECT id FROM sample_loans)');
   await run('loan applications', 'DELETE FROM loan_requests WHERE id IN (SELECT id FROM sample_requests)');
 
+  // Dues of the sample members and of the seeder's meetings, then their payments
+  // (a payment's share capital and savings parts go with the savings and share capital below).
+  await client.query(`CREATE TEMP TABLE sample_activities ON COMMIT DROP AS SELECT id FROM activities WHERE ${seeded()}`, [runs]);
+  if (await tableExists(client, 'member_dues')) {
+    await run('dues', 'DELETE FROM member_dues WHERE member_id IN (SELECT id FROM sample_members) OR activity_id IN (SELECT id FROM sample_activities)');
+    await run('dues payments', 'DELETE FROM member_dues_payments WHERE member_id IN (SELECT id FROM sample_members)');
+  }
+
   // Savings, share capital, attendance; the seeder's activities with everyone's attendance at them.
   await run('savings transactions', 'DELETE FROM savings_transactions WHERE member_id IN (SELECT id FROM sample_members)');
   await run('share capital contributions', 'DELETE FROM share_contributions WHERE member_id IN (SELECT id FROM sample_members)');
-  await client.query(`CREATE TEMP TABLE sample_activities ON COMMIT DROP AS SELECT id FROM activities WHERE ${seeded()}`, [runs]);
   await run('attendance records', 'DELETE FROM activity_attendance WHERE member_id IN (SELECT id FROM sample_members) OR activity_id IN (SELECT id FROM sample_activities)');
   await run('activities', 'DELETE FROM activities WHERE id IN (SELECT id FROM sample_activities)');
   await run('announcements', `DELETE FROM announcements WHERE ${seeded()}`, [runs]);
@@ -138,17 +148,32 @@ async function removeSampleData(client) {
   const realAfter = await realCounts(client);
   const changed = Object.keys(realBefore).filter((key) => realBefore[key] !== realAfter[key]);
   if (changed.length) throw new Error(`Stopped: real records would change (${changed.map((key) => `${key} ${realBefore[key]} -> ${realAfter[key]}`).join(', ')}). Nothing was removed.`);
-  return { removed, runs, realAfter };
+  // Real bag sales may have sold bags of the sample harvests: then Bag Sales would show fewer than none on hand.
+  let warning = null;
+  if (await tableExists(client, 'machinery_bag_sales')) {
+    const stock = (await client.query(
+      `SELECT (SELECT COALESCE(SUM(ROUND(s.amount_paid / s.bag_value, 2)), 0) FROM machinery_services s WHERE s.unit IN ('per_100_bags', 'bags_per_ha') AND s.bag_value > 0)
+              - (SELECT COALESCE(SUM(bags), 0) FROM machinery_bag_sales) AS on_hand`
+    )).rows[0].on_hand;
+    if (Number(stock) < 0) warning = `Warning: after this, Bag Sales would show ${stock} bags on hand (real sales sold bags of the sample harvests).`;
+  }
+  return { removed, runs, realAfter, warning };
+}
+
+async function tableExists(client, table) {
+  return Boolean((await client.query('SELECT to_regclass($1) AS t', [`public.${table}`])).rows[0].t);
 }
 
 // Records that are not sample data, counted before and after: they must not change.
 async function realCounts(client) {
+  const dues = await tableExists(client, 'member_dues');
   const row = (await client.query(
     `SELECT (SELECT COUNT(*) FROM members WHERE id NOT IN (SELECT id FROM sample_members))::int AS members,
             (SELECT COUNT(*) FROM users WHERE id NOT IN (SELECT id FROM sample_users))::int AS logins,
             (SELECT COUNT(*) FROM loans WHERE member_id IS NOT NULL AND member_id NOT IN (SELECT id FROM sample_members))::int AS "member loans",
             (SELECT COUNT(*) FROM savings_transactions WHERE member_id NOT IN (SELECT id FROM sample_members))::int AS "member savings",
             (SELECT COUNT(*) FROM share_contributions WHERE member_id NOT IN (SELECT id FROM sample_members))::int AS "member share capital",
+            ${dues ? '(SELECT COUNT(*) FROM member_dues WHERE member_id NOT IN (SELECT id FROM sample_members))::int' : '0'} AS "member dues",
             (SELECT COUNT(*) FROM machinery)::int AS machines,
             (SELECT COUNT(*) FROM machinery_service_rates)::int AS "machinery rates",
             (SELECT COUNT(*) FROM document_scans)::int AS "document scans"`
@@ -168,6 +193,7 @@ try {
     console.log(`${apply ? 'Removed' : 'Would remove'} from ${host} (seeder runs: ${result.runs.length}):`);
     for (const [label, count] of result.removed) console.log(`  ${String(count).padStart(6)}  ${label}`);
     console.log(`Real records kept: ${Object.entries(result.realAfter).map(([key, value]) => `${value} ${key}`).join(', ')}.`);
+    if (result.warning) console.log(result.warning);
     if (!apply) throw new Rehearsal();
     await client.query(
       `INSERT INTO audit_logs (action, module, entity_type, description, new_values, user_agent)

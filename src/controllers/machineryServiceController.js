@@ -9,9 +9,14 @@ import { formatDateOnly, isValidDateOnly, todayDateOnly } from '../utils/dates.j
 import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import {
-  CLIENT_CATEGORIES, CROPPING_PERIODS, SERVICE_UNITS, FeeInputError, computeServiceFee, findRateForDate, fromScaled, rateForClient, toScaled,
+  BAG_UNITS, CLIENT_CATEGORIES, CROPPING_PERIODS, SEASONS, SERVICE_UNITS, FeeInputError, computeServiceFee, findRateForDate, fromScaled, rateForClient,
+  seasonForDate, toScaled,
 } from '../services/machineryFees.js';
 import { EXPENSE_CATEGORIES, buildPhilmechReport } from '../services/philmechReport.js';
+import { notifyMember } from '../services/notificationService.js';
+import { emailMember } from '../services/memberEmails.js';
+import { machineryPaymentEmail } from '../services/emailTemplates.js';
+import { displayName } from '../utils/people.js';
 
 const PAYMENT_STATUSES = ['unpaid', 'partial', 'full'];
 
@@ -19,7 +24,7 @@ const serviceSelect = `
   SELECT s.id, s.machinery_id AS "machineryId", m.name AS "machineryName", s.service_type AS "serviceType",
          s.service_date AS "serviceDate", s.cropping_period AS "croppingPeriod", s.year,
          s.client_category AS "clientCategory", s.member_id AS "memberDatabaseId", mb.member_number AS "memberNumber",
-         s.client_name AS "clientName", s.client_address AS "clientAddress", s.unit,
+         s.client_name AS "clientName", s.client_address AS "clientAddress", s.unit, s.season,
          s.area_ha AS "areaHa", s.days, s.total_bags AS "totalBags", s.fee_bags AS "feeBags",
          s.bag_value AS "bagValue", s.kg_per_bag AS "kgPerBag", s.price_per_kg AS "pricePerKg",
          s.rate_id AS "rateId", s.rate_used AS "rateUsed", s.computed_fee_amount AS "computedFeeAmount",
@@ -33,8 +38,37 @@ const serviceSelect = `
 
 const paymentSelect = `
   SELECT p.id, p.service_id AS "serviceId", p.amount, p.payment_date AS "paymentDate", p.notes,
-         u.username AS "recordedBy", p.created_at AS "createdAt"
+         ${displayName('u')} AS "recordedBy", u.position AS "recordedByPosition", p.created_at AS "createdAt"
   FROM machinery_service_payments p LEFT JOIN users u ON u.id = p.recorded_by`;
+
+const pesos = (value) => `PHP ${Number(value).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+// Tells a member about a payment for machinery work done for them (in the
+// app and on the phone; an email follows after the transaction). A
+// non-member has no account to tell.
+async function notifyMachineryPayment(client, service, { paymentId, amount, paymentDate, voided = false }) {
+  if (!service.memberDatabaseId) return;
+  const work = `${service.serviceType} by ${service.machineryName} on ${formatDateOnly(service.serviceDate)}`;
+  await notifyMember(client, service.memberDatabaseId, voided
+    ? {
+      type: 'machinery_payment_voided', title: 'Machinery payment cancelled', severity: 'warning', link: '/transaction',
+      message: `The ${pesos(amount)} payment of ${formatDateOnly(paymentDate)} for ${work} was cancelled by the office. Balance: ${pesos(service.balance)}.`,
+      entityType: 'machinery_service_payment', entityId: paymentId, dedupeKey: `machinery-payment-${paymentId}-voided`,
+    }
+    : {
+      type: 'machinery_payment', title: 'Machinery payment recorded', severity: 'success', link: '/transaction',
+      message: `A payment of ${pesos(amount)} for ${work} was recorded on ${formatDateOnly(paymentDate)}. ${Number(service.balance) > 0 ? `Balance: ${pesos(service.balance)}.` : 'The fee is fully paid.'}`,
+      entityType: 'machinery_service_payment', entityId: paymentId, dedupeKey: `machinery-payment-${paymentId}`,
+    });
+}
+
+const emailMachineryPayment = (service, payment) => {
+  if (!service.memberDatabaseId) return;
+  void emailMember(service.memberDatabaseId, (recipient) => machineryPaymentEmail({
+    memberName: recipient.full_name, amount: payment.amount, paymentDate: payment.paymentDate, serviceType: service.serviceType,
+    machineryName: service.machineryName, serviceDate: service.serviceDate, balance: service.balance, voided: payment.voided,
+  }));
+};
 
 const expenseSelect = `
   SELECT e.id, e.machinery_id AS "machineryId", m.name AS "machineryName", e.expense_date AS "expenseDate",
@@ -43,7 +77,7 @@ const expenseSelect = `
   FROM machinery_expenses e JOIN machinery m ON m.id = e.machinery_id`;
 
 const rateSelect = `
-  SELECT id, machinery_id AS "machineryId", service_type AS "serviceType", unit, member_rate AS "memberRate",
+  SELECT id, machinery_id AS "machineryId", service_type AS "serviceType", unit, season, member_rate AS "memberRate",
          non_member_rate AS "nonMemberRate", effective_from AS "effectiveFrom", effective_to AS "effectiveTo",
          (SELECT COUNT(*)::int FROM machinery_services s WHERE s.rate_id = machinery_service_rates.id) AS "servicesUsingRate"
   FROM machinery_service_rates`;
@@ -89,6 +123,15 @@ function readDecimal(value, label, scale) {
 }
 
 const feeError = (error) => (error instanceof FeeInputError ? badRequest(error.message) : error);
+const SEASON_LABELS = { dry: 'dry season', wet: 'wet season' };
+const isBagUnit = (unit) => BAG_UNITS.includes(unit);
+
+// Optional: dry or wet; empty means the season of the service date.
+function readSeason(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (!SEASONS.includes(value)) throw badRequest('Season must be the dry season or the wet season.');
+  return value;
+}
 
 // A quote only needs what the fee depends on: machine, service, date,
 // member or non-member, and the quantities.
@@ -104,6 +147,7 @@ function readServiceInput(body, { quote = false } = {}) {
     machineryId,
     serviceType,
     serviceDate,
+    season: readSeason(body.season),
     croppingPeriod: quote ? null : readPeriod(body.croppingPeriod),
     year: quote ? null : readYear(body.year),
     clientCategory,
@@ -134,8 +178,12 @@ async function priceService(db, input) {
   if (!machine) throw notFound('Machinery not found.');
   const rates = (await db.query(`${rateSelect} WHERE machinery_id = $1 AND lower(service_type) = lower($2)`, [machine.id, input.serviceType])).rows;
   if (!rates.length) throw badRequest(`${machine.name} has no ${input.serviceType} rate. Add it in the machine's rates first.`);
-  const rate = findRateForDate(rates, input.serviceType, input.serviceDate);
-  if (!rate) throw badRequest(`No ${rates[0].serviceType} rate for ${machine.name} covers ${formatDateOnly(input.serviceDate)}. Add a rate for that date first.`);
+  const season = input.season || seasonForDate(input.serviceDate);
+  const rate = findRateForDate(rates, input.serviceType, input.serviceDate, season);
+  if (!rate) {
+    const seasonal = rates.some((row) => row.season);
+    throw badRequest(`No ${rates[0].serviceType} rate${seasonal ? ` for the ${SEASON_LABELS[season]}` : ''} for ${machine.name} covers ${formatDateOnly(input.serviceDate)}. Add a rate for that date first.`);
+  }
   try {
     const fee = computeServiceFee({ unit: rate.unit, rate: rateForClient(rate, input.clientCategory), ...input });
     return { machine, rate, fee };
@@ -175,7 +223,7 @@ async function assertRentalRequest(db, rentalRequestId, machineryId) {
 }
 
 const auditService = (row) => ({
-  machinery_id: row.machineryId, service_type: row.serviceType, service_date: row.serviceDate, cropping_period: row.croppingPeriod, year: row.year,
+  machinery_id: row.machineryId, service_type: row.serviceType, service_date: row.serviceDate, season: row.season ?? null, cropping_period: row.croppingPeriod, year: row.year,
   client_category: row.clientCategory, client_name: row.clientName, area_ha: row.areaHa, total_bags: row.totalBags, fee_bags: row.feeBags,
   rate_used: row.rateUsed, fee_amount: row.feeAmount, computed_fee_amount: row.computedFeeAmount, fee_override_reason: row.feeOverrideReason,
   amount_paid: row.amountPaid, balance: row.balance, payment_status: row.paymentStatus,
@@ -188,7 +236,7 @@ export async function quoteService(req, res) {
   const { rate, fee } = await priceService({ query }, input);
   return res.json({
     success: true,
-    quote: { ...fee, unit: rate.unit, rate: { id: rate.id, serviceType: rate.serviceType, memberRate: rate.memberRate, nonMemberRate: rate.nonMemberRate, effectiveFrom: rate.effectiveFrom, effectiveTo: rate.effectiveTo } },
+    quote: { ...fee, unit: rate.unit, season: rate.season ?? null, rate: { id: rate.id, serviceType: rate.serviceType, season: rate.season ?? null, memberRate: rate.memberRate, nonMemberRate: rate.nonMemberRate, effectiveFrom: rate.effectiveFrom, effectiveTo: rate.effectiveTo } },
   });
 }
 
@@ -237,23 +285,26 @@ export async function createService(req, res) {
       `INSERT INTO machinery_services (
          machinery_id, service_type, service_date, cropping_period, year, client_category, member_id, client_name, client_address,
          unit, area_ha, days, total_bags, fee_bags, bag_value, kg_per_bag, price_per_kg, rate_id, rate_used,
-         computed_fee_amount, fee_amount, fee_override_reason, rental_request_id, recorded_by, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::numeric, 0), $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+         computed_fee_amount, fee_amount, fee_override_reason, rental_request_id, recorded_by, notes, season)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::numeric, 0), $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
        RETURNING id`,
       [machine.id, rate.serviceType, input.serviceDate, input.croppingPeriod, input.year, input.clientCategory, who.memberId, who.clientName, who.clientAddress,
-        rate.unit, input.areaHa, rate.unit === 'per_day' ? input.days : null, rate.unit === 'per_100_bags' ? input.totalBags : null, fee.feeBags, fee.bagValue,
-        rate.unit === 'per_100_bags' ? input.kgPerBag : null, rate.unit === 'per_100_bags' ? input.pricePerKg : null, rate.id, fee.rateUsed,
-        settled.computedFeeAmount, settled.feeAmount, settled.feeOverrideReason, input.rentalRequestId, currentUserId(req), input.notes]
+        rate.unit, input.areaHa, rate.unit === 'per_day' ? input.days : null, isBagUnit(rate.unit) ? input.totalBags : null, fee.feeBags, fee.bagValue,
+        isBagUnit(rate.unit) ? input.kgPerBag : null, isBagUnit(rate.unit) ? input.pricePerKg : null, rate.id, fee.rateUsed,
+        settled.computedFeeAmount, settled.feeAmount, settled.feeOverrideReason, input.rentalRequestId, currentUserId(req), input.notes, rate.season ?? null]
     );
     const id = inserted.rows[0].id;
+    let paymentId = null;
     if (amountPaid > 0) {
-      await client.query('INSERT INTO machinery_service_payments (service_id, amount, payment_date, notes, recorded_by) VALUES ($1, $2, $3, $4, $5)',
-        [id, centsToString(amountPaid), paymentDate, 'Paid when the service was recorded', currentUserId(req)]);
+      paymentId = (await client.query('INSERT INTO machinery_service_payments (service_id, amount, payment_date, notes, recorded_by) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+        [id, centsToString(amountPaid), paymentDate, 'Paid when the service was recorded', currentUserId(req)])).rows[0].id;
     }
     const row = (await client.query(`${serviceSelect} WHERE s.id = $1`, [id])).rows[0];
     await createAuditLog({ client, user: req.user, action: 'MACHINERY_SERVICE_RECORDED', module: 'Machinery', entityType: 'machinery_service', entityId: String(id), description: `Recorded ${row.serviceType} for ${row.clientName} on ${machine.name}`, newValues: auditService(row), ...getRequestMeta(req) });
+    if (paymentId) await notifyMachineryPayment(client, row, { paymentId, amount: centsToString(amountPaid), paymentDate });
     return row;
   });
+  if (amountPaid > 0) emailMachineryPayment(service, { amount: centsToString(amountPaid), paymentDate });
   return res.status(201).json({ success: true, service });
 }
 
@@ -274,12 +325,12 @@ export async function updateService(req, res) {
       `UPDATE machinery_services SET machinery_id = $2, service_type = $3, service_date = $4, cropping_period = $5, year = $6, client_category = $7,
          member_id = $8, client_name = $9, client_address = $10, unit = $11, area_ha = COALESCE($12::numeric, 0), days = $13, total_bags = $14, fee_bags = $15,
          bag_value = $16, kg_per_bag = $17, price_per_kg = $18, rate_id = $19, rate_used = $20, computed_fee_amount = $21, fee_amount = $22,
-         fee_override_reason = $23, rental_request_id = $24, notes = $25, updated_at = NOW()
+         fee_override_reason = $23, rental_request_id = $24, notes = $25, season = $26, updated_at = NOW()
        WHERE id = $1`,
       [id, machine.id, rate.serviceType, input.serviceDate, input.croppingPeriod, input.year, input.clientCategory, who.memberId, who.clientName, who.clientAddress,
-        rate.unit, input.areaHa, rate.unit === 'per_day' ? input.days : null, rate.unit === 'per_100_bags' ? input.totalBags : null, fee.feeBags, fee.bagValue,
-        rate.unit === 'per_100_bags' ? input.kgPerBag : null, rate.unit === 'per_100_bags' ? input.pricePerKg : null, rate.id, fee.rateUsed,
-        settled.computedFeeAmount, settled.feeAmount, settled.feeOverrideReason, input.rentalRequestId, input.notes]
+        rate.unit, input.areaHa, rate.unit === 'per_day' ? input.days : null, isBagUnit(rate.unit) ? input.totalBags : null, fee.feeBags, fee.bagValue,
+        isBagUnit(rate.unit) ? input.kgPerBag : null, isBagUnit(rate.unit) ? input.pricePerKg : null, rate.id, fee.rateUsed,
+        settled.computedFeeAmount, settled.feeAmount, settled.feeOverrideReason, input.rentalRequestId, input.notes, rate.season ?? null]
     );
     const row = (await client.query(`${serviceSelect} WHERE s.id = $1`, [id])).rows[0];
     await createAuditLog({ client, user: req.user, action: 'MACHINERY_SERVICE_UPDATED', module: 'Machinery', entityType: 'machinery_service', entityId: String(id), description: `Updated ${row.serviceType} service for ${row.clientName}`, oldValues: auditService(before), newValues: auditService(row), ...getRequestMeta(req) });
@@ -316,12 +367,18 @@ export async function receivePayment(req, res) {
       [id, centsToString(amount), paymentDate, notes, currentUserId(req)]
     )).rows[0];
     const service = (await client.query(`${serviceSelect} WHERE s.id = $1`, [id])).rows[0];
-    await createAuditLog({ client, user: req.user, action: 'MACHINERY_SERVICE_PAYMENT_RECEIVED', module: 'Machinery', entityType: 'machinery_service_payment', entityId: String(payment.id), description: `Received payment from ${service.clientName} for ${service.serviceType}`, oldValues: { amount_paid: before.amountPaid, balance: before.balance, payment_status: before.paymentStatus }, newValues: { amount: centsToString(amount), capital_change: capitalChange(amount), payment_date: paymentDate, amount_paid: service.amountPaid, balance: service.balance, payment_status: service.paymentStatus }, ...getRequestMeta(req) });
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_SERVICE_PAYMENT_RECEIVED', module: 'Machinery', entityType: 'machinery_service_payment', entityId: String(payment.id), description: `Received payment from ${service.clientName} for ${service.serviceType}`, oldValues: { amount_paid: before.amountPaid, balance: before.balance, payment_status: before.paymentStatus }, newValues: { amount: centsToString(amount), capital_change: capitalChange(amount), payment_date: paymentDate, amount_paid: service.amountPaid, balance: service.balance, payment_status: service.paymentStatus }, details: paymentAuditClient(service), ...getRequestMeta(req) });
+    await notifyMachineryPayment(client, service, { paymentId: payment.id, amount: centsToString(amount), paymentDate });
     return service;
   });
+  emailMachineryPayment(result, { amount: centsToString(amount), paymentDate });
   const payments = (await query(`${paymentSelect} WHERE p.service_id = $1 ORDER BY p.payment_date, p.id`, [id])).rows;
   return res.status(201).json({ success: true, service: result, payments });
 }
+
+// Who a payment was from, kept with its audit entry: a voided payment is
+// deleted, so the audit log could not find the client through it any more.
+const paymentAuditClient = (service) => ({ service_id: service.id, client_name: service.clientName, member_id: service.memberDatabaseId ?? null });
 
 export async function voidPayment(req, res) {
   const id = parseId(req.params.id, 'service ID');
@@ -332,7 +389,11 @@ export async function voidPayment(req, res) {
     if (!payment) throw notFound('Payment not found.');
     await client.query('DELETE FROM machinery_service_payments WHERE id = $1', [paymentId]);
     const service = (await client.query(`${serviceSelect} WHERE s.id = $1`, [id])).rows[0];
-    await createAuditLog({ client, user: req.user, action: 'MACHINERY_SERVICE_PAYMENT_VOIDED', module: 'Machinery', entityType: 'machinery_service_payment', entityId: String(paymentId), description: `Voided a payment from ${service.clientName} for ${service.serviceType}`, oldValues: { amount: payment.amount, payment_date: payment.payment_date, notes: payment.notes }, newValues: { capital_change: capitalChange(-toCents(payment.amount)), amount_paid: service.amountPaid, balance: service.balance, payment_status: service.paymentStatus }, ...getRequestMeta(req) });
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_SERVICE_PAYMENT_VOIDED', module: 'Machinery', entityType: 'machinery_service_payment', entityId: String(paymentId), description: `Voided a payment from ${service.clientName} for ${service.serviceType}`, oldValues: { amount: payment.amount, payment_date: payment.payment_date, notes: payment.notes }, newValues: { capital_change: capitalChange(-toCents(payment.amount)), amount_paid: service.amountPaid, balance: service.balance, payment_status: service.paymentStatus }, details: paymentAuditClient(service), ...getRequestMeta(req) });
+    await notifyMachineryPayment(client, service, { paymentId, amount: payment.amount, paymentDate: payment.payment_date, voided: true });
+    return { ...service, voidedPayment: payment };
+  }).then(({ voidedPayment, ...service }) => {
+    emailMachineryPayment(service, { amount: voidedPayment.amount, paymentDate: voidedPayment.payment_date, voided: true });
     return service;
   });
   const payments = (await query(`${paymentSelect} WHERE p.service_id = $1 ORDER BY p.payment_date, p.id`, [id])).rows;
@@ -431,7 +492,7 @@ export async function deleteExpense(req, res) {
 }
 
 // ----- Bags of palay from harvesting, and their sales -------------------------------------
-// Harvesting is charged in bags (unit per_100_bags). What a farmer has paid of
+// Harvesting is charged in bags (per 100 bags; in the wet season per hectare). What a farmer has paid of
 // a harvest fee, divided by the value of one bag, is the bags handed to the
 // cooperative; the balance is the bags still to collect. The cooperative sells
 // the bags later at the price of the day, so every sale keeps its own price.
@@ -451,9 +512,9 @@ async function bagStock(db, excludeSaleId = null) {
   const row = (await db.query(
     `SELECT
        (SELECT COALESCE(SUM(ROUND(s.amount_paid / s.bag_value, 2)), 0) FROM machinery_services s
-         WHERE s.unit = 'per_100_bags' AND s.bag_value > 0) AS received,
+         WHERE s.unit IN ('per_100_bags', 'bags_per_ha') AND s.bag_value > 0) AS received,
        (SELECT COALESCE(SUM(ROUND(s.balance / s.bag_value, 2)), 0) FROM machinery_services s
-         WHERE s.unit = 'per_100_bags' AND s.bag_value > 0) AS "toCollect",
+         WHERE s.unit IN ('per_100_bags', 'bags_per_ha') AND s.bag_value > 0) AS "toCollect",
        (SELECT COALESCE(SUM(b.bags), 0) FROM machinery_bag_sales b WHERE $1::int IS NULL OR b.id <> $1) AS sold`,
     [excludeSaleId]
   )).rows[0];
@@ -579,7 +640,7 @@ export async function deleteBagSale(req, res) {
 
 // ----- Rates ---------------------------------------------------------------------------------
 
-const auditRate =(row) => ({ machinery_id: row.machineryId, service_type: row.serviceType, unit: row.unit, member_rate: row.memberRate, non_member_rate: row.nonMemberRate, effective_from: row.effectiveFrom, effective_to: row.effectiveTo });
+const auditRate = (row) => ({ machinery_id: row.machineryId, service_type: row.serviceType, unit: row.unit, season: row.season ?? null, member_rate: row.memberRate, non_member_rate: row.nonMemberRate, effective_from: row.effectiveFrom, effective_to: row.effectiveTo });
 
 function readRateAmounts(body, partial = false) {
   const values = {};
@@ -588,14 +649,17 @@ function readRateAmounts(body, partial = false) {
   return values;
 }
 
-async function assertNoRateOverlap(db, machineryId, serviceType, from, to, excludeId = null) {
+// A dry-season and a wet-season rate may run side by side; an all-year rate
+// may not run beside either (the database trigger checks the same).
+async function assertNoRateOverlap(db, machineryId, serviceType, from, to, excludeId = null, season = null) {
   const clash = (await db.query(
     `${rateSelect} WHERE machinery_id = $1 AND lower(service_type) = lower($2) AND ($5::int IS NULL OR id <> $5)
+       AND (season IS NULL OR $6::varchar IS NULL OR season = $6)
        AND daterange(effective_from, effective_to, '[]') && daterange($3::date, $4::date, '[]') LIMIT 1`,
-    [machineryId, serviceType, from, to, excludeId]
+    [machineryId, serviceType, from, to, excludeId, season]
   )).rows[0];
   if (clash) {
-    throw conflict(`This overlaps the ${clash.serviceType} rate from ${formatDateOnly(clash.effectiveFrom)}${clash.effectiveTo ? ` to ${formatDateOnly(clash.effectiveTo)}` : ' onwards'}.`);
+    throw conflict(`This overlaps the ${clash.serviceType}${clash.season ? ` (${SEASON_LABELS[clash.season]})` : ''} rate from ${formatDateOnly(clash.effectiveFrom)}${clash.effectiveTo ? ` to ${formatDateOnly(clash.effectiveTo)}` : ' onwards'}.`);
   }
 }
 
@@ -612,7 +676,8 @@ export async function createRate(req, res) {
   const body = req.body || {};
   const serviceType = cleanString(body.serviceType, 60);
   if (!serviceType) throw badRequest('Enter the service type, e.g. Rotavator or Harvesting.');
-  if (!SERVICE_UNITS.includes(body.unit)) throw badRequest('Unit must be per hectare, per 100 bags or per day.');
+  if (!SERVICE_UNITS.includes(body.unit)) throw badRequest('Unit must be per hectare, per 100 bags, bags per hectare or per day.');
+  const season = readSeason(body.season);
   const effectiveFrom = readDate(body.effectiveFrom, 'start date', { notFuture: false });
   const effectiveTo = body.effectiveTo ? readDate(body.effectiveTo, 'end date', { notFuture: false }) : null;
   if (effectiveTo && effectiveTo < effectiveFrom) throw badRequest('The end date cannot be before the start date.');
@@ -621,8 +686,11 @@ export async function createRate(req, res) {
     const machine = await assertMachine(client, machineryId);
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`acifac-machinery-rate:${machine.id}:${serviceType.toLowerCase()}`]);
     const sameType = (await client.query(`${rateSelect} WHERE machinery_id = $1 AND lower(service_type) = lower($2) ORDER BY effective_from`, [machine.id, serviceType])).rows;
-    if (sameType.length && sameType[0].unit !== body.unit) throw badRequest(`${sameType[0].serviceType} on this machine is charged ${sameType[0].unit.replace(/_/g, ' ')}; use the same unit.`);
-    const open = sameType.find((row) => !row.effectiveTo && row.effectiveFrom < effectiveFrom);
+    // One unit per service and season (the dry and the wet season may differ).
+    const sameSeason = sameType.filter((row) => (row.season ?? null) === season);
+    if (sameSeason.length && sameSeason[0].unit !== body.unit) throw badRequest(`${sameSeason[0].serviceType}${season ? ` in the ${SEASON_LABELS[season]}` : ''} on this machine is charged ${sameSeason[0].unit.replace(/_/g, ' ')}; use the same unit.`);
+    // A new rate ends the open rate it follows: the same season's, or the all-year one when seasons begin.
+    const open = sameType.find((row) => !row.effectiveTo && row.effectiveFrom < effectiveFrom && (!row.season || row.season === season));
     if (open && !effectiveTo && body.closePrevious !== false) {
       const endDate = new Date(`${effectiveFrom}T00:00:00Z`);
       endDate.setUTCDate(endDate.getUTCDate() - 1);
@@ -630,14 +698,14 @@ export async function createRate(req, res) {
       await client.query('UPDATE machinery_service_rates SET effective_to = $2 WHERE id = $1', [open.id, closedTo]);
       await createAuditLog({ client, user: req.user, action: 'MACHINERY_RATE_UPDATED', module: 'Machinery', entityType: 'machinery_service_rate', entityId: String(open.id), description: `Ended the ${open.serviceType} rate for ${machine.name} on ${closedTo}`, oldValues: { effective_to: null }, newValues: { effective_to: closedTo }, ...getRequestMeta(req) });
     }
-    await assertNoRateOverlap(client, machine.id, serviceType, effectiveFrom, effectiveTo);
+    await assertNoRateOverlap(client, machine.id, serviceType, effectiveFrom, effectiveTo, null, season);
     const id = (await client.query(
-      `INSERT INTO machinery_service_rates (machinery_id, service_type, unit, member_rate, non_member_rate, effective_from, effective_to, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-      [machine.id, sameType[0]?.serviceType || serviceType, body.unit, amounts.memberRate, amounts.nonMemberRate, effectiveFrom, effectiveTo, currentUserId(req)]
+      `INSERT INTO machinery_service_rates (machinery_id, service_type, unit, member_rate, non_member_rate, effective_from, effective_to, created_by, season)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [machine.id, sameType[0]?.serviceType || serviceType, body.unit, amounts.memberRate, amounts.nonMemberRate, effectiveFrom, effectiveTo, currentUserId(req), season]
     )).rows[0].id;
     const row = (await client.query(`${rateSelect} WHERE id = $1`, [id])).rows[0];
-    await createAuditLog({ client, user: req.user, action: 'MACHINERY_RATE_ADDED', module: 'Machinery', entityType: 'machinery_service_rate', entityId: String(id), description: `Added ${row.serviceType} rate for ${machine.name} from ${effectiveFrom}`, newValues: auditRate(row), ...getRequestMeta(req) });
+    await createAuditLog({ client, user: req.user, action: 'MACHINERY_RATE_ADDED', module: 'Machinery', entityType: 'machinery_service_rate', entityId: String(id), description: `Added ${row.serviceType}${season ? ` (${SEASON_LABELS[season]})` : ''} rate for ${machine.name} from ${effectiveFrom}`, newValues: auditRate(row), ...getRequestMeta(req) });
     return row;
   });
   return res.status(201).json({ success: true, rate });
@@ -655,7 +723,7 @@ export async function updateRate(req, res) {
     const effectiveFrom = body.effectiveFrom !== undefined ? readDate(body.effectiveFrom, 'start date', { notFuture: false }) : before.effectiveFrom;
     const effectiveTo = body.effectiveTo !== undefined ? (body.effectiveTo ? readDate(body.effectiveTo, 'end date', { notFuture: false }) : null) : before.effectiveTo;
     if (effectiveTo && effectiveTo < effectiveFrom) throw badRequest('The end date cannot be before the start date.');
-    await assertNoRateOverlap(client, before.machineryId, before.serviceType, effectiveFrom, effectiveTo, id);
+    await assertNoRateOverlap(client, before.machineryId, before.serviceType, effectiveFrom, effectiveTo, id, before.season ?? null);
     await client.query(
       'UPDATE machinery_service_rates SET member_rate = $2, non_member_rate = $3, effective_from = $4, effective_to = $5 WHERE id = $1',
       [id, amounts.memberRate ?? before.memberRate, amounts.nonMemberRate ?? before.nonMemberRate, effectiveFrom, effectiveTo]
@@ -762,7 +830,7 @@ export async function philmechReport(req, res) {
     query(`SELECT b.machinery_id AS "machineryId", ${owner('b')} AS "reportMachineId", b.beginning_cash AS "beginningCash", b.other_income AS "otherIncome"
            FROM machinery_period_balances b JOIN machinery b_m ON b_m.id = b.machinery_id
            WHERE b.cropping_period = $1 AND b.year = $2 AND ${machineFilter('b', 3)}`, params),
-    query(`SELECT ${owner('r')} AS "reportMachineId", r.service_type AS "serviceType", r.unit, r.member_rate AS "memberRate", r.non_member_rate AS "nonMemberRate",
+    query(`SELECT ${owner('r')} AS "reportMachineId", r.service_type AS "serviceType", r.unit, r.season, r.member_rate AS "memberRate", r.non_member_rate AS "nonMemberRate",
                   r.effective_from AS "effectiveFrom", r.effective_to AS "effectiveTo"
            FROM machinery_service_rates r JOIN machinery r_m ON r_m.id = r.machinery_id
            WHERE $1::varchar IS NULL OR ${owner('r')} = $1 ORDER BY lower(r.service_type), r.effective_from`, [machineryId]),

@@ -3,6 +3,9 @@ import { createApp } from './app.js';
 import { isProduction, validateProductionEnv } from './config/env.js';
 import { startEventListener, stopEventListener } from './services/events.js';
 import { refreshLoanStatuses } from './services/loanService.js';
+import { refreshDuesReminders } from './services/dues.js';
+import { refreshLoyaltyMilestones } from './services/loyalty.js';
+import { flushPushOutbox } from './services/pushService.js';
 import { retryDueScans } from './controllers/ocrController.js';
 import { getPool } from './config/db.js';
 import { applyMigrations, autoMigrateEnabled } from './services/migrations.js';
@@ -68,9 +71,13 @@ server.listen(PORT, async () => {
   console.log(`ACIFAC backend running on port ${PORT} (${isProduction ? 'production' : 'development'})`);
 
   if (process.env.DISABLE_LIVE_UPDATES !== 'true') startEventListener();
-  // Overdue detection and payment-due reminders: once at start, then hourly.
-  void refreshLoanStatuses({ force: true });
-  loanTimer = setInterval(() => void refreshLoanStatuses({ force: true }), 60 * 60 * 1000);
+  // Overdue detection, payment-due and unpaid-dues reminders, loyalty milestones: once at start,
+  // then hourly; reminders also go to the phones that turned notifications on.
+  const hourly = () => Promise.all([refreshLoanStatuses({ force: true }), refreshDuesReminders(), refreshLoyaltyMilestones()])
+    .then(() => flushPushOutbox())
+    .catch((error) => console.error('Hourly refresh failed:', error instanceof Error ? error.message : error));
+  void hourly();
+  loanTimer = setInterval(() => void hourly(), 60 * 60 * 1000);
   loanTimer.unref();
 
   // Scans the AI could not read (it was busy) are read again by themselves.

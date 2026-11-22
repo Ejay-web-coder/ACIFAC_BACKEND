@@ -115,12 +115,23 @@ export function paymentEmail({ memberName, amount, paymentDate, loanNumber, rema
     `<p>Hello ${escapeHtml(memberName)},</p><p>Your payment of <strong>${formatAmount(amount)}</strong> for loan ${escapeHtml(loanNumber)} was recorded${penalty}.</p><p>Remaining balance: ${formatAmount(remainingBalance)} (${escapeHtml(status)}).</p>`
   );
 }
-export function rentalDecisionEmail({ machineryName, startDate, endDate, status, rentalFee }) {
+// Approved: the rental fee. Declined: the reason the office gave.
+export function rentalDecisionEmail({ machineryName, startDate, endDate, status, rentalFee, reason = '' }) {
   const decision = status === 'approved' ? 'approved' : 'declined';
+  const request = `Your rental request for ${machineryName} (${formatDateOnly(startDate)} to ${formatDateOnly(endDate)}) was ${decision}.`;
+  const requestHtml = `Your rental request for <strong>${escapeHtml(machineryName)}</strong> (${escapeHtml(formatDateOnly(startDate))} to ${escapeHtml(formatDateOnly(endDate))}) was <strong>${decision}</strong>.`;
+  if (decision === 'approved') {
+    return message(
+      'ACIFAC machinery rental approved',
+      `${request} Rental fee: ${formatAmount(rentalFee)}.`,
+      `<p>${requestHtml}</p><p>Rental fee: ${formatAmount(rentalFee)}</p>`
+    );
+  }
+  const why = reason || 'Please contact ACIFAC for more information.';
   return message(
-    `ACIFAC machinery rental ${decision}`,
-    `Your rental request for ${machineryName} (${startDate} to ${endDate}) was ${decision}. Rental fee: ${formatAmount(rentalFee)}.`,
-    `<p>Your rental request for <strong>${escapeHtml(machineryName)}</strong> (${escapeHtml(startDate)} to ${escapeHtml(endDate)}) was <strong>${decision}</strong>.</p><p>Rental fee: ${formatAmount(rentalFee)}</p>`
+    'ACIFAC machinery rental declined',
+    `${request}\n\nReason: ${why}\n\nYou can send a new request for other days under Rental Booking in the member portal, or ask the ACIFAC office.`,
+    `<p>${requestHtml}</p><p><strong>Reason:</strong> ${escapeHtml(why).replaceAll('\n', '<br>')}</p><p>You can send a new request for other days under <strong>Rental Booking</strong> in the member portal, or ask the ACIFAC office.</p>`
   );
 }
 
@@ -181,5 +192,96 @@ export function welcomeMemberEmail({ memberName, memberNumber, membershipDate, f
     'Welcome to ACIFAC',
     `Hello ${memberName},\n\nWelcome to the Amnay-Cabagan Irrigators and Farmers Agriculture Cooperative. Your member number is ${memberNumber}, effective ${membershipDate}.${paperNote(fromPaperForm)}\nKeep this number for loans, savings and machinery rentals.`,
     `<p>Hello ${escapeHtml(memberName)},</p><p>Welcome to the Amnay-Cabagan Irrigators and Farmers Agriculture Cooperative. Your member number is <strong>${escapeHtml(memberNumber)}</strong>, effective ${escapeHtml(membershipDate)}.${escapeHtml(paperNote(fromPaperForm))}</p><p>Keep this number for loans, savings and machinery rentals.</p>`
+  );
+}
+
+export function membershipTerminatedEmail({ memberName, memberNumber, kind, date }) {
+  return message(
+    'Your ACIFAC membership was terminated',
+    `Hello ${memberName},\n\nYour membership in ACIFAC (${memberNumber}) was terminated on ${formatDateOnly(date)} (${kind}).\nIf you think this is a mistake, or for your share capital and savings, please visit the ACIFAC office.`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>Your membership in ACIFAC (<strong>${escapeHtml(memberNumber)}</strong>) was terminated on ${escapeHtml(formatDateOnly(date))} (${escapeHtml(kind)}).</p><p>If you think this is a mistake, or for your share capital and savings, please visit the ACIFAC office.</p>`
+  );
+}
+
+export function membershipRestoredEmail({ memberName, memberNumber }) {
+  return message(
+    'Your ACIFAC membership was restored',
+    `Hello ${memberName},\n\nYour membership in ACIFAC (${memberNumber}) was restored. You are an active member again.`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>Your membership in ACIFAC (<strong>${escapeHtml(memberNumber)}</strong>) was restored. You are an active member again.</p>`
+  );
+}
+
+export function duesReminderEmail({ memberName, total, count, oldest }) {
+  return message(
+    'ACIFAC: unpaid dues',
+    `Hello ${memberName},\n\nYou have ${count} unpaid ${count === 1 ? 'due' : 'dues'} totalling ${formatAmount(total)}, the oldest from ${formatDateOnly(oldest)}.\nPlease pay them at the ACIFAC office. You can see them in the member portal under Dues.`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>You have ${count} unpaid ${count === 1 ? 'due' : 'dues'} totalling <strong>${formatAmount(total)}</strong>, the oldest from ${escapeHtml(formatDateOnly(oldest))}.</p><p>Please pay them at the ACIFAC office. You can see them in the member portal under <strong>Dues</strong>.</p>`
+  );
+}
+
+export function machineryPaymentEmail({ memberName, amount, paymentDate, serviceType, machineryName, serviceDate, balance, voided = false }) {
+  const work = `${serviceType} by ${machineryName} on ${formatDateOnly(serviceDate)}`;
+  const left = Number(balance) > 0 ? `Balance: ${formatAmount(balance)}.` : 'The fee is fully paid.';
+  return voided
+    ? message(
+      'ACIFAC machinery payment cancelled',
+      `Hello ${memberName},\n\nThe ${formatAmount(amount)} payment of ${formatDateOnly(paymentDate)} for ${work} was cancelled by the office.\n${left}`,
+      `<p>Hello ${escapeHtml(memberName)},</p><p>The <strong>${formatAmount(amount)}</strong> payment of ${escapeHtml(formatDateOnly(paymentDate))} for ${escapeHtml(work)} was cancelled by the office.</p><p>${escapeHtml(left)}</p>`
+    )
+    : message(
+      'ACIFAC machinery payment recorded',
+      `Hello ${memberName},\n\nA payment of ${formatAmount(amount)} for ${work} was recorded on ${formatDateOnly(paymentDate)}.\n${left}\nYou can see it under Transactions in the member portal.`,
+      `<p>Hello ${escapeHtml(memberName)},</p><p>A payment of <strong>${formatAmount(amount)}</strong> for ${escapeHtml(work)} was recorded on ${escapeHtml(formatDateOnly(paymentDate))}.</p><p>${escapeHtml(left)} You can see it under <strong>Transactions</strong> in the member portal.</p>`
+    );
+}
+
+// --- Sent to many members at once (memberEmails.emailInBulk) --------------------
+// The same message goes to everyone, so none of these greets by name.
+
+const portal = () => getFrontendUrl();
+const bulkFooter = () => `You get these emails as an ACIFAC member. To stop them, turn off Email Notifications under Settings in the member portal (${portal()}).`;
+const bulkFooterHtml = () => `<p style="margin-top:24px;font-size:12px;color:#6b7280">You get these emails as an ACIFAC member. To stop them, turn off Email Notifications under Settings in the <a href="${escapeHtml(portal())}">member portal</a>.</p>`;
+// Web addresses in escaped text become links (without a full stop or bracket that ends the sentence).
+const linkify = (html) => html.replace(/https?:\/\/[^\s<]+/g, (url) => {
+  const address = url.replace(/[.,;:!?)]+$/, '');
+  return `<a href="${address}">${address}</a>${url.slice(address.length)}`;
+});
+const paragraphsHtml = (text) => String(text).split(/\n{2,}/).map((part) => `<p>${linkify(escapeHtml(part)).replaceAll('\n', '<br>')}</p>`).join('');
+
+// An announcement posted by the office. `postedOn` is YYYY-MM-DD; `postedBy` may be empty.
+export function announcementEmail({ title, message: body, postedOn, postedBy = '' }) {
+  const posted = `Posted on ${formatDateOnly(postedOn)}${postedBy ? ` by ${postedBy}` : ''}.`;
+  return message(
+    `ACIFAC announcement: ${title}`,
+    `ACIFAC announcement\n\n${title}\n\n${body}\n\n${posted}\n\n${bulkFooter()}`,
+    `<p style="margin:0;font-size:12px;font-weight:bold;letter-spacing:1px;color:#15803d">ACIFAC ANNOUNCEMENT</p><h2 style="margin:4px 0 12px">${escapeHtml(title)}</h2>${paragraphsHtml(body)}<p style="color:#6b7280">${escapeHtml(posted)}</p>${bulkFooterHtml()}`
+  );
+}
+
+// An activity members must attend: created, changed (its day, time or place)
+// or cancelled. `noun` is "meeting" or "activity"; `when` is "December 5,
+// 2026, 8:00 AM to 12:00 PM"; `note` says who must attend and what to bring;
+// `date` (YYYY-MM-DD) and `reason` are for a cancellation.
+export function activityEmail({ change, noun, title, when, venue, organizer = '', description = '', note = '', date, reason = '' }) {
+  const link = `${portal()}/member/attendance`;
+  const details = [`When: ${when}`, `Where: ${venue}`, organizer ? `Organized by: ${organizer}` : ''].filter(Boolean).join('\n');
+  const opening = {
+    created: `ACIFAC has a new ${noun}: ${title}.`,
+    changed: `The ${noun} "${title}" was changed. It is now:`,
+    cancelled: `The ${noun} "${title}" on ${formatDateOnly(date)} was cancelled.${reason ? `\nReason: ${reason}` : ''}`,
+  }[change];
+  const subject = { created: `ACIFAC ${noun}: ${title}`, changed: `ACIFAC ${noun} changed: ${title}`, cancelled: `ACIFAC ${noun} cancelled: ${title}` }[change];
+  const parts = change === 'cancelled'
+    ? [opening]
+    : [opening, details, change === 'created' ? description : '', note, `You can see it under Attendance in the member portal: ${link}`];
+  const text = ['Hello,', ...parts.filter(Boolean)].join('\n\n');
+  return message(subject, `${text}\n\n${bulkFooter()}`, `${paragraphsHtml(text)}${bulkFooterHtml()}`);
+}
+
+export function loyaltyMilestoneEmail({ memberName, years, award }) {
+  return message(
+    `ACIFAC: ${years} years as a member`,
+    `Hello ${memberName},\n\nCongratulations! Today you have been a member of ACIFAC for ${years} years. Thank you for your loyalty.${award ? `\nMembers in good standing (regular attendance and loan payments on time) receive the ${award} at the General Assembly.` : ''}`,
+    `<p>Hello ${escapeHtml(memberName)},</p><p>Congratulations! Today you have been a member of ACIFAC for <strong>${escapeHtml(years)} years</strong>. Thank you for your loyalty.</p>${award ? `<p>Members in good standing (regular attendance and loan payments on time) receive the <strong>${escapeHtml(award)}</strong> at the General Assembly.</p>` : ''}`
   );
 }

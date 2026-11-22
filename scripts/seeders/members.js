@@ -1,19 +1,23 @@
-import { nextMemberNumber, parseShareCapital, readAdditionalInfo, validateMemberInput } from '../../src/controllers/memberController.js';
+import { parseShareCapital, readAdditionalInfo, validateMemberInput } from '../../src/controllers/memberController.js';
 import { centsToString } from '../../src/utils/money.js';
 import { createMemberLogins } from './accounts.js';
 import { addDays, addMonths, stampSql } from './support.js';
 
-// The sample members of the cooperative: SAMPLE_MEMBER_COUNT (100) members
-// with every field of the Add Member form filled in (ID, RSBSA No., family,
-// mother's maiden name, income sources, membership fee and seminar records),
-// checked by the Add Member form's validation and registered as it registers
-// them (numbers ACIFAC-YYYY-NNN, initial share capital, audit entry). The 15
-// named below come first (the other seeders give them their loans, savings,
-// services and rentals); the rest are generated. `joined` is how many months
-// ago they became members; `more` lists later share capital contributions as
-// [months ago, amount] (at most PHP 20,000 in all). Every member gets an
-// active login of their own: member001, member002, ...
+// The sample members of the cooperative: SAMPLE_MEMBER_COUNT (100) members, or
+// as many as --members=N asks for (ctx.sampleMemberCount), with every field of
+// the Add Member form filled in (ID, RSBSA No., family, mother's maiden name,
+// income sources, membership fee and seminar records), checked by the Add
+// Member form's validation and registered as it registers them (numbers
+// ACIFAC-YYYY-NNN, initial share capital, audit entry). The 15 named below
+// come first (the other seeders give them their loans, savings, services and
+// rentals); the rest are generated. `joined` is how many months ago they became
+// members; `more` lists later share capital contributions as [months ago,
+// amount]. Every member gets an active login of their own: member001, ...
 export const SAMPLE_MEMBER_COUNT = 100;
+// The cooperative was registered with the CDA on January 3, 2018: nobody
+// joined before. Generated members join from then on, more of them in recent
+// years, so the Loyalty Awards have members with 5 years and more.
+const FOUNDED = '2018-01-03';
 
 const NAMED = [
   { key: 'juan', first: 'Juan', middle: 'Santos', last: 'Dela Cruz', gender: 'Male', born: '1974-03-14', civil: 'Married', spouse: 'Lorna Dela Cruz', education: 'High School', palay: '2.5', income: '180000', joined: 34, share: '5000', more: [[24, '3000'], [12, '3000'], [5, '2000']] },
@@ -49,9 +53,13 @@ const OFFICERS = ['Lorna Cruz', 'Ramon Bautista', 'Elvira Santos'];
 
 const pick = (list, n) => list[n % list.length];
 const digits = (seed, length) => String((seed * 7919 + 104729) % 10 ** length).padStart(length, '0');
+const daysBetween = (from, to) => Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000);
 
-// The 85 generated members, oldest members first, with a varied but repeatable mix.
+// The generated members (85 of the default 100), oldest members first, with a varied but repeatable mix.
 function generated(count, today) {
+  // Days from a week after the founding to today; the n-th member joined
+  // span x (share of the members after them)^1.4 days ago, at least 2.
+  const span = daysBetween(addDays(FOUNDED, 7), today);
   return Array.from({ length: count }, (_, index) => {
     const seq = index + NAMED.length + 1;
     const female = seq % 2 === 0;
@@ -60,15 +68,19 @@ function generated(count, today) {
     const corn = seq % 6 === 0;
     const area = (0.5 + (seq % 7) * 0.35).toFixed(2);
     const civil = pick(CIVIL, seq);
+    const joinedOn = addDays(today, -Math.max(2, Math.round(span * ((count - index) / count) ** 1.4)));
+    // 20 to 59 years old on the day they joined (Membership Policy: 18 to 65).
+    const ageAtJoining = 20 + ((seq * 7) % 40);
+    const born = addDays(`${Number(joinedOn.slice(0, 4)) - ageAtJoining}${joinedOn.slice(4)}`, -(1 + ((seq * 37) % 300)));
     return {
       key: `m${String(seq).padStart(3, '0')}`, first, middle: pick(SURNAMES, seq * 11 + 4) === last ? pick(SURNAMES, seq + 2) : pick(SURNAMES, seq * 11 + 4), last,
       suffix: !female && seq % 17 === 0 ? 'Jr.' : null, gender: female ? 'Female' : 'Male',
-      born: addDays('1958-01-01', (seq * 211) % 15000), civil,
+      born: born.endsWith('-02-29') ? addDays(born, -1) : born, civil,
       spouse: civil === 'Married' ? `${pick(female ? MALE : FEMALE, seq * 3)} ${last}` : null,
       education: pick(EDUCATION, seq * 3), livelihood: corn ? 'Corn farming' : seq % 9 === 0 ? 'Rice and vegetable farming' : 'Rice farming',
       palay: corn ? null : area, corn: corn ? area : null, income: String(48000 + (seq % 16) * 9000),
-      // Spread over the last three years, oldest first; a few joined this month.
-      joinedOn: addDays(today, -Math.max(2, Math.round(((count - index) / count) * 3 * 365) - 5)),
+      // From 2018 on, oldest first; a few joined this month.
+      joinedOn,
       share: pick(SHARE, seq), more: seq % 3 === 0 ? [[Math.max(1, (seq % 10) + 1), pick(['500', '1000', '1500', '2000'], seq)]] : [],
     };
   });
@@ -122,7 +134,7 @@ function memberBody(person, index, today) {
 
 export default async function seedMembers(ctx) {
   const { client, today, admin } = ctx;
-  const persons = [...NAMED, ...generated(SAMPLE_MEMBER_COUNT - NAMED.length, today)];
+  const persons = [...NAMED, ...generated((ctx.sampleMemberCount ?? SAMPLE_MEMBER_COUNT) - NAMED.length, today)];
   const people = persons.map((person, index) => {
     const body = memberBody(person, index, today);
     // The Add Member form's own checks.
@@ -141,11 +153,22 @@ export default async function seedMembers(ctx) {
   )).rows[0];
   if (duplicate) throw new Error(`A sample member is already registered here (${duplicate.member_number}).`);
 
-  // Member numbers in the order they joined, as if each had been registered on the day.
+  // Member numbers in the order they joined, as if each had been registered on
+  // the day: ACIFAC-YYYY-NNN of the year they joined, NNN counting on from the
+  // numbers that year already has (as the Add Member form counts each year).
   const order = people.map((p, index) => index).sort((a, b) => people[a].values.membershipDate.localeCompare(people[b].values.membershipDate) || a - b);
   await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['acifac-member-number']);
-  const [prefix, firstNumber] = (await nextMemberNumber(client)).match(/^(ACIFAC-\d{4}-)(\d+)$/).slice(1);
-  order.forEach((index, position) => { people[index].memberNumber = `${prefix}${String(Number(firstNumber) + position).padStart(3, '0')}`; });
+  const years = [...new Set(people.map((p) => p.values.membershipDate.slice(0, 4)))];
+  const next = new Map((await client.query(
+    `SELECT y.year, COALESCE((SELECT MAX(NULLIF(SPLIT_PART(member_number, '-', 3), '')::int) FROM members WHERE member_number ~ ('^ACIFAC-' || y.year || '-[0-9]+$')), 0) + 1 AS next
+     FROM unnest($1::text[]) AS y(year)`, [years]
+  )).rows.map((row) => [row.year, Number(row.next)]));
+  for (const index of order) {
+    const year = people[index].values.membershipDate.slice(0, 4);
+    const number = next.get(year);
+    next.set(year, number + 1);
+    people[index].memberNumber = `ACIFAC-${year}-${String(number).padStart(3, '0')}`;
+  }
 
   const column = (pick) => people.map(pick);
   const ids = (await client.query(

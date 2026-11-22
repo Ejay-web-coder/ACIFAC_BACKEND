@@ -428,7 +428,7 @@ export async function machineryAnalytics(from, to) {
     demandHistory(),
     lifetimeFigures(),
     query(`
-      SELECT machinery_id AS id, service_type AS "serviceType", unit, member_rate AS "memberRate", non_member_rate AS "nonMemberRate"
+      SELECT machinery_id AS id, service_type AS "serviceType", unit, season, member_rate AS "memberRate", non_member_rate AS "nonMemberRate"
       FROM machinery_service_rates WHERE effective_from <= ${SQL_TODAY} AND (effective_to IS NULL OR effective_to >= ${SQL_TODAY})
       ORDER BY machinery_id, service_type
     `),

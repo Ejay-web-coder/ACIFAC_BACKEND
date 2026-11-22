@@ -37,8 +37,9 @@ function generate(seq, index, count, today) {
     phone: `0900 ${String(100 + Math.floor(seq / 10000)).padStart(3, '0')} ${String(seq % 10000).padStart(4, '0')}`,
     address: `Purok ${(seq % 7) + 1}, Barahan, Santa Cruz, Occidental Mindoro`,
     barangay: 'Barahan', municipality: 'Santa Cruz', province: 'Occidental Mindoro',
-    // A different birthday for each of 14,600 members in a row (1960 to 1999).
-    date_of_birth: addDays('1960-01-01', (seq * 37) % 14600),
+    // A different birthday for each of 14,600 members in a row (1962 to 2001),
+    // so every member joined at 18 to 65 (Membership Policy).
+    date_of_birth: addDays('1962-01-01', (seq * 37) % 14600),
     gender: female ? 'Female' : 'Male', civil_status: pick(CIVIL, seq), education: pick(EDUCATION, seq * 3),
     livelihood: seq % 5 === 0 ? 'Corn farming' : 'Rice farming', farm_area_ha: palay, palay_area_ha: seq % 5 === 0 ? null : palay, corn_area_ha: seq % 5 === 0 ? palay : null,
     yearly_income: String(50000 + (seq % 15) * 10000),

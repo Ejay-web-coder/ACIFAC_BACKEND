@@ -1,5 +1,5 @@
 import { describe, test, expect } from '@jest/globals';
-import { loanDecisionEmail, passwordResetCodeEmail, paymentEmail, welcomeMemberEmail } from '../../src/services/emailTemplates.js';
+import { loanDecisionEmail, passwordResetCodeEmail, paymentEmail, rentalDecisionEmail, welcomeMemberEmail } from '../../src/services/emailTemplates.js';
 
 describe('Email messages (emailTemplates)', () => {
   test('an approved loan email gives the amounts, the 2.5% a month interest and the due date', () => {
@@ -23,6 +23,17 @@ describe('Email messages (emailTemplates)', () => {
     expect(email.subject).toBe('ACIFAC Password Reset');
     expect(email.text).toContain('Your verification code is:\n\n482913\n\nThis code expires in 10 minutes.');
     expect(email.html).not.toContain('href');
+  });
+
+  test('a declined rental email gives the reason the office wrote', () => {
+    const email = rentalDecisionEmail({ machineryName: 'Water Pump', startDate: '2026-12-03', endDate: '2026-12-05', status: 'declined', rentalFee: '2400.00', reason: 'The pump is <under repair> that week.' });
+    expect(email.subject).toBe('ACIFAC machinery rental declined');
+    expect(email.text).toContain('Your rental request for Water Pump (December 3, 2026 to December 5, 2026) was declined.');
+    expect(email.text).toContain('Reason: The pump is <under repair> that week.');
+    expect(email.text).not.toContain('Rental fee');
+    expect(email.html).toContain('The pump is &lt;under repair&gt; that week.');
+    const approved = rentalDecisionEmail({ machineryName: 'Water Pump', startDate: '2026-12-03', endDate: '2026-12-05', status: 'approved', rentalFee: '2400.00' });
+    expect(approved.text).toBe('Your rental request for Water Pump (December 3, 2026 to December 5, 2026) was approved. Rental fee: PHP 2,400.00.');
   });
 
   test('edge case: names are escaped in the HTML, so a name cannot inject markup', () => {
