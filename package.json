@@ -9,6 +9,7 @@
     "migrate": "node scripts/run-migrations.js",
     "create-admin": "node scripts/create-admin.js",
     "seed": "node scripts/seed.js",
+    "seed:member": "node scripts/seed-member.js",
     "test": "node --test --test-concurrency=1 \"test/**/*.test.js\"",
     "remove-sample-data": "node scripts/remove-sample-data.js",
     "remove-all-members": "node scripts/remove-all-members.js",

@@ -17,7 +17,9 @@ import '../src/config/env.js';
 //    and notifications (the seeder's bag sales go as its own rows);
 //  - the seeder's Kadiwa products, by the moment the seeder created them. A
 //    product that real sales sold is only marked deleted, as the inventory's own
-//    Delete does, so those sales keep their lines.
+//    Delete does, so those sales keep their lines;
+//  - the records `npm run seed:member` added to real members (it keeps the ids
+//    of what it wrote), first, since they sit on the sample activities and sales.
 // Real members, real records, machines, rates, settings and administrators stay.
 // Everything happens in one transaction: if any delete would break a real
 // record (a foreign key), nothing is removed.
@@ -45,6 +47,7 @@ if (!local && process.env.SEED_ALLOW_REMOTE !== 'true') {
 if (local && !process.env.DATABASE_SSL) process.env.DATABASE_SSL = 'disable';
 
 const { getPool } = await import('../src/config/db.js');
+const { removeMemberHistory } = await import('./seeders/memberHistoryRemoval.js');
 
 class Rehearsal extends Error {}
 
@@ -56,11 +59,15 @@ async function removeSampleData(client) {
     return rowCount;
   };
 
+  // What npm run seed:member added to real members.
+  const history = await removeMemberHistory(client);
+  for (const [label, count] of history.removed) removed.set(`${label} (seed:member, ${history.members.length} member${history.members.length === 1 ? '' : 's'})`, count);
+
   // The seeder's transactions and the moments they ran (NOW() inside them).
   const runs = (await client.query(
     `SELECT DISTINCT xmin::text AS tx FROM audit_logs WHERE user_agent = $1`, [SEEDER_AGENT]
   )).rows.map((row) => row.tx);
-  if (!runs.length) return { removed, runs, note: 'No sample data from npm run seed was found.' };
+  if (!runs.length) return { removed, runs, note: history.members.length ? null : 'No sample data from npm run seed was found.' };
   const seeded = (alias = '') => `${alias ? `${alias}.` : ''}xmin::text = ANY($1::text[])`;
 
   // The sample members: registered by the seeder, with a made-up @example.com address.
@@ -192,7 +199,7 @@ try {
   } else {
     console.log(`${apply ? 'Removed' : 'Would remove'} from ${host} (seeder runs: ${result.runs.length}):`);
     for (const [label, count] of result.removed) console.log(`  ${String(count).padStart(6)}  ${label}`);
-    console.log(`Real records kept: ${Object.entries(result.realAfter).map(([key, value]) => `${value} ${key}`).join(', ')}.`);
+    if (result.realAfter) console.log(`Real records kept: ${Object.entries(result.realAfter).map(([key, value]) => `${value} ${key}`).join(', ')}.`);
     if (result.warning) console.log(result.warning);
     if (!apply) throw new Rehearsal();
     await client.query(
