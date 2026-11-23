@@ -100,8 +100,14 @@ async function run(client) {
 
   if (member.status !== 'active') throw new Stop(`Only an active member gets records: this one is ${member.status}.`);
   if (!member.membership_date) throw new Stop('The member has no membership date: records are dated from it.');
-  const already = (await client.query(`SELECT created_at FROM audit_logs WHERE action = $1 AND entity_type = 'member' AND entity_id = $2 LIMIT 1`, [HISTORY_ACTION, String(member.id)])).rows[0];
+  const earlier = (await client.query(
+    `SELECT created_at, COALESCE(new_values -> 'counts', '{}'::jsonb) = '{}'::jsonb AS empty FROM audit_logs WHERE action = $1 AND entity_type = 'member' AND entity_id = $2 ORDER BY id`,
+    [HISTORY_ACTION, String(member.id)]
+  )).rows;
+  const already = earlier.find((run) => !run.empty);
   if (already) throw new Stop(`This member already got their records (${new Date(already.created_at).toLocaleString('en-PH', { timeZone: 'Asia/Manila' })}). To add them again, run with --remove --apply first.`);
+  // An earlier run that added nothing (the membership date left no days to fill) does not count.
+  if (earlier.length) await removeMemberHistory(client, { memberId: member.id });
   const admin = (await client.query(`SELECT id, username, role, full_name FROM users WHERE role = 'ADMIN' AND account_status = 'ACTIVE' ORDER BY id LIMIT 1`)).rows[0];
   if (!admin) throw new Stop('No active administrator here to record the entries.');
   const login = (await client.query(`SELECT username FROM users WHERE member_id = $1 AND account_status = 'ACTIVE' ORDER BY id LIMIT 1`, [member.id])).rows[0];
@@ -115,6 +121,11 @@ async function run(client) {
   };
   const started = Date.now();
   await seedMemberHistory(ctx);
+  if (!counts.size) {
+    throw new Stop(`Nothing to add, so nothing was saved: records are dated from a week after the membership date (${member.membership_date}), and that leaves `
+      + `${ctx.start > ctx.today ? 'no days' : `only ${ctx.start} to ${ctx.today}`}${skipped.length ? ` (${skipped.join('; ')})` : ''}. `
+      + 'If the member joined earlier, correct the membership date on their page (Members > Edit) and run this again.');
+  }
   console.log(`\n${apply ? 'Added' : 'Would add'} on ${host} (from ${ctx.start} to ${ctx.today}, entered by ${admin.username}):`);
   for (const [label, amount] of counts) console.log(`  ${String(amount).padStart(5)}  ${label}`);
   for (const reason of skipped) console.log(`  skipped: ${reason}`);
