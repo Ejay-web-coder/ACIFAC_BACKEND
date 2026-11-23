@@ -118,8 +118,8 @@ const restructuringSelect = `
          ${displayName('u')} AS "recordedBy", r.created_at AS "createdAt"
   FROM loan_restructurings r LEFT JOIN users u ON u.id = r.recorded_by LEFT JOIN loans n ON n.id = r.new_loan_id`;
 
-const requestSelect = `
-  SELECT r.id, r.member_id AS "memberDatabaseId", COALESCE(m.member_number, r.member_number) AS "memberId", r.member_number AS "memberNumber",
+const requestColumns = `
+  r.id, r.member_id AS "memberDatabaseId", COALESCE(m.member_number, r.member_number) AS "memberId", r.member_number AS "memberNumber",
          r.member_name AS "memberName", r.loan_type AS "loanType", r.amount, r.term, r.purpose, r.monthly_income AS "monthlyIncome",
          r.submitted_at AS "submittedAt", r.reviewed_at AS "reviewedAt", r.status, r.review_notes AS "reviewNotes",
          r.farm_area AS "farmArea", r.maximum_eligible_amount AS "maximumEligibleAmount", r.interest_rate AS "interestRate",
@@ -134,7 +134,8 @@ const requestSelect = `
          r.farm_location AS "farmLocation", r.barangay, r.municipality, r.province, r.irrigation_other AS "irrigationOther",
          ol.loan_number AS "openLoanNumber", ol.balance AS "openLoanBalance", ol.total AS "openLoanTotal", ol.penalty AS "openLoanPenalty",
          -- The member's first year of loans ends 12 months after their first loan (null: no loan yet); then the 2-hectare limit ends.
-         (SELECT TO_CHAR((MIN(fl.date_approved) + make_interval(months => ${FIRST_LOAN_YEAR.months}))::date, 'YYYY-MM-DD') FROM loans fl WHERE fl.member_id = r.member_id) AS "firstLoanYearEnds"
+         (SELECT TO_CHAR((MIN(fl.date_approved) + make_interval(months => ${FIRST_LOAN_YEAR.months}))::date, 'YYYY-MM-DD') FROM loans fl WHERE fl.member_id = r.member_id) AS "firstLoanYearEnds"`;
+const requestFrom = `
   FROM loan_requests r LEFT JOIN members m ON m.id = r.member_id
   LEFT JOIN LATERAL (
     -- The member's open loan, which approving this application would restructure (80% paid) or which blocks it.
@@ -143,6 +144,11 @@ const requestSelect = `
            GREATEST(0.00, ${penaltyAccruedSql('o', SQL_TODAY)} - COALESCE((SELECT SUM(op.penalty_paid) FROM loan_payments op WHERE op.loan_id = o.id), 0)) AS penalty
     FROM loans o WHERE o.member_id = r.member_id AND o.status <> 'paid' ORDER BY o.id LIMIT 1
   ) ol ON r.status = 'pending'`;
+const requestSelect = `SELECT ${requestColumns} ${requestFrom}`;
+// The office's list also has the For Evaluation note (what is being
+// evaluated, by whom, when). Members never get it: their own data uses requestSelect.
+const officeRequestSelect = `SELECT ${requestColumns}, r.evaluation_notes AS "evaluationNotes", r.evaluated_at AS "evaluatedAt", ${displayName('eu')} AS "evaluatedBy"
+  ${requestFrom} LEFT JOIN users eu ON eu.id = r.evaluated_by`;
 
 const memberApplicationSelect = `SELECT id, member_number, first_name, middle_name, last_name, suffix, email, phone,
   address, barangay, municipality, province, date_of_birth, gender, civil_status, livelihood, farm_area_ha, id_number,
@@ -476,7 +482,7 @@ export async function listLoanRequests(req, res) {
     where = 'WHERE r.status = $1';
   }
   const [rows, count] = await Promise.all([
-    query(`${requestSelect} ${where} ORDER BY (r.status = 'pending') DESC, r.submitted_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`, [...params, limit, offset]),
+    query(`${officeRequestSelect} ${where} ORDER BY (r.status = 'pending') DESC, r.submitted_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`, [...params, limit, offset]),
     query(`SELECT COUNT(*)::int AS total FROM loan_requests r ${where}`, params),
   ]);
   return res.json({ success: true, requests: rows.rows, pagination: paginationMeta(page, limit, count.rows[0].total) });
@@ -535,11 +541,38 @@ export async function createLoan(req, res, _next, { takeIds, borrowerSignature =
   return res.status(201).json({ success: true, loan });
 }
 
+// "For Evaluation": the application stays pending, with the office's note on
+// what is being evaluated (required; saving again replaces it). Office only:
+// the member is not notified and the note is not in their data.
+async function keepForEvaluation(req, res, requestId, note) {
+  if (!note) throw badRequest('Write what is being evaluated.');
+  await withTransaction(async (client) => {
+    const row = (await client.query('SELECT id, status, member_name, evaluation_notes FROM loan_requests WHERE id = $1 FOR UPDATE', [requestId])).rows[0];
+    if (!row) throw notFound('Loan request not found.');
+    if (row.status !== 'pending') throw conflict('Loan request was already reviewed.');
+    await client.query('UPDATE loan_requests SET evaluation_notes = $1, evaluated_at = NOW(), evaluated_by = $2, updated_at = NOW() WHERE id = $3', [note, currentUserId(req), requestId]);
+    await createAuditLog({
+      client,
+      user: req.user,
+      action: 'LOAN_REQUEST_EVALUATION',
+      module: 'Loans',
+      entityType: 'loan_request',
+      entityId: String(requestId),
+      description: `Loan request kept for evaluation for ${row.member_name}`,
+      oldValues: { evaluation_notes: row.evaluation_notes },
+      newValues: { status: 'pending', evaluation_notes: note },
+      ...getRequestMeta(req),
+    });
+  });
+  return res.json({ success: true, message: 'Loan request kept for evaluation.' });
+}
+
 export async function reviewLoanRequest(req, res) {
   const requestId = parseId(req.params.id, 'loan request ID');
   const status = req.body?.status;
   const reviewNotes = optionalString(req.body?.reason ?? req.body?.reviewNotes, 1000);
-  if (!['approved', 'declined'].includes(status)) throw badRequest('Invalid request status.');
+  if (!['approved', 'declined', 'evaluation'].includes(status)) throw badRequest('Invalid request status.');
+  if (status === 'evaluation') return keepForEvaluation(req, res, requestId, reviewNotes);
 
   const { request, loanId } = await withTransaction(async (client) => {
     const requestRow = (await client.query('SELECT * FROM loan_requests WHERE id = $1 FOR UPDATE', [requestId])).rows[0];

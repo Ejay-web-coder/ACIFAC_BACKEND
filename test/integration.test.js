@@ -782,6 +782,20 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   }
   const declined = await applyWithIds(member, '/api/members/me/loan-requests', { amount: '1000', term: 3, purpose: 'Repair', farmArea: '2' });
   assert.equal(declined.data.request.loanType, 'agricultural', 'the loan type is agricultural when none is sent');
+  // For Evaluation: it stays pending with the office's message (required, the latest replaces the one
+  // before); only the office's list has it: the member's own data never does, and they are not notified.
+  assert.equal((await admin.patch(`/api/admin/loan-requests/${declined.data.request.id}`, { status: 'evaluation', reason: '   ' })).status, 400);
+  assert.equal((await admin.patch(`/api/admin/loan-requests/${declined.data.request.id}`, { status: 'evaluation', reason: 'Checking the IDs.' })).status, 200);
+  const kept = await admin.patch(`/api/admin/loan-requests/${declined.data.request.id}`, { status: 'evaluation', reason: 'Checking the farm area with the barangay.' });
+  assert.equal(kept.status, 200, JSON.stringify(kept.data));
+  const evaluated = (await admin.get('/api/admin/loan-requests?status=pending&limit=100')).data.requests.find((row) => row.id === declined.data.request.id);
+  assert.equal(evaluated.status, 'pending');
+  assert.equal(evaluated.evaluationNotes, 'Checking the farm area with the barangay.');
+  assert.ok(evaluated.evaluatedBy && evaluated.evaluatedAt, 'who saved it and when');
+  const ownRequest = (await member.get('/api/members/me')).data.data.loanRequests.find((row) => row.id === declined.data.request.id);
+  assert.equal(ownRequest.status, 'pending');
+  assert.equal('evaluationNotes' in ownRequest, false, 'members never get the office note');
+  assert.equal((await member.get('/api/notifications')).data.data.some((n) => /Checking the/.test(n.message)), false);
   const decline = await admin.patch(`/api/admin/loan-requests/${declined.data.request.id}`, { status: 'declined', reason: 'Incomplete documents' });
 
   // The paper-form layout sends the cash amount; the server adds the farm inputs to it.
@@ -798,6 +812,7 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   assert.equal(combined.data.request.inKindItems.length, 2);
   await admin.patch(`/api/admin/loan-requests/${combined.data.request.id}`, { status: 'declined', reason: 'test cleanup' });
   assert.equal(decline.status, 200);
+  assert.equal((await admin.patch(`/api/admin/loan-requests/${declined.data.request.id}`, { status: 'evaluation', reason: 'Too late' })).status, 409, 'a reviewed application cannot be kept for evaluation');
   // Declines are texted too, with the reason (both are out before the SMS test below counts texts).
   const declinedText = await waitForText((text) => text.message.startsWith('ACIFAC: Your loan application for PHP 1,000.00 was declined. Reason: Incomplete documents.'));
   assert.deepEqual(declinedText.recipients, ['+639178888888']);
@@ -811,7 +826,10 @@ test('loans: quote, apply, approve, installments, payments, overdue, paid', { sk
   assert.ok(payments.length > 0);
   for (const row of payments) assert.deepEqual([row.target_name, row.target_member_number, row.target_kind], [borrower.name, borrower.member_number, 'member']);
   const requestEntries = (await admin.get('/api/admin/audit-logs?module=Loans&limit=100')).data.data.filter((row) => row.entity_type === 'loan_request' && row.entity_id === String(declined.data.request.id));
-  assert.deepEqual(requestEntries.map((row) => [row.action, row.target_name]), [['LOAN_REJECTED', borrower.name], ['LOAN_APPLICATION_SUBMITTED', borrower.name]]);
+  // Newest first: declined after it was kept for evaluation twice (each message saved is logged).
+  assert.deepEqual(requestEntries.map((row) => [row.action, row.target_name]), [
+    ['LOAN_REJECTED', borrower.name], ['LOAN_REQUEST_EVALUATION', borrower.name], ['LOAN_REQUEST_EVALUATION', borrower.name], ['LOAN_APPLICATION_SUBMITTED', borrower.name],
+  ]);
 });
 
 test('sms: a text the phone gateway refuses is retried later; members can switch SMS off', { skip }, async () => {
