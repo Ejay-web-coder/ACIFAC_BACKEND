@@ -153,21 +153,26 @@ function mapMember(row) {
 }
 
 // No member may own more than 10% of the cooperative's share capital (RA 9520).
-// It is checked after the payment, the member included: own <= 10% of (others + own),
-// so a member may hold at most one ninth of every other member's share capital.
-// Terminated members are left out. The office chose no exception for a young
-// cooperative: with little capital elsewhere, a member may add little or nothing.
+// Every member has the same maximum: 10% of the cooperative's total share
+// capital as it is now, every member's included (terminated members left out).
+// A payment is checked against it before it is added, so the member's part
+// stays at most 10% after it too. (Until November 2026 it was a ninth of the
+// other members' share capital, which differed from member to member.) The
+// office chose no exception for a young cooperative: with little capital in
+// all, a member may add little or nothing.
 export const SHARE_CAPITAL_PERCENT_CAP = 10;
 
-/** The most share capital a member may hold, in cents (memberId null: a member not yet registered). */
-export async function shareCapitalMaxCents(db, memberId = null) {
+/** The cooperative's total share capital and the most any member may hold (10% of it), in cents. */
+export async function shareCapitalLimit(db) {
   const runner = db?.query ? db.query.bind(db) : query;
-  const { rows } = await runner(
-    `SELECT COALESCE(SUM(share_capital), 0) AS total FROM members WHERE status <> 'archived' AND ($1::bigint IS NULL OR id <> $1)`,
-    [memberId]
-  );
-  const othersCents = toCents(rows[0].total);
-  return Math.floor((othersCents * SHARE_CAPITAL_PERCENT_CAP) / (100 - SHARE_CAPITAL_PERCENT_CAP));
+  const { rows } = await runner(`SELECT COALESCE(SUM(share_capital), 0) AS total FROM members WHERE status <> 'archived'`);
+  const totalCents = toCents(rows[0].total);
+  return { totalCents, maxCents: Math.floor((totalCents * SHARE_CAPITAL_PERCENT_CAP) / 100) };
+}
+
+/** The most share capital a member may hold, in cents: the same for every member. */
+export async function shareCapitalMaxCents(db) {
+  return (await shareCapitalLimit(db)).maxCents;
 }
 
 // Holds share-capital checks in one line, so two payments at once can't both pass on the same totals.
@@ -181,7 +186,7 @@ const lockShareCapital = (client) => client.query(`SELECT pg_advisory_xact_lock(
 export async function shareCapitalRoomCents(client, memberId) {
   await lockShareCapital(client);
   const current = toCents((await client.query('SELECT COALESCE(SUM(amount), 0) AS total FROM share_contributions WHERE member_id = $1', [memberId])).rows[0].total);
-  return Math.max(0, (await shareCapitalMaxCents(client, memberId)) - current);
+  return Math.max(0, (await shareCapitalMaxCents(client)) - current);
 }
 const pesosFromCents = (cents) => `PHP ${Number(centsToString(Math.max(0, cents))).toLocaleString('en-PH', { minimumFractionDigits: 2 })}`;
 
@@ -190,13 +195,15 @@ async function getShareDetails(db, memberId) {
   const result = await runner(`${shareContributionSelect} WHERE sc.member_id = $1 ORDER BY sc.contribution_date DESC, sc.id DESC`, [memberId]);
   const contributions = result.rows.map((row) => ({ ...row, amount: Number(row.amount) }));
   const totalCents = result.rows.reduce((sum, row) => sum + toCents(row.amount), 0);
-  const limitCents = await shareCapitalMaxCents(db, memberId);
+  const limit = await shareCapitalLimit(db);
   return {
     contributions,
     total: Number(centsToString(totalCents)),
-    maximum: Number(centsToString(limitCents)),
-    remaining: Number(centsToString(Math.max(0, limitCents - totalCents))),
+    maximum: Number(centsToString(limit.maxCents)),
+    remaining: Number(centsToString(Math.max(0, limit.maxCents - totalCents))),
     maximumPercent: SHARE_CAPITAL_PERCENT_CAP,
+    // The cooperative's total share capital the maximum is 10% of.
+    cooperativeTotal: Number(centsToString(limit.totalCents)),
   };
 }
 
@@ -427,10 +434,10 @@ export async function insertShareContribution(client, req, memberId, { amountCen
   const totalResult = await client.query('SELECT COALESCE(SUM(amount), 0) AS total FROM share_contributions WHERE member_id = $1', [memberId]);
   const currentCents = toCents(totalResult.rows[0].total);
   await lockShareCapital(client);
-  const maxCents = await shareCapitalMaxCents(client, memberId);
+  const { totalCents, maxCents } = await shareCapitalLimit(client);
   const remainingCents = maxCents - currentCents;
   if (amountCents > remainingCents) {
-    throw badRequest(`A member's share capital can't be more than ${SHARE_CAPITAL_PERCENT_CAP}% of the cooperative's total share capital. This member can hold at most ${pesosFromCents(maxCents)}, so the most that can be added now is ${pesosFromCents(remainingCents)}.`);
+    throw badRequest(`A member's share capital can't be more than ${SHARE_CAPITAL_PERCENT_CAP}% of the cooperative's total share capital (${pesosFromCents(totalCents)}), so every member can hold at most ${pesosFromCents(maxCents)}. This member has ${pesosFromCents(currentCents)}, so the most that can be added now is ${pesosFromCents(remainingCents)}.`);
   }
   const insert = await client.query(
     `INSERT INTO share_contributions (member_id, amount, contribution_date, payment_method, reference_number, notes, recorded_by)
@@ -802,9 +809,9 @@ export async function insertMemberRecord(client, req, { body, values, shareCapit
   // The initial share capital counts toward the 10% limit like any contribution.
   if (shareCapitalCents > 0) {
     await lockShareCapital(client);
-    const maxCents = await shareCapitalMaxCents(client, null);
+    const { totalCents, maxCents } = await shareCapitalLimit(client);
     if (shareCapitalCents > maxCents) {
-      throw badRequest(`A member's share capital can't be more than ${SHARE_CAPITAL_PERCENT_CAP}% of the cooperative's total share capital. A new member can start with at most ${pesosFromCents(maxCents)}.`);
+      throw badRequest(`A member's share capital can't be more than ${SHARE_CAPITAL_PERCENT_CAP}% of the cooperative's total share capital (${pesosFromCents(totalCents)}). A new member can start with at most ${pesosFromCents(maxCents)}.`);
     }
   }
 

@@ -22,11 +22,11 @@ const { todayDateOnly } = await import('../../src/utils/dates.js');
 
 const year = todayDateOnly().slice(0, 4);
 const form = { first_name: 'Juan', last_name: 'Dela Cruz', phone: '09171234567', address: 'Brgy. Bibiclat, Aliaga, Nueva Ecija', membership_date: '2026-01-15', share_capital: '1000' };
-// otherCapital: the share capital of every other member (PHP 90,000 allows a new member up to PHP 10,000).
-function databaseHas({ duplicate = null, otherCapital = '90000.00' } = {}) {
+// cooperativeCapital: the cooperative's total share capital (PHP 100,000 allows every member, a new one too, up to PHP 10,000).
+function databaseHas({ duplicate = null, cooperativeCapital = '100000.00' } = {}) {
   answer(db.client.query, [
     ['SELECT id, member_number FROM members', { rows: duplicate ? [duplicate] : [] }],
-    ['SELECT COALESCE(SUM(share_capital), 0) AS total FROM members', { rows: [{ total: otherCapital }] }],
+    ['SELECT COALESCE(SUM(share_capital), 0) AS total FROM members', { rows: [{ total: cooperativeCapital }] }],
     ['AS next_number', { rows: [{ next_number: 4 }] }],
     ['INSERT INTO members', { rows: [{ id: 55 }] }],
   ]);
@@ -72,7 +72,7 @@ describe('Add member (memberController.createMember)', () => {
   test('refuses starting share capital above 10% of the cooperative\'s total', async () => {
     await expect(createMember(register({ ...form, share_capital: '10000.01' }), mockResponse())).rejects.toMatchObject({
       status: 400,
-      message: "A member's share capital can't be more than 10% of the cooperative's total share capital. A new member can start with at most PHP 10,000.00.",
+      message: "A member's share capital can't be more than 10% of the cooperative's total share capital (PHP 100,000.00). A new member can start with at most PHP 10,000.00.",
     });
   });
 

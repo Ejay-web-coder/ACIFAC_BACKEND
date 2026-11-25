@@ -7,13 +7,13 @@ jest.unstable_mockModule('../../src/config/db.js', () => db.module);
 jest.unstable_mockModule('../../src/services/memberEmails.js', mockMemberEmails);
 const { addShareContribution } = await import('../../src/controllers/memberController.js');
 
-// current: the member's share capital; others: everyone else's (PHP 90,000 allows the member PHP 10,000 in all).
-function databaseHas({ status = 'active', current = '1000.00', others = '90000.00', duplicateReference = false } = {}) {
+// current: the member's share capital; cooperative: every member's, theirs included (PHP 100,000 allows every member PHP 10,000).
+function databaseHas({ status = 'active', current = '1000.00', cooperative = '100000.00', duplicateReference = false } = {}) {
   answer(db.client.query, [
     ['SELECT id, member_number, status, membership_date FROM members', { rows: [{ id: 3, member_number: 'ACIFAC-2026-001', status }] }],
     ['AND LOWER(reference_number) = LOWER($2)', { rows: duplicateReference ? [{ '?column?': 1 }] : [] }],
     ['SELECT COALESCE(SUM(amount), 0) AS total FROM share_contributions', { rows: [{ total: current }] }],
-    ['SELECT COALESCE(SUM(share_capital), 0) AS total FROM members', { rows: [{ total: others }] }],
+    ['SELECT COALESCE(SUM(share_capital), 0) AS total FROM members', { rows: [{ total: cooperative }] }],
     ['INSERT INTO share_contributions', (params) => ({ rows: [{ id: 7, memberId: params[0], amount: params[1], date: params[2] }] })],
     ['FROM share_contributions sc', { rows: [{ id: 7, amount: '500.00' }, { id: 1, amount: current }] }],
   ]);
@@ -26,15 +26,24 @@ describe('Share capital contribution (memberController.addShareContribution)', (
     const res = mockResponse();
     await addShareContribution(contribute(), res);
     expect(res.statusCode).toBe(201);
-    expect(res.body).toMatchObject({ message: 'Share contribution recorded.', contribution: { amount: 500 }, data: { total: 1500, maximum: 10000, remaining: 8500, maximumPercent: 10 } });
+    expect(res.body).toMatchObject({ message: 'Share contribution recorded.', contribution: { amount: 500 }, data: { total: 1500, maximum: 10000, remaining: 8500, maximumPercent: 10, cooperativeTotal: 100000 } });
     expect(db.client.query).toHaveBeenCalledWith(expect.stringContaining('UPDATE members SET share_capital'), ['1500.00', 3]);
   });
 
   test('refuses an amount that would pass 10% of the cooperative\'s share capital', async () => {
     await expect(addShareContribution(contribute({ amount: '9000.01' }), mockResponse())).rejects.toMatchObject({
       status: 400,
-      message: "A member's share capital can't be more than 10% of the cooperative's total share capital. This member can hold at most PHP 10,000.00, so the most that can be added now is PHP 9,000.00.",
+      message: "A member's share capital can't be more than 10% of the cooperative's total share capital (PHP 100,000.00), so every member can hold at most PHP 10,000.00. This member has PHP 1,000.00, so the most that can be added now is PHP 9,000.00.",
     });
+  });
+
+  test('every member has the same maximum, whatever they hold now', async () => {
+    for (const current of ['0', '1000.00', '9500.00']) {
+      databaseHas({ current });
+      const res = mockResponse();
+      await addShareContribution(contribute({ amount: '100' }), res);
+      expect(res.body.data.maximum).toBe(10000);
+    }
   });
 
   test('rejects a missing amount or date, and an unknown payment method', async () => {

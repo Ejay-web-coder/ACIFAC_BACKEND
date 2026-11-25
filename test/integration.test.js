@@ -534,17 +534,21 @@ test('savings deposits and share capital are separate ledgers', { skip }, async 
   const share = await admin.post(`/api/members/${state.memberId}/share-contributions`, { amount: '500', contributionDate: '2026-02-03', referenceNumber: 'SC-1' });
   assert.equal(share.status, 201, JSON.stringify(share.data));
   assert.equal(share.data.data.total, 1500);
-  // No member may hold more than 10% of all members' share capital (them included):
-  // at most a ninth of everyone else's. Here everyone else is mostly the PHP 1,000,000 pool.
-  const { rows: [others] } = await pool.query(`SELECT SUM(share_capital) AS total FROM members WHERE status <> 'archived' AND id <> $1`, [state.memberId]);
-  const capCents = Math.floor(Math.round(Number(others.total) * 100) / 9);
+  // No member may hold more than 10% of the cooperative's total share capital, the same
+  // maximum for every member. Here the total is mostly the PHP 1,000,000 pool.
+  const { rows: [all] } = await pool.query(`SELECT SUM(share_capital) AS total FROM members WHERE status <> 'archived'`);
+  const totalCents = Math.round(Number(all.total) * 100);
+  const capCents = Math.floor(totalCents / 10);
   const shareView = (await admin.get(`/api/members/${state.memberId}`)).data.data.shareDetails;
-  assert.equal(Math.round(shareView.maximum * 100), capCents, 'the maximum is a ninth of the others');
+  assert.equal(Math.round(shareView.maximum * 100), capCents, 'the maximum is 10% of the total');
+  assert.equal(Math.round(shareView.cooperativeTotal * 100), totalCents);
   assert.equal(Math.round(shareView.remaining * 100), capCents - 150000);
+  const secondView = (await admin.get(`/api/members/${state.secondMemberId}`)).data.data.shareDetails;
+  assert.equal(secondView.maximum, shareView.maximum, 'every member has the same maximum');
   const overCap = await admin.post(`/api/members/${state.memberId}/share-contributions`, { amount: ((capCents - 150000 + 1) / 100).toFixed(2), contributionDate: '2026-02-03' });
   assert.equal(overCap.status, 400);
   assert.match(overCap.data.message, /10% of the cooperative's total share capital/);
-  // A new member starts with at most a ninth of everyone's share capital.
+  // A new member starts with at most the same 10% of the total.
   const tooRich = await admin.request('POST', '/api/members', { form: await memberForm({ first_name: 'Rico', last_name: 'Yaman', email: 'rico@example.com', date_of_birth: '1970-07-07', share_capital: '5000000' }) });
   assert.equal(tooRich.status, 400);
   assert.match(tooRich.data.message, /A new member can start with at most/);
@@ -5131,9 +5135,10 @@ test('loans: the loan policy at release: 2 hectares in the first year of loans; 
   assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM loans WHERE member_id = $1', [memberId])).rows[0].n, 0, 'nothing was released');
   assert.equal((await office.patch(`/api/admin/loan-requests/${big}`, { status: 'declined', reason: 'Over 2 hectares in the first year of loans' })).status, 200);
 
-  // Lito already holds all but PHP 300 of what the 10% share capital limit allows.
+  // Lito already holds all but PHP 300 of what the 10% share capital limit allows:
+  // the maximum, 10% of the total with his own, is then his share plus PHP 300.
   const others = cents((await pool.query(`SELECT COALESCE(SUM(share_capital), 0) AS total FROM members WHERE status <> 'archived' AND id <> $1`, [memberId])).rows[0].total);
-  const held = (Math.floor((others * 10) / 90) - 30000) / 100;
+  const held = Math.floor((others - 300000) / 9) / 100;
   await pool.query(`INSERT INTO share_contributions (member_id, amount, contribution_date, payment_method, notes) VALUES ($1, $2::numeric, '2024-01-01', 'Cash', 'test: near the limit')`, [memberId, held.toFixed(2)]);
   await pool.query('UPDATE members SET share_capital = $2::numeric WHERE id = $1', [memberId, held.toFixed(2)]);
 
@@ -5157,14 +5162,18 @@ test('loans: the loan policy at release: 2 hectares in the first year of loans; 
   const endsOn = (await pool.query(`SELECT TO_CHAR(($1::date + INTERVAL '12 months')::date, 'YYYY-MM-DD') AS d`, [loan.dateApproved])).rows[0].d;
   assert.deepEqual([(await quote('150000')).firstLoanYear.endsOn, (await office.get('/api/admin/loans?limit=100')).data.loans.find((row) => row.id === loan.id).firstLoanYearEnds], [endsOn, endsOn]);
 
-  // An in-kind loan has no cash: the PHP 950 of deductions is paid at release (the PHP 400 Capital Build-Up all to savings: no room left).
+  // An in-kind loan has no cash: the PHP 950 of deductions is paid at release. Of the PHP 400
+  // Capital Build-Up only the room left goes to share capital: the PHP 300 above raised the
+  // total, so the maximum rose by a tenth of it; the rest goes to savings.
   await settleOpenLoans(memberId);
+  const roomCents = Math.round((await office.get(`/api/members/${memberId}`)).data.data.shareDetails.remaining * 100);
+  assert.ok(roomCents > 0 && roomCents < 40000, `a little room came back (${roomCents} centavos)`);
   const inKind = await pendingRequest('20000', 'in-kind', [{ item: 'Urea', description: '', quantity: '10', unit: 'bags', unitPrice: '2000' }]);
   const inKindApproved = await office.patch(`/api/admin/loan-requests/${inKind}`, { status: 'approved' });
   assert.equal(inKindApproved.status, 200, JSON.stringify(inKindApproved.data));
   const inKindLoan = (await office.get(`/api/admin/loans/${inKindApproved.data.loanId}`)).data.loan;
   assert.deepEqual([inKindLoan.savingsDeducted, inKindLoan.capitalBuildUp, inKindLoan.capitalBuildUpToSavings, inKindLoan.cashReleased, inKindLoan.paidAtRelease],
-    ['500.00', '400.00', '400.00', '0.00', '950.00']);
+    ['500.00', '400.00', ((40000 - roomCents) / 100).toFixed(2), '0.00', '950.00']);
 
   // After the first year of loans the whole farm counts.
   await pool.query(
