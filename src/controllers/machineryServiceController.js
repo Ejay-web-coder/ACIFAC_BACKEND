@@ -6,7 +6,7 @@
 import { query, withTransaction } from '../config/db.js';
 import { capitalChange, createAuditLog } from '../utils/audit.js';
 import { formatDateOnly, isValidDateOnly, todayDateOnly } from '../utils/dates.js';
-import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, paginationMeta, parseId, parsePagination } from '../utils/http.js';
+import { badRequest, cleanString, conflict, currentUserId, getRequestMeta, notFound, optionalString, paginationMeta, parseId, parsePagination } from '../utils/http.js';
 import { centsToString, parseMoneyInput, toCents } from '../utils/money.js';
 import {
   BAG_UNITS, CLIENT_CATEGORIES, CROPPING_PERIODS, SEASONS, SERVICE_UNITS, FeeInputError, computeServiceFee, findRateForDate, fromScaled, rateForClient,
@@ -30,7 +30,7 @@ const serviceSelect = `
          s.rate_id AS "rateId", s.rate_used AS "rateUsed", s.computed_fee_amount AS "computedFeeAmount",
          s.fee_amount AS "feeAmount", s.fee_override_reason AS "feeOverrideReason",
          s.amount_paid AS "amountPaid", s.balance, s.payment_status AS "paymentStatus",
-         s.rental_request_id AS "rentalRequestId", s.notes, s.created_at AS "createdAt", s.updated_at AS "updatedAt",
+         s.rental_request_id AS "rentalRequestId", s.operator_name AS "operatorName", s.notes, s.created_at AS "createdAt", s.updated_at AS "updatedAt",
          (SELECT MAX(p.payment_date) FROM machinery_service_payments p WHERE p.service_id = s.id) AS "lastPaymentDate"
   FROM machinery_services s
   JOIN machinery m ON m.id = s.machinery_id
@@ -163,6 +163,8 @@ function readServiceInput(body, { quote = false } = {}) {
     feeAmount: readMoney(body.feeAmount, 'Fee', { required: false }),
     feeOverrideReason: cleanString(body.feeOverrideReason, 500),
     rentalRequestId: body.rentalRequestId === undefined || body.rentalRequestId === null || body.rentalRequestId === '' ? null : parseId(body.rentalRequestId, 'rental request'),
+    // Who operated the machine; blank means not entered.
+    operatorName: optionalString(body.operatorName, 200),
     notes: cleanString(body.notes, 1000),
   };
   if (quote) return input;
@@ -226,7 +228,7 @@ const auditService = (row) => ({
   machinery_id: row.machineryId, service_type: row.serviceType, service_date: row.serviceDate, season: row.season ?? null, cropping_period: row.croppingPeriod, year: row.year,
   client_category: row.clientCategory, client_name: row.clientName, area_ha: row.areaHa, total_bags: row.totalBags, fee_bags: row.feeBags,
   rate_used: row.rateUsed, fee_amount: row.feeAmount, computed_fee_amount: row.computedFeeAmount, fee_override_reason: row.feeOverrideReason,
-  amount_paid: row.amountPaid, balance: row.balance, payment_status: row.paymentStatus,
+  amount_paid: row.amountPaid, balance: row.balance, payment_status: row.paymentStatus, operator_name: row.operatorName ?? null,
 });
 
 // ----- Services ----------------------------------------------------------------------
@@ -285,13 +287,13 @@ export async function createService(req, res) {
       `INSERT INTO machinery_services (
          machinery_id, service_type, service_date, cropping_period, year, client_category, member_id, client_name, client_address,
          unit, area_ha, days, total_bags, fee_bags, bag_value, kg_per_bag, price_per_kg, rate_id, rate_used,
-         computed_fee_amount, fee_amount, fee_override_reason, rental_request_id, recorded_by, notes, season)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::numeric, 0), $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+         computed_fee_amount, fee_amount, fee_override_reason, rental_request_id, recorded_by, notes, season, operator_name)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11::numeric, 0), $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
        RETURNING id`,
       [machine.id, rate.serviceType, input.serviceDate, input.croppingPeriod, input.year, input.clientCategory, who.memberId, who.clientName, who.clientAddress,
         rate.unit, input.areaHa, rate.unit === 'per_day' ? input.days : null, isBagUnit(rate.unit) ? input.totalBags : null, fee.feeBags, fee.bagValue,
         isBagUnit(rate.unit) ? input.kgPerBag : null, isBagUnit(rate.unit) ? input.pricePerKg : null, rate.id, fee.rateUsed,
-        settled.computedFeeAmount, settled.feeAmount, settled.feeOverrideReason, input.rentalRequestId, currentUserId(req), input.notes, rate.season ?? null]
+        settled.computedFeeAmount, settled.feeAmount, settled.feeOverrideReason, input.rentalRequestId, currentUserId(req), input.notes, rate.season ?? null, input.operatorName]
     );
     const id = inserted.rows[0].id;
     let paymentId = null;
@@ -325,12 +327,12 @@ export async function updateService(req, res) {
       `UPDATE machinery_services SET machinery_id = $2, service_type = $3, service_date = $4, cropping_period = $5, year = $6, client_category = $7,
          member_id = $8, client_name = $9, client_address = $10, unit = $11, area_ha = COALESCE($12::numeric, 0), days = $13, total_bags = $14, fee_bags = $15,
          bag_value = $16, kg_per_bag = $17, price_per_kg = $18, rate_id = $19, rate_used = $20, computed_fee_amount = $21, fee_amount = $22,
-         fee_override_reason = $23, rental_request_id = $24, notes = $25, season = $26, updated_at = NOW()
+         fee_override_reason = $23, rental_request_id = $24, notes = $25, season = $26, operator_name = $27, updated_at = NOW()
        WHERE id = $1`,
       [id, machine.id, rate.serviceType, input.serviceDate, input.croppingPeriod, input.year, input.clientCategory, who.memberId, who.clientName, who.clientAddress,
         rate.unit, input.areaHa, rate.unit === 'per_day' ? input.days : null, isBagUnit(rate.unit) ? input.totalBags : null, fee.feeBags, fee.bagValue,
         isBagUnit(rate.unit) ? input.kgPerBag : null, isBagUnit(rate.unit) ? input.pricePerKg : null, rate.id, fee.rateUsed,
-        settled.computedFeeAmount, settled.feeAmount, settled.feeOverrideReason, input.rentalRequestId, input.notes, rate.season ?? null]
+        settled.computedFeeAmount, settled.feeAmount, settled.feeOverrideReason, input.rentalRequestId, input.notes, rate.season ?? null, input.operatorName]
     );
     const row = (await client.query(`${serviceSelect} WHERE s.id = $1`, [id])).rows[0];
     await createAuditLog({ client, user: req.user, action: 'MACHINERY_SERVICE_UPDATED', module: 'Machinery', entityType: 'machinery_service', entityId: String(id), description: `Updated ${row.serviceType} service for ${row.clientName}`, oldValues: auditService(before), newValues: auditService(row), ...getRequestMeta(req) });

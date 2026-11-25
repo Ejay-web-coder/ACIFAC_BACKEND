@@ -1281,6 +1281,58 @@ test('machinery: the booking calendar shows which machine is free each day; a bo
   assert.equal((await admin.request('PATCH', `/api/machinery/operations/${todayOp.id}`, { body: { status: 'completed' } })).status, 200);
 });
 
+test('machinery: the office enters who operated the machine on each booking and each service', { skip }, async () => {
+  const { todayDateOnly } = await import('../src/utils/dates.js');
+  const today = todayDateOnly();
+  const plus = (days) => { const d = new Date(`${today}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
+  const book = async (machineryId, clientName, from) => {
+    const created = await admin.post('/api/machinery/requests', { machineryId, clientCategory: 'non_member', clientName, startDate: plus(from), endDate: plus(from + 1), purpose: 'Land preparation' });
+    assert.equal(created.status, 201, JSON.stringify(created.data));
+    assert.equal((await admin.patch(`/api/machinery/requests/${created.data.request.id}`, { status: 'approved' })).status, 200);
+    return { requestId: created.data.request.id, operation: (await admin.get('/api/machinery?limit=200')).data.operations.find((row) => row.rentalRequestId === created.data.request.id) };
+  };
+
+  // A booking: no operator until the office enters one, at any time.
+  const nena = await book('RT-02', 'Nena Cruz', 140);
+  assert.equal(nena.operation.operatorName, null);
+  const set = await admin.patch(`/api/machinery/operations/${nena.operation.id}/operator`, { operatorName: '  Pedro Santos  ' });
+  assert.equal(set.status, 200, JSON.stringify(set.data));
+  assert.equal(set.data.operation.operatorName, 'Pedro Santos', 'kept without the spaces around it');
+  assert.equal((await admin.get('/api/machinery?limit=200')).data.operations.find((row) => row.id === nena.operation.id).operatorName, 'Pedro Santos');
+  assert.equal((await member.patch(`/api/machinery/operations/${nena.operation.id}/operator`, { operatorName: 'Juan' })).status, 403, 'the office only');
+  assert.equal((await admin.patch(`/api/machinery/operations/${nena.operation.id}/operator`, { operatorName: 42 })).status, 400);
+  assert.equal((await admin.patch('/api/machinery/operations/999999/operator', { operatorName: 'Juan' })).status, 404);
+  const [audited] = (await pool.query(`SELECT description, old_values, new_values FROM audit_logs WHERE action = 'OPERATION_OPERATOR_SET' AND entity_id = $1 ORDER BY id`, [String(nena.operation.id)])).rows;
+  assert.equal(audited.description, 'Set Pedro Santos as operator of the Rotavator w/ Tractor 2 booking of Nena Cruz');
+  assert.deepEqual([audited.old_values.operator_name, audited.new_values.operator_name], [null, 'Pedro Santos']);
+
+  // A service: entered with the work, changed or removed when it is edited.
+  const body = { machineryId: 'RT-02', croppingPeriod: '1st', year: 2026, serviceType: 'Rotavator', serviceDate: '2026-06-10', clientCategory: 'non_member', clientName: 'Nena Cruz', areaHa: '1', rentalRequestId: nena.requestId };
+  const service = await admin.post('/api/machinery/services', { ...body, operatorName: 'pedro santos' });
+  assert.equal(service.status, 201, JSON.stringify(service.data));
+  assert.equal(service.data.service.operatorName, 'pedro santos');
+  assert.equal((await admin.get('/api/machinery/services?machineryId=RT-02&limit=200')).data.services.find((row) => row.id === service.data.service.id).operatorName, 'pedro santos');
+
+  // Suggestions: who ran this machine first, then the others; the same name in other capitals once, as last used.
+  const ana = await book('RT-01', 'Ana Lim', 150);
+  assert.equal((await admin.patch(`/api/machinery/operations/${ana.operation.id}/operator`, { operatorName: 'Ana Reyes' })).status, 200);
+  const names = async (machineryId) => (await admin.get(`/api/machinery/operators${machineryId ? `?machineryId=${machineryId}` : ''}`)).data.operators
+    .filter((row) => /^(pedro santos|ana reyes)$/i.test(row.name)).map((row) => [row.name, row.onMachine]);
+  assert.deepEqual(await names('RT-02'), [['Pedro Santos', true], ['Ana Reyes', false]], 'the booking (later) gives the spelling');
+  assert.deepEqual(await names('RT-01'), [['Ana Reyes', true], ['Pedro Santos', false]]);
+  assert.deepEqual(await names(), [['Ana Reyes', false], ['Pedro Santos', false]], 'no machine: the most recent first');
+  assert.equal((await member.get('/api/machinery/operators')).status, 403);
+
+  const edited = await admin.patch(`/api/machinery/services/${service.data.service.id}`, { ...body, operatorName: '   ' });
+  assert.equal(edited.status, 200, JSON.stringify(edited.data));
+  assert.equal(edited.data.service.operatorName, null, 'a blank name removes it');
+  const cleared = await admin.patch(`/api/machinery/operations/${nena.operation.id}/operator`, { operatorName: '' });
+  assert.equal(cleared.data.operation.operatorName, null);
+  assert.equal((await pool.query(`SELECT description FROM audit_logs WHERE action = 'OPERATION_OPERATOR_SET' AND entity_id = $1 ORDER BY id DESC LIMIT 1`, [String(nena.operation.id)])).rows[0].description,
+    'Removed the operator of the Rotavator w/ Tractor 2 booking of Nena Cruz');
+  assert.equal((await admin.request('DELETE', `/api/machinery/services/${service.data.service.id}`)).status, 200);
+});
+
 test('machinery analytics: utilization, revenue and cost, alerts, downtime, ROI and recommendations', { skip }, async () => {
   const { todayDateOnly } = await import('../src/utils/dates.js');
   const today = todayDateOnly();

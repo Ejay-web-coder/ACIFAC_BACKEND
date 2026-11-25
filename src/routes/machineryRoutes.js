@@ -1,7 +1,8 @@
 import express from 'express';
 import { requireAdmin, requireAuth } from '../middleware/auth.js';
 import {
-  createMachinery, createRentalRequest, getMachineryAvailability, listMachineryCatalog, listMachineryData, reviewRentalRequest, updateMachinery, updateOperationStatus,
+  createMachinery, createRentalRequest, getMachineryAvailability, listMachineryCatalog, listMachineryData, listOperators, reviewRentalRequest, setOperationOperator,
+  updateMachinery, updateOperationStatus,
 } from '../controllers/machineryController.js';
 import {
   createBagSale, createExpense, createRate, createService, deleteBagSale, deleteExpense, deleteRate, deleteService, getReportForm, getService, listBagSales,
@@ -20,6 +21,9 @@ router.get('/', requireAdmin, listMachineryData);
 router.post('/', requireAdmin, createMachinery);
 router.patch('/requests/:id', requireAdmin, reviewRentalRequest);
 router.patch('/operations/:id', requireAdmin, updateOperationStatus);
+// Who operated the machine on each booking and service (admin only).
+router.patch('/operations/:id/operator', requireAdmin, setOperationOperator);
+router.get('/operators', requireAdmin, listOperators);
 
 // Per-service jobs, payments, expenses and the PhilMech report (admin only).
 router.post('/services/quote', requireAdmin, quoteService);

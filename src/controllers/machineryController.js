@@ -32,7 +32,7 @@ const operationSelect = `
   SELECT o.id, o.machinery_id AS "machineryId", o.machinery_name AS "machineryName", o.rental_request_id AS "rentalRequestId",
          o.client_category AS "clientCategory", o.member_name AS "memberName", COALESCE(m.member_number, o.member_id::text) AS "memberId",
          o.purpose, o.start_date AS "startDate", o.end_date AS "endDate", o.duration,
-         o.rental_fee AS "rentalFee", o.status, o.created_at AS "createdAt"
+         o.rental_fee AS "rentalFee", o.status, o.operator_name AS "operatorName", o.created_at AS "createdAt"
   FROM machinery_operations o LEFT JOIN members m ON m.id = o.member_id`;
 
 const machinerySelect = `
@@ -467,4 +467,51 @@ export async function updateOperationStatus(req, res) {
     return (await client.query(`${operationSelect} WHERE o.id = $1`, [id])).rows[0];
   });
   return res.json({ success: true, operation });
+}
+
+// PATCH /api/machinery/operations/:id/operator { operatorName }
+// Who operated the machine for an approved booking, at any time (also after
+// it is completed). A blank name removes it.
+export async function setOperationOperator(req, res) {
+  const id = parseId(req.params.id, 'operation ID');
+  const value = req.body?.operatorName;
+  if (value !== undefined && value !== null && typeof value !== 'string') throw badRequest('The operator must be a name.');
+  const operatorName = optionalString(value, 200);
+  const operation = await withTransaction(async (client) => {
+    const before = (await client.query('SELECT id, machinery_name, member_name, operator_name FROM machinery_operations WHERE id = $1 FOR UPDATE', [id])).rows[0];
+    if (!before) throw notFound('Operation not found.');
+    await client.query('UPDATE machinery_operations SET operator_name = $2 WHERE id = $1', [id, operatorName]);
+    await createAuditLog({
+      client, user: req.user, action: 'OPERATION_OPERATOR_SET', module: 'Machinery', entityType: 'machinery_operation', entityId: String(id),
+      description: operatorName
+        ? `Set ${operatorName} as operator of the ${before.machinery_name} booking of ${before.member_name}`
+        : `Removed the operator of the ${before.machinery_name} booking of ${before.member_name}`,
+      oldValues: { operator_name: before.operator_name }, newValues: { operator_name: operatorName }, ...getRequestMeta(req),
+    });
+    return (await client.query(`${operationSelect} WHERE o.id = $1`, [id])).rows[0];
+  });
+  return res.json({ success: true, operation });
+}
+
+// GET /api/machinery/operators?machineryId=M-001
+// Names already entered as operators (bookings and services), offered as
+// suggestions: those who ran the given machine first, then the most recent.
+// Names that differ only in capitals count once, spelled as last entered.
+export async function listOperators(req, res) {
+  const machineryId = cleanString(req.query.machineryId, 20) || null;
+  const rows = (await query(
+    `SELECT (array_agg(name ORDER BY used_on DESC, name))[1] AS name,
+            COALESCE(bool_or(machinery_id = $1::varchar), false) AS "onMachine",
+            MAX(used_on) AS "lastUsed"
+     FROM (
+       SELECT btrim(operator_name) AS name, machinery_id, start_date AS used_on FROM machinery_operations WHERE operator_name IS NOT NULL
+       UNION ALL
+       SELECT btrim(operator_name), machinery_id, service_date FROM machinery_services WHERE operator_name IS NOT NULL
+     ) used
+     GROUP BY lower(name)
+     ORDER BY "onMachine" DESC, "lastUsed" DESC, 1
+     LIMIT 50`,
+    [machineryId]
+  )).rows;
+  return res.json({ success: true, operators: rows.map((row) => ({ name: row.name, onMachine: row.onMachine, lastUsed: row.lastUsed })) });
 }
